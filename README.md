@@ -70,8 +70,9 @@ with a capability.
 
 ## Composer sources
 
-Sources are listed per ecosystem, in order. Claims are patterns with `*`
-wildcards only, matched against the lowercase package name. At most one source
+Sources are listed per ecosystem, in order. A claim is `*` or a lowercase
+`<vendor>/<name>` pattern of `[a-z0-9_.-]` and `*` wildcards (no `?` or `[...]`),
+matched against the lowercase package name; anything else fails validation. At most one source
 may be unclaimed (the public catch-all); `storage` sources must have claims.
 
 | Type | Keys | Does |

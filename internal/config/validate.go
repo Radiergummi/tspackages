@@ -198,6 +198,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			add("duplicate source name")
 		}
 		seen[s.Name] = true
+		for _, c := range s.Claims {
+			if !validClaim(c) {
+				add(`invalid claim %q (use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-])`, c)
+			}
+		}
 
 		if len(s.Claims) == 0 && s.Type != "storage" {
 			unclaimed++
@@ -271,6 +276,12 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 	}
 	return errs
 }
+
+var claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
+
+// validClaim accepts "*" or exactly two lowercase segments, so a claim can
+// never be a pattern that matches no Composer name or uses path.Match classes.
+func validClaim(c string) bool { return c == "*" || claimRe.MatchString(c) }
 
 // hostAllowed mirrors the upstream allowlist: an entry matches the URL's
 // hostname case-insensitively, and an entry with a port also needs that port.

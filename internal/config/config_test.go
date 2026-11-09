@@ -351,3 +351,25 @@ func TestExampleConfigValidates(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClaimValidation(t *testing.T) {
+	src := func(claim string) string {
+		return strings.Replace(base, "SECRET", "x", 1) +
+			"      - {name: r, type: registry, url: 'https://a', fetch_hosts: [a], claims: ['" + claim + "']}\n"
+	}
+	for _, bad := range []string{"matchory", "matchory*", "matchory/[", "Matchory/*", "a/b/c", "/a", "a/", "a/b?", "a/[bc]", `a\/b`, "a/b]", "", "**/x y"} {
+		t.Run("bad "+bad, func(t *testing.T) {
+			_, err := Load(writeConfig(t, src(bad)))
+			if err == nil || !strings.Contains(err.Error(), "invalid claim") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	for _, good := range []string{"*", "matchory/*", "matchory-*/*", "a.b_c/d-e", "*/*", "acme/pkg"} {
+		t.Run("good "+good, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, src(good))); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
