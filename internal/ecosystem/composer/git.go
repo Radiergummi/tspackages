@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -68,6 +69,11 @@ type GitSource struct {
 	log        *slog.Logger
 	maxArchive int64 // largest zip kept in memory; bigger versions are skipped
 
+	now func() time.Time // replaced in tests
+
+	hmu     sync.RWMutex // guards indexed
+	indexed []bool       // per mirror: indexed successfully at least once
+
 	mu     sync.Mutex // serialises Index; guards the fields below
 	prev   []remoteResult
 	loaded map[string]loaded // by commit; archives are immutable
@@ -113,6 +119,7 @@ func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.M
 	g := &GitSource{
 		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pins, rec: rec,
 		state: state, poll: poll, log: log, maxArchive: maxArchive,
+		now: time.Now, indexed: make([]bool, len(mirrors)),
 		prev:   make([]remoteResult, len(mirrors)),
 		loaded: map[string]loaded{},
 		prov:   map[string]bool{},
@@ -161,6 +168,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 			g.log.Warn("composer git sync failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
 			continue
 		}
+		metrics.SetGitLastSync(g.name, m.Remote(), m.LastSync())
 		res, err := g.indexRemote(ctx, m)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -170,6 +178,9 @@ func (g *GitSource) Index(ctx context.Context) error {
 			continue
 		}
 		g.prev[i] = res
+		g.hmu.Lock()
+		g.indexed[i] = res.ok
+		g.hmu.Unlock()
 	}
 	g.idx.Store(g.assemble())
 	return nil
@@ -560,6 +571,40 @@ func (g *GitSource) readStored(ctx context.Context, key string, max int64) ([]by
 		return nil, fmt.Errorf("%w: %s over %d bytes", errTooLarge, key, max)
 	}
 	return data, nil
+}
+
+// Health reports one entry per remote: OK once indexed and synced within
+// three poll intervals. Package-name conflicts are a separate, not-OK entry.
+func (g *GitSource) Health(context.Context) []metrics.Health {
+	g.hmu.RLock()
+	indexed := slices.Clone(g.indexed)
+	g.hmu.RUnlock()
+	var out []metrics.Health
+	for i, m := range g.mirrors {
+		h := metrics.Health{Name: g.name + " " + m.Remote()}
+		last := m.LastSync()
+		switch {
+		case !indexed[i]:
+			h.Detail = "never indexed"
+			if !last.IsZero() {
+				h.Detail += "; last sync " + last.UTC().Format(time.RFC3339)
+			}
+		case g.now().Sub(last) > 3*g.poll:
+			h.Detail = "last sync " + last.UTC().Format(time.RFC3339) + " is older than 3 poll intervals"
+		default:
+			h.OK = true
+			h.Detail = "last sync " + last.UTC().Format(time.RFC3339)
+		}
+		out = append(out, h)
+	}
+	if cs := g.Conflicts(); len(cs) > 0 {
+		names := make([]string, len(cs))
+		for i, c := range cs {
+			names[i] = c.Package
+		}
+		out = append(out, metrics.Health{Name: g.name + " conflicts", Detail: "package names declared by several remotes: " + strings.Join(names, ", ")})
+	}
+	return out
 }
 
 // Conflicts lists package names declared by several remotes in the last pass.

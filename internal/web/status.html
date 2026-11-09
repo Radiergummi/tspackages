@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tspackages</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:56rem;margin:2rem auto;padding:0 1rem;color:#1b1f24;background:#fff}
+@media(prefers-color-scheme:dark){body{color:#e6e8eb;background:#14171a}pre,code{background:#22272c}}
+h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #8884}
+table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #8883;vertical-align:top}
+pre,code{background:#f1f3f5;border-radius:4px;padding:.1rem .3rem}pre{padding:.6rem;overflow-x:auto}
+.ok{color:#1a7f37}.bad{color:#cf222e;font-weight:600}.muted{color:#8b949e}
+</style>
+</head>
+<body>
+<h1>tspackages</h1>
+<p class="muted">Ecosystems:{{range .Ecosystems}} {{.}}{{else}} none{{end}}</p>
+
+<h2>Sources</h2>
+{{if .Health}}<table>
+<tr><th>Source</th><th>Status</th><th>Detail</th></tr>
+{{range .Health}}<tr><td>{{.Name}}</td>{{if .OK}}<td class="ok">ok</td>{{else}}<td class="bad">not ok</td>{{end}}<td>{{.Detail}}</td></tr>
+{{end}}</table>{{else}}<p class="muted">No sources.</p>{{end}}
+
+<h2>Moved tags</h2>
+{{if .Moved}}<p>These tags changed upstream after first being seen. The pinned commit is still served.</p>
+<table>
+<tr><th>Source</th><th>Remote</th><th>Tag</th><th>Pinned</th><th>Seen</th></tr>
+{{range .Moved}}<tr><td>{{.Source}}</td><td>{{.Remote}}</td><td>{{.Tag}}</td><td><code>{{.Pinned}}</code></td><td><code>{{.Seen}}</code></td></tr>
+{{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
+
+<h2>Package name conflicts</h2>
+{{if .Conflicts}}<p>These names are declared by several remotes and are not served.</p>
+<table>
+<tr><th>Package</th><th>Remotes</th></tr>
+{{range .Conflicts}}<tr><td>{{.Package}}</td><td>{{range .Remotes}}{{.}}<br>{{end}}</td></tr>
+{{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
+{{if .Composer}}
+<h2>Composer</h2>
+<p>Add to <code>composer.json</code>:</p>
+<pre>{"repositories":[{"type":"composer","url":"https://{{.Host}}/composer"},{"packagist.org":false}]}</pre>
+<p>Upload a package:</p>
+<pre>curl -fT pkg.zip https://{{.Host}}/composer/upload/&lt;vendor&gt;/&lt;name&gt;/&lt;version&gt;</pre>
+{{end}}
+</body>
+</html>

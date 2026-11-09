@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -47,6 +49,11 @@ type RegistrySource struct {
 	wait         func(context.Context) error
 	log          *slog.Logger
 	now          func() time.Time // replaced in tests
+
+	hmu      sync.Mutex // guards the health fields
+	fetchErr error      // last metadata fetch failure; nil once one succeeds
+	fetchAt  time.Time  // when fetchErr happened
+	stale    bool       // fetchErr was answered from stale cache
 }
 
 var _ Source = (*RegistrySource)(nil)
@@ -115,7 +122,9 @@ func (s *RegistrySource) fetchMeta(ctx context.Context, url string) ([]byte, boo
 	if err := s.wait(ctx); err != nil {
 		return nil, false, err
 	}
+	start := time.Now()
 	resp, err := s.c.Get(ctx, url)
+	metrics.ObserveUpstream(s.name, time.Since(start))
 	if err != nil {
 		return nil, false, err
 	}
@@ -141,6 +150,7 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 	key := s.metaKey(pkg, dev)
 	cached, fresh, have := s.readCached(ctx, key)
 	if have && fresh {
+		metrics.ObserveCacheHit(ecoName, s.name)
 		return cached, !bytes.Equal(cached, notFoundMarker), nil
 	}
 	body, found, err = s.fetchMeta(ctx, s.metaURL(pkg, dev))
@@ -148,6 +158,7 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 		// Validate before caching, so garbage never replaces good bytes.
 		_, err = parseMetadata(body, pkg, dev)
 	}
+	s.noteFetch(err, have)
 	if err != nil {
 		if have {
 			// A stale not-found marker is served too, deliberately: during an
@@ -323,6 +334,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 
 	refKey := s.distRefKey(pkg, version, reference)
 	if a, ok := s.cachedDist(ctx, refKey, shasum); ok {
+		metrics.ObserveCacheHit(ecoName, s.name)
 		return a, nil
 	}
 
@@ -360,5 +372,32 @@ func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstre
 	if err := s.wait(ctx); err != nil {
 		return nil, "", "", err
 	}
+	start := time.Now()
+	defer func() { metrics.ObserveUpstream(s.name, time.Since(start)) }()
 	return s.c.FetchVerified(ctx, url, want, s.maxArtifact)
+}
+
+// noteFetch records the outcome of an upstream metadata fetch for Health.
+func (s *RegistrySource) noteFetch(err error, haveCache bool) {
+	s.hmu.Lock()
+	defer s.hmu.Unlock()
+	if err == nil {
+		s.fetchErr, s.stale = nil, false
+		return
+	}
+	s.fetchErr, s.fetchAt, s.stale = err, s.now(), haveCache
+}
+
+// Health is OK unless the last upstream metadata fetch failed.
+func (s *RegistrySource) Health(context.Context) []metrics.Health {
+	s.hmu.Lock()
+	defer s.hmu.Unlock()
+	h := metrics.Health{Name: s.name, OK: s.fetchErr == nil, Detail: "no upstream fetch has failed"}
+	if s.fetchErr != nil {
+		h.Detail = fmt.Sprintf("last upstream fetch failed at %s: %v", s.fetchAt.UTC().Format(time.RFC3339), s.fetchErr)
+		if s.stale {
+			h.Detail += "; serving stale"
+		}
+	}
+	return []metrics.Health{h}
 }

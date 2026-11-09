@@ -1,0 +1,91 @@
+// Package metrics holds tspackages' Prometheus registry and the helpers the
+// handlers and sources call to record observations.
+//
+// Label values come from configuration (ecosystem, source, remote) or are
+// fixed (the numeric status code); never pass client input.
+package metrics
+
+import (
+	"context"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+)
+
+// Health is the state of one status-page source entry.
+type Health struct {
+	Name   string
+	OK     bool
+	Detail string
+}
+
+// StatusSource reports its health on the status page.
+type StatusSource interface {
+	Health(ctx context.Context) []Health
+}
+
+var (
+	registry = prometheus.NewRegistry()
+
+	requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tspackages_requests_total",
+		Help: "Requests handled, by ecosystem, source and HTTP status code.",
+	}, []string{"ecosystem", "source", "code"})
+	cacheHits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tspackages_cache_hits_total",
+		Help: "Upstream-backed reads served from the cache.",
+	}, []string{"ecosystem", "source"})
+	upstreamDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tspackages_upstream_request_duration_seconds",
+		Help:    "Duration of upstream requests.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"source"})
+	gitLastSync = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tspackages_git_last_sync_timestamp_seconds",
+		Help: "Unix time of the last successful sync of a git remote.",
+	}, []string{"source", "remote"})
+
+	rejected atomic.Pointer[func() uint64]
+)
+
+func init() {
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		requests, cacheHits, upstreamDuration, gitLastSync,
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "tspackages_rate_limited_total",
+			Help: "Requests rejected by the per-identity rate limiter.",
+		}, func() float64 {
+			if f := rejected.Load(); f != nil {
+				return float64((*f)())
+			}
+			return 0
+		}),
+	)
+}
+
+// Registry is the registry served at /metrics.
+func Registry() *prometheus.Registry { return registry }
+
+// SetRejected sets the function read by tspackages_rate_limited_total.
+func SetRejected(f func() uint64) { rejected.Store(&f) }
+
+func ObserveRequest(ecosystem, source string, code int) {
+	requests.WithLabelValues(ecosystem, source, strconv.Itoa(code)).Inc()
+}
+
+func ObserveCacheHit(ecosystem, source string) {
+	cacheHits.WithLabelValues(ecosystem, source).Inc()
+}
+
+func ObserveUpstream(source string, d time.Duration) {
+	upstreamDuration.WithLabelValues(source).Observe(d.Seconds())
+}
+
+func SetGitLastSync(source, remote string, t time.Time) {
+	gitLastSync.WithLabelValues(source, remote).Set(float64(t.Unix()))
+}

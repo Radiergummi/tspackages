@@ -22,6 +22,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -586,4 +587,16 @@ func (s *StorageSource) Packages(ctx context.Context) ([]string, bool, error) {
 	}
 	slices.Sort(names)
 	return names, true, nil
+}
+
+// probeKey is stat-ed to check the store is reachable; it never exists.
+const probeKey = ".tspackages-probe"
+
+// Health is OK if the store answers a Stat (a miss counts as success).
+func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
+	h := metrics.Health{Name: s.name, OK: true, Detail: "store reachable"}
+	if _, err := s.d.Stat(ctx, probeKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		h.OK, h.Detail = false, "store unreachable: "+err.Error()
+	}
+	return []metrics.Health{h}
 }

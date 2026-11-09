@@ -17,6 +17,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/authz"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -99,6 +100,15 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 		w := &statusWriter{ResponseWriter: rw}
 		e := &entry{}
 		h(w, r, caller, e)
+		status := w.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		src := e.source
+		if src == "" {
+			src = "none"
+		}
+		metrics.ObserveRequest(ecoName, src, status)
 		level := slog.LevelDebug
 		if e.write || e.claimed {
 			level = slog.LevelInfo
