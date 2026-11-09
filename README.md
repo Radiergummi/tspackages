@@ -6,10 +6,8 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Milestone 1 ships Composer. PyPI, Go, npm, OCI and Maven follow; see
-[the design](docs/superpowers/specs/2026-11-09-tspackages-design.md) if you have
-the repository checked out, and read [docs/security.md](docs/security.md) before
-you deploy.
+Milestone 1 ships Composer. PyPI, Go, npm, OCI and Maven follow. Read
+[docs/security.md](docs/security.md) before you deploy.
 
 - Tailscale is the only authentication. There are no tokens, no basic auth and
   no dev mode. A caller without a matching capability gets `403`.
@@ -124,7 +122,8 @@ curl -fsS -X PUT --data-binary @b-1.0.0.zip \
 ```
 
 Republishing a version is rejected with `409`, and so is an upload of a name
-that an earlier source also claims (it would be stored but never served).
+that an earlier source also claims (the earlier source would shadow it on
+reads).
 
 ## Tailnet policy
 
