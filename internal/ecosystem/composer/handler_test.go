@@ -89,9 +89,13 @@ const readAll = `{"read":["*"]}`
 
 func server(t *testing.T, srcs []Source, rules ...string) http.Handler {
 	t.Helper()
+	return serverLog(t, slog.New(slog.NewTextHandler(io.Discard, nil)), srcs, rules...)
+}
+
+func serverLog(t *testing.T, log *slog.Logger, srcs []Source, rules ...string) http.Handler {
+	t.Helper()
 	mux := http.NewServeMux()
-	New(srcs, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000},
-		slog.New(slog.NewTextHandler(io.Discard, nil))).Mount(mux)
+	New(srcs, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}, log).Mount(mux)
 	return identity.Middleware(whoiser{rules}, hCap, nil)(mux)
 }
 
@@ -281,36 +285,6 @@ func TestDistForbiddenAndError(t *testing.T) {
 	}
 }
 
-func TestPackagesJSONAvailablePackages(t *testing.T) {
-	g, r := gitAndReg()
-	g.pkgs["matchory/secret"] = []Version{ver("matchory/secret", "1.0.0", false)}
-	g.pkgs["Matchory/Mixed"] = nil
-	h := server(t, []Source{g}, `{"read":["composer:matchory/a","composer:matchory/mixed"]}`)
-	w := do(h, "GET", "/composer/packages.json", nil)
-	var resp struct {
-		Packages  []any    `json:"packages"`
-		MetaURL   string   `json:"metadata-url"`
-		Available []string `json:"available-packages"`
-	}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if w.Code != 200 || resp.MetaURL != "/composer/p2/%package%.json" || len(resp.Packages) != 0 ||
-		strings.Join(resp.Available, ",") != "matchory/a,matchory/mixed" {
-		t.Fatalf("%d %s", w.Code, w.Body)
-	}
-	// With an unclaimed source the key is absent.
-	w = do(server(t, []Source{g, r}, readAll), "GET", "/composer/packages.json", nil)
-	if w.Code != 200 || strings.Contains(w.Body.String(), "available-packages") {
-		t.Fatalf("%d %s", w.Code, w.Body)
-	}
-	// No composer rule at all.
-	if w := do(server(t, []Source{g}, `{"read":["npm:*"]}`), "GET", "/composer/packages.json", nil); w.Code != 403 {
-		t.Fatalf("%d", w.Code)
-	}
-	if w := do(server(t, []Source{g}), "GET", "/composer/packages.json", nil); w.Code != 403 {
-		t.Fatalf("%d", w.Code)
-	}
-}
-
 func TestUploadFlow(t *testing.T) {
 	store, _ := newSource(t)
 	g, r := gitAndReg()
@@ -355,20 +329,208 @@ func TestUploadFlow(t *testing.T) {
 	}
 }
 
-func TestClientAuthorizationIgnored(t *testing.T) {
-	store, _ := newSource(t)
-	h := server(t, []Source{store}, `{"write":["composer:matchory-internal/*"]}`)
-	w := do(h, "PUT", "/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(pkgZip(t, fooJSON)), "Authorization", "Bearer junk")
-	if w.Code != 201 {
-		t.Fatalf("%d %s", w.Code, w.Body)
-	}
-}
-
 func TestNoCallerIs403(t *testing.T) {
 	g, _ := gitAndReg()
 	mux := http.NewServeMux()
 	New([]Source{g}, archive.Limits{MaxBytes: 1}, nil).Mount(mux)
 	if w := do(mux, "GET", "/composer/p2/matchory/a.json", nil); w.Code != 403 || g.calls.Load() != 0 {
 		t.Fatalf("%d", w.Code)
+	}
+}
+
+func TestPackagesJSONAvailablePackagePatterns(t *testing.T) {
+	store, _ := newSource(t)
+	g := &fakeSource{name: "git-fake", claims: []string{"matchory/*", "acme/x"}}
+	reg := &fakeSource{name: "reg-fake", claims: []string{"acme/x", "vendor/*"}}
+	get := func(srcs []Source, rules ...string) (int, map[string]any) {
+		w := do(server(t, srcs, rules...), "GET", "/composer/packages.json", nil)
+		var m map[string]any
+		json.Unmarshal(w.Body.Bytes(), &m)
+		return w.Code, m
+	}
+	// A caller who may read one pattern still sees every pattern.
+	code, m := get([]Source{g, reg, store}, `{"read":["composer:vendor/*"]}`)
+	got, _ := json.Marshal(m["available-package-patterns"])
+	if code != 200 || string(got) != `["acme/x","matchory-internal/*","matchory/*","vendor/*"]` {
+		t.Fatalf("%d %s", code, got)
+	}
+	if _, has := m["available-packages"]; has {
+		t.Fatal("old key present")
+	}
+	if m["metadata-url"] != "/composer/p2/%package%.json" {
+		t.Fatalf("%v", m)
+	}
+	// Any unclaimed source: key absent.
+	_, m = get([]Source{g, &fakeSource{name: "pub"}}, readAll)
+	if _, has := m["available-package-patterns"]; has {
+		t.Fatalf("%v", m)
+	}
+	// A claim of "*" covers everything: key absent.
+	_, m = get([]Source{g, &fakeSource{name: "all", claims: []string{"*"}}}, readAll)
+	if _, has := m["available-package-patterns"]; has {
+		t.Fatalf("%v", m)
+	}
+	// No composer rule at all.
+	if code, _ := get([]Source{g}, `{"read":["npm:*"]}`); code != 403 {
+		t.Fatalf("%d", code)
+	}
+	if code, _ := get([]Source{g}); code != 403 {
+		t.Fatalf("%d", code)
+	}
+	if g.calls.Load() != 0 {
+		t.Fatal("packages.json enumerated sources")
+	}
+}
+
+type logLine map[string]any
+
+func captured(buf *bytes.Buffer) []logLine {
+	var out []logLine
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m logLine
+		if json.Unmarshal([]byte(l), &m) == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func TestLogLevels(t *testing.T) {
+	g, r := gitAndReg()
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := serverLog(t, log, []Source{g, r}, `{"read":["composer:monolog/*"]}`)
+	do(h, "GET", "/composer/p2/matchory/a.json", nil)           // claimed, forbidden
+	do(h, "GET", "/composer/dist/git-fake/matchory/a/1/r", nil) // claimed, forbidden
+	do(h, "GET", "/composer/p2/monolog/monolog.json", nil)      // unclaimed
+	ls := captured(&buf)
+	if len(ls) != 3 {
+		t.Fatalf("%v", ls)
+	}
+	for i, want := range []struct {
+		level  string
+		status float64
+	}{{"INFO", 403}, {"INFO", 403}, {"DEBUG", 200}} {
+		if ls[i]["level"] != want.level || ls[i]["status"] != want.status || ls[i]["caller"] != "tag:ci" {
+			t.Errorf("line %d: %v", i, ls[i])
+		}
+	}
+
+	buf.Reset()
+	mux := http.NewServeMux()
+	New([]Source{g}, archive.Limits{MaxBytes: 1}, log).Mount(mux)
+	do(mux, "GET", "/composer/p2/matchory/a.json", nil)
+	ls = captured(&buf)
+	if len(ls) != 1 || ls[0]["level"] != "WARN" {
+		t.Fatalf("%v", ls)
+	}
+}
+
+func TestResponseHeaders(t *testing.T) {
+	store, _ := newSource(t)
+	g, r := gitAndReg()
+	h := server(t, []Source{g, r, store}, `{"read":["*"],"write":["*"]}`)
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"packages": do(h, "GET", "/composer/packages.json", nil),
+		"p2":       do(h, "GET", "/composer/p2/matchory/a.json", nil),
+		"dist":     do(h, "GET", "/composer/dist/git-fake/matchory/a/1/r", nil),
+		"upload":   do(h, "PUT", "/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(pkgZip(t, fooJSON))),
+		"p2-404":   do(h, "GET", "/composer/p2/matchory/zzz.json", nil),
+	} {
+		hd := w.Header()
+		if hd.Get("Cache-Control") != "private, no-store" || hd.Get("Vary") != "Host" || hd.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s: %v", name, hd)
+		}
+	}
+}
+
+func TestDistURLOnlyWhenReferenceKnown(t *testing.T) {
+	g, r := gitAndReg()
+	g.pkgs["matchory/n"] = []Version{
+		{Version: "1.0.0", Package: map[string]any{"name": "matchory/n", "version": "1.0.0"}},
+		{Version: "2.0.0", Reference: "", Package: map[string]any{"name": "matchory/n", "dist": map[string]any{"url": "https://upstream.example/z", "type": "zip"}}},
+	}
+	w := do(server(t, []Source{g, r}, readAll), "GET", "/composer/p2/matchory/n.json", nil)
+	var resp p2Resp
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Packages["matchory/n"]) != 2 {
+		t.Fatalf("%s", w.Body)
+	}
+	for _, v := range resp.Packages["matchory/n"] {
+		if _, has := v["dist"]; has {
+			t.Fatalf("dist invented or upstream url leaked: %v", v)
+		}
+	}
+}
+
+func TestDistHeadIs405(t *testing.T) {
+	g, r := gitAndReg()
+	w := do(server(t, []Source{g, r}, readAll), "HEAD", "/composer/dist/git-fake/matchory/a/1/r", nil)
+	if w.Code != 405 || g.distHit.Load() != 0 {
+		t.Fatalf("%d", w.Code)
+	}
+}
+
+type failBody struct{ n int }
+
+func (f *failBody) Read(p []byte) (int, error) {
+	if f.n > 0 {
+		return 0, errors.New("disk exploded")
+	}
+	f.n++
+	return copy(p, "abc"), nil
+}
+
+type brokenDist struct{ fakeSource }
+
+func (b *brokenDist) Dist(context.Context, string, string, string) (Artifact, error) {
+	return Artifact{Body: io.NopCloser(&failBody{}), Size: 100}, nil
+}
+
+func TestDistCopyErrorLogged(t *testing.T) {
+	b := &brokenDist{fakeSource{name: "b", claims: []string{"matchory/*"}}}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	do(serverLog(t, log, []Source{b}, readAll), "GET", "/composer/dist/b/matchory/a/1/r", nil)
+	found := false
+	for _, l := range captured(&buf) {
+		if l["level"] == "WARN" && strings.Contains(l["error"].(string), "disk exploded") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no warn: %s", buf.String())
+	}
+}
+
+func TestSourceKeyRemoved(t *testing.T) {
+	g, r := gitAndReg()
+	v := ver("monolog/monolog", "3.0.0", false)
+	v.Package = map[string]any{"name": "monolog/monolog", "version": "3.0.0", "dist": map[string]any{"type": "zip"},
+		"source": map[string]any{"type": "git", "url": "https://github.com/x/y.git"}}
+	r.pkgs["monolog/monolog"] = []Version{v}
+	w := do(server(t, []Source{g, r}, readAll), "GET", "/composer/p2/monolog/monolog.json", nil)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "github.com") || strings.Contains(w.Body.String(), `"source"`) {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if _, ok := v.Package["source"]; !ok {
+		t.Fatal("source map mutated")
+	}
+}
+
+func TestClientAuthorizationStripped(t *testing.T) {
+	store, _ := newSource(t)
+	mux := http.NewServeMux()
+	New([]Source{store}, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}, nil).Mount(mux)
+	var seen string
+	h := identity.Middleware(whoiser{[]string{`{"write":["composer:matchory-internal/*"]}`}}, hCap, nil)(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Get("Authorization") + r.Header.Get("Proxy-Authorization")
+			mux.ServeHTTP(w, r)
+		}))
+	w := do(h, "PUT", "/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(pkgZip(t, fooJSON)),
+		"Authorization", "Bearer junk", "Proxy-Authorization", "Basic junk")
+	if w.Code != 201 || seen != "" {
+		t.Fatalf("%d, header seen by handlers: %q", w.Code, seen)
 	}
 }

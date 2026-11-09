@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -46,6 +47,11 @@ func (c *Composer) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /composer/packages.json", c.wrap(c.packagesJSON))
 	mux.HandleFunc("GET /composer/p2/{vendor}/{file}", c.wrap(c.p2))
 	mux.HandleFunc("GET /composer/dist/{source}/{vendor}/{name}/{version}/{reference}", c.wrap(c.dist))
+	// HEAD would otherwise be served by the GET route and fetch the artifact.
+	mux.HandleFunc("HEAD /composer/dist/{source}/{vendor}/{name}/{version}/{reference}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+	})
 	mux.HandleFunc("PUT /composer/upload/{vendor}/{name}/{version}", c.wrap(c.upload))
 }
 
@@ -82,9 +88,14 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 	return func(rw http.ResponseWriter, r *http.Request) {
 		caller, ok := identity.FromContext(r.Context())
 		if !ok {
+			c.log.Warn("composer request without caller", "path", r.URL.Path, "status", http.StatusForbidden)
 			http.Error(rw, "forbidden", http.StatusForbidden)
 			return
 		}
+		hd := rw.Header()
+		hd.Set("Cache-Control", "private, no-store")
+		hd.Set("Vary", "Host")
+		hd.Set("X-Content-Type-Options", "nosniff")
 		w := &statusWriter{ResponseWriter: rw}
 		e := &entry{}
 		h(w, r, caller, e)
@@ -111,35 +122,29 @@ func (c *Composer) packagesJSON(w http.ResponseWriter, r *http.Request, caller i
 		"packages":     []any{},
 		"metadata-url": "/composer/p2/%package%.json",
 	}
-	unclaimed := false
+	// Composer may skip a repository for names matching none of these
+	// patterns. They are the claims of every source, not filtered per caller:
+	// they describe routing, not access. Any unclaimed source (or a "*" claim)
+	// can answer any name, so the key is omitted.
+	patterns := map[string]bool{}
 	for _, s := range c.sources {
 		if len(s.Claims()) == 0 {
-			unclaimed = true
+			patterns = nil
+			break
+		}
+		for _, cl := range s.Claims() {
+			if cl == "*" {
+				patterns = nil
+				break
+			}
+			patterns[cl] = true
+		}
+		if patterns == nil {
+			break
 		}
 	}
-	if !unclaimed {
-		seen := map[string]bool{}
-		names := []string{}
-		for _, s := range c.sources {
-			list, enumerable, err := s.Packages(r.Context())
-			if err != nil {
-				c.log.Warn("composer: listing packages failed", "source", s.Name(), "error", err)
-				continue
-			}
-			if !enumerable {
-				continue
-			}
-			for _, n := range list {
-				n, err := Normalize(n)
-				if err != nil || seen[n] || !authz.Allowed(caller.Rules, ecoName, n, authz.Read, Match) {
-					continue
-				}
-				seen[n] = true
-				names = append(names, n)
-			}
-		}
-		slices.Sort(names)
-		body["available-packages"] = names
+	if patterns != nil {
+		body["available-package-patterns"] = slices.Sorted(maps.Keys(patterns))
 	}
 	writeJSON(w, http.StatusOK, body)
 }
@@ -168,12 +173,12 @@ func (c *Composer) p2(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		return
 	}
 	e.pkg = name
+	cands, claimed := resolve.Candidates(c.sources, name, Match)
+	e.claimed = claimed
 	if !authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	cands, claimed := resolve.Candidates(c.sources, name, Match)
-	e.claimed = claimed
 	vs, src, err := resolve.First(r.Context(), cands, func(ctx context.Context, s Source) ([]Version, error) {
 		return s.Versions(ctx, name)
 	})
@@ -199,12 +204,12 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 		return
 	}
 	e.pkg = name
+	cands, claimed := resolve.Candidates(c.sources, name, Match)
+	e.claimed = claimed
 	if !authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	cands, claimed := resolve.Candidates(c.sources, name, Match)
-	e.claimed = claimed
 	var src Source
 	for _, s := range cands {
 		if s.Name() == r.PathValue("source") {
@@ -228,7 +233,9 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 	if art.Size > 0 {
 		w.Header().Set("Content-Length", fmt.Sprint(art.Size))
 	}
-	_, _ = io.Copy(w, art.Body)
+	if _, err := io.Copy(w, art.Body); err != nil {
+		c.log.Warn("composer dist copy failed", "package", name, "source", src.Name(), "error", err)
+	}
 }
 
 func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identity.Caller, e *entry) {
@@ -300,10 +307,11 @@ func (c *Composer) withDistURL(r *http.Request, source, name string, v Version) 
 	if pkg == nil {
 		pkg = map[string]any{}
 	}
+	delete(pkg, "source") // never reveal upstream VCS locations
 	dist, _ := pkg["dist"].(map[string]any)
-	if dist == nil {
-		dist = map[string]any{}
-		pkg["dist"] = dist
+	if dist == nil || v.Reference == "" {
+		delete(pkg, "dist") // no artifact we can address; do not invent a URL or leak upstream's
+		return pkg
 	}
 	scheme := "http"
 	if r.TLS != nil {
