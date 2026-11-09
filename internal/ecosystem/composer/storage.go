@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -54,13 +56,14 @@ const (
 // {"versions":[Version...]}. The index is written with If-Match; the zips are
 // the source of truth.
 type StorageSource struct {
-	name     string
-	claims   []string
-	d        storage.Driver
-	rec      *records.Store
-	limits   archive.Limits
-	rebuilds singleflight.Group // per package: concurrent readers share one rebuild
-	locks    sync.Map           // "<pkg>@<normalized>" -> *sync.Mutex; serialises uploads of one version (entries are tiny and never freed)
+	name      string
+	claims    []string
+	d         storage.Driver
+	rec       *records.Store
+	limits    archive.Limits
+	rebuilds  singleflight.Group // per package: concurrent readers share one rebuild
+	unhealthy atomic.Bool        // last Health probe failed; logs only on change
+	locks     sync.Map           // "<pkg>@<normalized>" -> *sync.Mutex; serialises uploads of one version (entries are tiny and never freed)
 }
 
 // trustedLimits is for archives this source already accepted once: the current
@@ -595,8 +598,14 @@ const probeKey = ".tspackages-probe"
 // Health is OK if the store answers a Stat (a miss counts as success).
 func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	h := metrics.Health{Name: s.name, OK: true, Detail: "store reachable"}
-	if _, err := s.d.Stat(ctx, probeKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		h.OK, h.Detail = false, "store unreachable: "+err.Error()
+	_, err := s.d.Stat(ctx, probeKey)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		h.OK, h.Detail = false, "unreachable"
+		if s.unhealthy.CompareAndSwap(false, true) {
+			slog.Warn("composer storage source unreachable", "source", s.name, "error", err)
+		}
+	} else {
+		s.unhealthy.Store(false)
 	}
 	return []metrics.Health{h}
 }

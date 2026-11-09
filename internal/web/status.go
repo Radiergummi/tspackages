@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"sort"
 	"time"
@@ -41,17 +42,25 @@ type Web struct {
 	moved     func() []pins.MovedTag
 	conflicts func() []composer.Conflict
 	ready     func(ctx context.Context) error
+
+	movedPkg     func(pins.MovedTag) string // package a moved tag's remote declares
+	readyTimeout time.Duration
 }
 
 // New returns the status endpoints. hostname is the fallback host for client
 // snippets when a request carries none.
 func New(hostname string, eco []ecosystem.Ecosystem, sources []StatusSource, moved func() []pins.MovedTag, conflicts func() []composer.Conflict, ready func(ctx context.Context) error) *Web {
-	return &Web{hostname: hostname, eco: eco, sources: sources, moved: moved, conflicts: conflicts, ready: ready}
+	return &Web{hostname: hostname, eco: eco, sources: sources, moved: moved, conflicts: conflicts, ready: ready, readyTimeout: 5 * time.Second}
 }
 
 // SetRejected exposes the rate limiter's rejection count as
 // tspackages_rate_limited_total.
 func (w *Web) SetRejected(f func() uint64) { metrics.SetRejected(f) }
+
+// SetMovedPackage tells the status page which package a moved tag belongs to,
+// so it can show the tag only to callers allowed to read that package. Without
+// it moved tags are hidden.
+func (w *Web) SetMovedPackage(f func(pins.MovedTag) string) { w.movedPkg = f }
 
 // Mount registers the routes on mux.
 func (w *Web) Mount(mux *http.ServeMux) {
@@ -78,9 +87,16 @@ func (w *Web) requireCaller(h http.HandlerFunc) http.HandlerFunc {
 func (w *Web) readyz(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if w.ready != nil {
-		if err := w.ready(r.Context()); err != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), w.readyTimeout)
+		defer cancel()
+		if err := w.ready(ctx); err != nil {
+			category := "unavailable"
+			if ctx.Err() != nil {
+				category = "timeout"
+			}
+			slog.Warn("not ready", "category", category, "error", err)
 			rw.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = rw.Write([]byte(err.Error()))
+			_, _ = rw.Write([]byte("not ready: " + category))
 			return
 		}
 	}
@@ -92,7 +108,7 @@ type pageData struct {
 	Ecosystems []string
 	Health     []Health
 	Moved      []pins.MovedTag
-	Conflicts  []composer.Conflict
+	Conflicts  []conflictView
 	Composer   bool
 }
 
@@ -119,11 +135,28 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 	for _, s := range w.sources {
 		d.Health = append(d.Health, s.Health(ctx)...)
 	}
-	if w.moved != nil {
-		d.Moved = w.moved()
+	allowed := func(pkg string) bool {
+		return authz.Allowed(caller.Rules, "composer", pkg, authz.Read, composer.Match)
+	}
+	if w.moved != nil && w.movedPkg != nil {
+		for _, m := range w.moved() {
+			if allowed(w.movedPkg(m)) {
+				m.Remote = metrics.RedactRemote(m.Remote)
+				d.Moved = append(d.Moved, m)
+			}
+		}
 	}
 	if w.conflicts != nil {
-		d.Conflicts = w.conflicts()
+		for _, c := range w.conflicts() {
+			if !allowed(c.Package) {
+				continue
+			}
+			v := conflictView{Package: c.Package}
+			for _, r := range c.Remotes {
+				v.Remotes = append(v.Remotes, metrics.RedactRemote(r))
+			}
+			d.Conflicts = append(d.Conflicts, v)
+		}
 	}
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.Header().Set("Cache-Control", "private, no-store")
@@ -132,6 +165,11 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 	if err := statusTmpl.Execute(rw, d); err != nil {
 		http.Error(rw, "internal error", http.StatusInternalServerError)
 	}
+}
+
+type conflictView struct {
+	Package string
+	Remotes []string
 }
 
 func hasAnyRule(rules []authz.Rule) bool { return len(rules) > 0 }

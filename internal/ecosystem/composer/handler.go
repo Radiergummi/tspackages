@@ -90,6 +90,7 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 		caller, ok := identity.FromContext(r.Context())
 		if !ok {
 			c.log.Warn("composer request without caller", "path", r.URL.Path, "status", http.StatusForbidden)
+			metrics.ObserveRequest(ecoName, "none", http.StatusForbidden)
 			http.Error(rw, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -118,7 +119,7 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 			"node", caller.NodeStableID,
 			"package", e.pkg,
 			"source", e.source,
-			"status", w.status,
+			"status", status,
 		)
 	}
 }

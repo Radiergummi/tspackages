@@ -120,6 +120,8 @@ func TestValidateErrors(t *testing.T) {
 `), "known_hosts is required for SSH remotes"},
 		{"scp without known_hosts", ecoc(`      - {name: g, type: git, claims: ["a/*"], remotes: ["git@github.com:a/b.git"]}
 `), "known_hosts is required for SSH remotes"},
+		{"https remote with credentials", ecoc(`      - {name: g, type: git, claims: ["a/*"], remotes: ["https://tok3n@github.com/a/b.git"]}
+`), "remote must not contain credentials; use token"},
 		{"file remote", ecoc(`      - {name: g, type: git, claims: ["a/*"], remotes: ["file:///x"]}
 `), "unsupported remote scheme"},
 		{"registry without fetch_hosts", ecoc(`      - {name: r, type: registry, url: "https://a"}

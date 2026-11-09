@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -186,6 +187,9 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				case "ssh":
 					ssh = true
 				case "https":
+					if u, err := url.Parse(r); err == nil && u.User != nil {
+						add("remote must not contain credentials; use token")
+					}
 				default:
 					add("unsupported remote scheme in %q (use https:// or ssh)", r)
 				}

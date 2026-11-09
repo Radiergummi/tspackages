@@ -71,8 +71,10 @@ type GitSource struct {
 
 	now func() time.Time // replaced in tests
 
-	hmu     sync.RWMutex // guards indexed
+	hmu     sync.RWMutex // guards the fields below
 	indexed []bool       // per mirror: indexed successfully at least once
+	failing []bool       // per mirror: the last index pass failed
+	pkgOf   []string     // per mirror: the package it declares, as last indexed
 
 	mu     sync.Mutex // serialises Index; guards the fields below
 	prev   []remoteResult
@@ -119,7 +121,7 @@ func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.M
 	g := &GitSource{
 		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pins, rec: rec,
 		state: state, poll: poll, log: log, maxArchive: maxArchive,
-		now: time.Now, indexed: make([]bool, len(mirrors)),
+		now: time.Now, indexed: make([]bool, len(mirrors)), failing: make([]bool, len(mirrors)), pkgOf: make([]string, len(mirrors)),
 		prev:   make([]remoteResult, len(mirrors)),
 		loaded: map[string]loaded{},
 		prov:   map[string]bool{},
@@ -175,11 +177,14 @@ func (g *GitSource) Index(ctx context.Context) error {
 		}
 		if err != nil {
 			g.log.Error("composer git: indexing failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
+			g.hmu.Lock()
+			g.failing[i] = true
+			g.hmu.Unlock()
 			continue
 		}
 		g.prev[i] = res
 		g.hmu.Lock()
-		g.indexed[i] = res.ok
+		g.indexed[i], g.failing[i], g.pkgOf[i] = res.ok, false, res.pkg
 		g.hmu.Unlock()
 	}
 	g.idx.Store(g.assemble())
@@ -577,20 +582,19 @@ func (g *GitSource) readStored(ctx context.Context, key string, max int64) ([]by
 // three poll intervals. Package-name conflicts are a separate, not-OK entry.
 func (g *GitSource) Health(context.Context) []metrics.Health {
 	g.hmu.RLock()
-	indexed := slices.Clone(g.indexed)
+	indexed, failing := slices.Clone(g.indexed), slices.Clone(g.failing)
 	g.hmu.RUnlock()
 	var out []metrics.Health
 	for i, m := range g.mirrors {
-		h := metrics.Health{Name: g.name + " " + m.Remote()}
+		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote())}
 		last := m.LastSync()
 		switch {
 		case !indexed[i]:
 			h.Detail = "never indexed"
-			if !last.IsZero() {
-				h.Detail += "; last sync " + last.UTC().Format(time.RFC3339)
-			}
 		case g.now().Sub(last) > 3*g.poll:
-			h.Detail = "last sync " + last.UTC().Format(time.RFC3339) + " is older than 3 poll intervals"
+			h.Detail = "sync stale"
+		case failing[i]:
+			h.Detail = "index failing"
 		default:
 			h.OK = true
 			h.Detail = "last sync " + last.UTC().Format(time.RFC3339)
@@ -598,13 +602,25 @@ func (g *GitSource) Health(context.Context) []metrics.Health {
 		out = append(out, h)
 	}
 	if cs := g.Conflicts(); len(cs) > 0 {
-		names := make([]string, len(cs))
-		for i, c := range cs {
-			names[i] = c.Package
-		}
-		out = append(out, metrics.Health{Name: g.name + " conflicts", Detail: "package names declared by several remotes: " + strings.Join(names, ", ")})
+		out = append(out, metrics.Health{Name: g.name + " conflicts", Detail: "conflict"})
 	}
 	return out
+}
+
+// MovedPackage returns the package the moved tag's remote declares, or "" if
+// the tag belongs to another source or the remote declares none.
+func (g *GitSource) MovedPackage(m pins.MovedTag) string {
+	if m.Source != g.name {
+		return ""
+	}
+	g.hmu.RLock()
+	defer g.hmu.RUnlock()
+	for i, mir := range g.mirrors {
+		if mir.Remote() == m.Remote {
+			return g.pkgOf[i]
+		}
+	}
+	return ""
 }
 
 // Conflicts lists package names declared by several remotes in the last pass.

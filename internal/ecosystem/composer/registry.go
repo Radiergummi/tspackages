@@ -52,7 +52,6 @@ type RegistrySource struct {
 
 	hmu      sync.Mutex // guards the health fields
 	fetchErr error      // last metadata fetch failure; nil once one succeeds
-	fetchAt  time.Time  // when fetchErr happened
 	stale    bool       // fetchErr was answered from stale cache
 }
 
@@ -158,7 +157,7 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 		// Validate before caching, so garbage never replaces good bytes.
 		_, err = parseMetadata(body, pkg, dev)
 	}
-	s.noteFetch(err, have)
+	s.noteFetch(ctx, err, have)
 	if err != nil {
 		if have {
 			// A stale not-found marker is served too, deliberately: during an
@@ -378,14 +377,21 @@ func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstre
 }
 
 // noteFetch records the outcome of an upstream metadata fetch for Health.
-func (s *RegistrySource) noteFetch(err error, haveCache bool) {
+// A cancelled request context says nothing about upstream and is ignored.
+func (s *RegistrySource) noteFetch(ctx context.Context, err error, haveCache bool) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.hmu.Lock()
 	defer s.hmu.Unlock()
 	if err == nil {
 		s.fetchErr, s.stale = nil, false
 		return
 	}
-	s.fetchErr, s.fetchAt, s.stale = err, s.now(), haveCache
+	if s.fetchErr == nil {
+		s.log.Warn("composer upstream unhealthy", "source", s.name, "stale", haveCache, "error", err)
+	}
+	s.fetchErr, s.stale = err, haveCache
 }
 
 // Health is OK unless the last upstream metadata fetch failed.
@@ -394,9 +400,10 @@ func (s *RegistrySource) Health(context.Context) []metrics.Health {
 	defer s.hmu.Unlock()
 	h := metrics.Health{Name: s.name, OK: s.fetchErr == nil, Detail: "no upstream fetch has failed"}
 	if s.fetchErr != nil {
-		h.Detail = fmt.Sprintf("last upstream fetch failed at %s: %v", s.fetchAt.UTC().Format(time.RFC3339), s.fetchErr)
+		// Category only; the error itself was logged when it first occurred.
+		h.Detail = "upstream error"
 		if s.stale {
-			h.Detail += "; serving stale"
+			h.Detail = "serving stale"
 		}
 	}
 	return []metrics.Health{h}

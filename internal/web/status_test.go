@@ -47,7 +47,7 @@ func reader() *identity.Caller {
 }
 
 func newWeb(ready func(context.Context) error) *Web {
-	return New("fallback", []ecosystem.Ecosystem{fakeEco{}},
+	w := New("fallback", []ecosystem.Ecosystem{fakeEco{}},
 		[]StatusSource{fakeSource{{Name: "main", OK: true, Detail: "fine"}, {Name: "<b>bad</b>", OK: false, Detail: "never indexed"}}},
 		func() []pins.MovedTag {
 			return []pins.MovedTag{{Ecosystem: "composer", Source: "git", Remote: "https://x/y.git", Tag: "v1.0.0<script>", Pinned: "aaa", Seen: "bbb"}}
@@ -56,6 +56,13 @@ func newWeb(ready func(context.Context) error) *Web {
 			return []composer.Conflict{{Package: "a/b", Remotes: []string{"r1", "r2"}}}
 		},
 		ready)
+	w.SetMovedPackage(func(m pins.MovedTag) string {
+		if strings.Contains(m.Remote, "other") {
+			return "b/x"
+		}
+		return "a/x"
+	})
+	return w
 }
 
 func TestStatusShowsMovedTag(t *testing.T) {
@@ -105,8 +112,61 @@ func TestHealthEndpointsNeedCallerNotCapability(t *testing.T) {
 func TestReadyz(t *testing.T) {
 	w := newWeb(func(context.Context) error { return errors.New("store down") })
 	rec := serve(t, w, "/readyz", reader())
-	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "store down") {
+	if rec.Code != 503 || rec.Body.String() != "not ready: unavailable" {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadyzDoesNotLeakErrorText(t *testing.T) {
+	w := newWeb(func(context.Context) error { return errors.New("open /var/secret/path: denied") })
+	rec := serve(t, w, "/readyz", reader())
+	if rec.Code != 503 || strings.Contains(rec.Body.String(), "/var/secret") {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadyzTimesOut(t *testing.T) {
+	w := newWeb(func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
+	w.readyTimeout = 20 * time.Millisecond
+	rec := serve(t, w, "/readyz", reader())
+	if rec.Code != 503 || rec.Body.String() != "not ready: timeout" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStatusFiltersByReadRules(t *testing.T) {
+	w := New("h", []ecosystem.Ecosystem{fakeEco{}}, nil,
+		func() []pins.MovedTag {
+			return []pins.MovedTag{
+				{Source: "git", Remote: "https://tok@h/a.git", Tag: "v-a", Pinned: "1", Seen: "2"},
+				{Source: "git", Remote: "https://h/other.git", Tag: "v-b", Pinned: "1", Seen: "2"},
+			}
+		},
+		func() []composer.Conflict {
+			return []composer.Conflict{{Package: "a/x", Remotes: []string{"https://tok@h/1.git", "r2"}}, {Package: "b/x", Remotes: []string{"r3", "r4"}}}
+		}, nil)
+	w.SetMovedPackage(func(m pins.MovedTag) string {
+		if strings.Contains(m.Remote, "other") {
+			return "b/x"
+		}
+		return "a/x"
+	})
+	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
+	body := serve(t, w, "/", c).Body.String()
+	for _, want := range []string{"v-a", "a/x"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"v-b", "b/x", "r3", "tok@"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("body leaks %q", bad)
+		}
+	}
+	// No movedPackage mapping: moved tags are hidden (fail closed).
+	w.movedPkg = nil
+	if body := serve(t, w, "/", c).Body.String(); strings.Contains(body, "v-a") {
+		t.Error("moved tag shown without package mapping")
 	}
 }
 

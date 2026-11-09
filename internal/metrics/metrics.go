@@ -8,6 +8,7 @@ package metrics
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -68,6 +69,22 @@ func init() {
 	)
 }
 
+// RedactRemote strips any userinfo from a git remote URL, so credentials never
+// reach labels, pages or logs even if a remote slipped through validation.
+func RedactRemote(remote string) string {
+	_, rest, ok := strings.Cut(remote, "://")
+	if !ok {
+		return remote
+	}
+	authority, _, _ := strings.Cut(rest, "/")
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return remote
+	}
+	scheme := remote[:len(remote)-len(rest)]
+	return scheme + rest[at+1:]
+}
+
 // Registry is the registry served at /metrics.
 func Registry() *prometheus.Registry { return registry }
 
@@ -87,5 +104,5 @@ func ObserveUpstream(source string, d time.Duration) {
 }
 
 func SetGitLastSync(source, remote string, t time.Time) {
-	gitLastSync.WithLabelValues(source, remote).Set(float64(t.Unix()))
+	gitLastSync.WithLabelValues(source, RedactRemote(remote)).Set(float64(t.Unix()))
 }

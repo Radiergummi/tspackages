@@ -3,11 +3,13 @@ package composer
 import (
 	"context"
 	"errors"
-	"strings"
+	"github.com/radiergummi/tspackages/internal/archive"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/metrics"
+	"github.com/radiergummi/tspackages/internal/pins"
 	"github.com/radiergummi/tspackages/internal/storage"
 )
 
@@ -94,7 +96,7 @@ func TestRegistryHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := e.src.Health(ctx)
-	if h[0].OK || !strings.Contains(h[0].Detail, "serving stale") {
+	if h[0].OK || h[0].Detail != "serving stale" {
 		t.Fatalf("after failure: %+v", h)
 	}
 	e.f.setStatus(0)
@@ -109,8 +111,20 @@ func TestRegistryHealth(t *testing.T) {
 	e2 := newRegEnv(t)
 	e2.f.setStatus(500)
 	_, _ = e2.src.Versions(ctx, "acme/pkg")
-	if h := e2.src.Health(ctx); h[0].OK || strings.Contains(h[0].Detail, "stale") {
+	if h := e2.src.Health(ctx); h[0].OK || h[0].Detail != "upstream error" {
 		t.Fatalf("no cache: %+v", h)
+	}
+}
+
+func TestRegistryCancelledFetchNotRecorded(t *testing.T) {
+	e := newRegEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.src.Versions(ctx, "acme/pkg"); err == nil {
+		t.Fatal("expected error")
+	}
+	if h := e.src.Health(context.Background()); !h[0].OK {
+		t.Fatalf("client cancellation marked source unhealthy: %+v", h)
 	}
 }
 
@@ -124,12 +138,20 @@ func TestGitHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := g.Health(ctx)
-	if len(h) != 2 || !h[0].OK || h[1].OK || !strings.Contains(h[1].Detail, "never indexed") {
+	if len(h) != 2 || !h[0].OK || h[1].OK || h[1].Detail != "never indexed" {
 		t.Fatalf("%+v", h)
 	}
 	g.now = func() time.Time { return time.Now().Add(10 * time.Minute) } // poll is 1m
-	if h := g.Health(ctx); h[0].OK || !strings.Contains(h[0].Detail, "older than") {
+	if h := g.Health(ctx); h[0].OK || h[0].Detail != "sync stale" {
 		t.Fatalf("stale: %+v", h[0])
+	}
+	g.now = time.Now
+	commitFile(t, good, "composer.json", `{broken`, "break")
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h := g.Health(ctx); h[0].OK || h[0].Detail != "index failing" {
+		t.Fatalf("failing index: %+v", h[0])
 	}
 	lbl := map[string]string{"source": "git", "remote": good}
 	fams, _ := metrics.Registry().Gather()
@@ -148,6 +170,20 @@ func TestGitHealth(t *testing.T) {
 	}
 }
 
+func TestGitMovedPackage(t *testing.T) {
+	a := gitRepo(t, "matchory/a")
+	g, _ := newGit(t, fsState(t), nil, a)
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := g.MovedPackage(pins.MovedTag{Source: "git", Remote: a}); got != "matchory/a" {
+		t.Errorf("got %q", got)
+	}
+	if got := g.MovedPackage(pins.MovedTag{Source: "other", Remote: a}); got != "" {
+		t.Errorf("foreign source: %q", got)
+	}
+}
+
 func TestGitHealthConflict(t *testing.T) {
 	a, b := gitRepo(t, "matchory/a"), gitRepo(t, "matchory/a")
 	g, _ := newGit(t, fsState(t), nil, a, b)
@@ -155,7 +191,7 @@ func TestGitHealthConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := g.Health(context.Background())
-	if len(h) != 3 || h[2].OK || !strings.Contains(h[2].Detail, "matchory/a") {
+	if len(h) != 3 || h[2].OK || h[2].Detail != "conflict" {
 		t.Fatalf("%+v", h)
 	}
 }
@@ -172,8 +208,20 @@ func TestStorageHealth(t *testing.T) {
 	if h := s.Health(context.Background()); !h[0].OK {
 		t.Fatalf("empty store: %+v", h)
 	}
-	s = newSourceOn(failStat{Driver: d, err: errors.New("boom")})
-	if h := s.Health(context.Background()); h[0].OK || !strings.Contains(h[0].Detail, "boom") {
+	s = newSourceOn(failStat{Driver: d, err: errors.New("open /var/secret/path: boom")})
+	if h := s.Health(context.Background()); h[0].OK || h[0].Detail != "unreachable" {
 		t.Fatalf("failing store: %+v", h)
+	}
+}
+
+func TestNoCallerRequestObserved(t *testing.T) {
+	g, _ := gitAndReg()
+	mux := http.NewServeMux()
+	New([]Source{g}, archive.Limits{MaxBytes: 1}, nil).Mount(mux)
+	lbl := map[string]string{"ecosystem": "composer", "source": "none", "code": "403"}
+	before := counter(t, "tspackages_requests_total", lbl)
+	do(mux, "GET", "/composer/packages.json", nil)
+	if got := counter(t, "tspackages_requests_total", lbl) - before; got != 1 {
+		t.Fatalf("delta = %v", got)
 	}
 }
