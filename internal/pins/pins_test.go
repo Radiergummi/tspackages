@@ -2,7 +2,10 @@ package pins
 
 import (
 	"context"
+	"io"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -87,5 +90,65 @@ func TestPinCorruptFileNotOverwritten(t *testing.T) {
 	}
 	if _, _, err := s.Pin(context.Background(), "composer", "gh", "r", "v1", sha1a); err == nil {
 		t.Fatal("expected error")
+	}
+	rc, _, err := d.Get(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	if string(got) != "{garbage" {
+		t.Fatalf("pin overwritten: %q", got)
+	}
+}
+
+func TestPinConcurrent(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	shas := []string{sha1a, sha1b}
+	got := make([]string, 2)
+	moved := make([]bool, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var err error
+			got[i], moved[i], err = s.Pin(ctx, "composer", "gh", "r", "v1", shas[i])
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got[0] != got[1] || moved[0] == moved[1] {
+		t.Fatalf("got=%v moved=%v", got, moved)
+	}
+	if len(s.Moved()) != 1 {
+		t.Fatalf("moved = %+v", s.Moved())
+	}
+}
+
+func TestMovedSortedAndCopied(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, tag := range []string{"b", "a", "c"} {
+		s.Pin(ctx, "composer", "gh", "r", tag, sha1a)
+		s.Pin(ctx, "composer", "gh", "r", tag, sha1b)
+	}
+	s.Pin(ctx, "composer", "aa", "r", "z", sha1a)
+	s.Pin(ctx, "composer", "aa", "r", "z", sha1b)
+	m := s.Moved()
+	var order []string
+	for _, x := range m {
+		order = append(order, x.Source+"/"+x.Tag)
+	}
+	if !slices.Equal(order, []string{"aa/z", "gh/a", "gh/b", "gh/c"}) {
+		t.Fatalf("order = %v", order)
+	}
+	m[0].Tag = "mutated"
+	m[1] = MovedTag{}
+	if got := s.Moved(); got[0].Tag != "z" || got[1].Tag != "a" {
+		t.Fatalf("store affected: %+v", got)
 	}
 }

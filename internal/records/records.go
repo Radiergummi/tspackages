@@ -52,7 +52,10 @@ type Provenance struct {
 	SHA1           string    `json:"sha1,omitempty"`
 	SHA256         string    `json:"sha256"`
 	Uploader       *Uploader `json:"uploader,omitempty"`
-	Created        time.Time `json:"created"`
+	// Attestation is the identity of a verified attestation (e.g. a Sigstore
+	// certificate identity); empty when none.
+	Attestation string    `json:"attestation,omitempty"`
+	Created     time.Time `json:"created"`
 }
 
 // Audit records one write action.
@@ -64,6 +67,9 @@ type Audit struct {
 	Version   string    `json:"version"`
 	SHA256    string    `json:"sha256"`
 	Uploader  Uploader  `json:"uploader"`
+	// Attestation is the identity of a verified attestation (e.g. a Sigstore
+	// certificate identity); empty when none.
+	Attestation string `json:"attestation,omitempty"`
 }
 
 type Store struct{ d storage.Driver }
@@ -78,7 +84,8 @@ func provKey(ecosystem, pkg, version, sha256 string) (string, error) {
 		storage.EscapeSegment(version) + "/" + sha256 + ".json", nil
 }
 
-// PutProvenance stores p once; an existing record is left untouched.
+// PutProvenance stores p once. An existing record for the same digest wins; a
+// differing new record for it is silently dropped.
 func (s *Store) PutProvenance(ctx context.Context, p Provenance) error {
 	key, err := provKey(p.Ecosystem, p.Package, p.Version, p.SHA256)
 	if err != nil {
@@ -119,6 +126,14 @@ func (s *Store) GetProvenance(ctx context.Context, ecosystem, pkg, version, sha2
 
 // PutAudit stores a at audit/<date>/<unixnano>-<random>.json.
 func (s *Store) PutAudit(ctx context.Context, a Audit) error {
+	if a.Action == "" {
+		return errors.New("records: audit action is empty")
+	}
+	if a.SHA256 != "" || a.Action == "publish" {
+		if !sha256RE.MatchString(a.SHA256) {
+			return fmt.Errorf("records: invalid sha256 %q", a.SHA256)
+		}
+	}
 	if a.Time.IsZero() {
 		a.Time = time.Now()
 	}
