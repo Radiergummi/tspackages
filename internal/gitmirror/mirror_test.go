@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
@@ -73,6 +74,7 @@ func TestSyncAndRefs(t *testing.T) {
 	git(t, src, "tag", "-a", "v1.0.0", "-m", "rel")
 	git(t, src, "tag", "v1.1.0")
 	git(t, src, "tag", "-a", "treetag", "-m", "x", "HEAD^{tree}")
+	git(t, src, "-c", "advice.nestedTag=false", "tag", "-a", "nested", "-m", "n", "v1.0.0")
 
 	m := newMirror(t, src)
 	if m.LastSync().IsZero() {
@@ -86,10 +88,10 @@ func TestSyncAndRefs(t *testing.T) {
 	for _, r := range refs {
 		got[r.Name] = r
 	}
-	if len(got) != 3 {
-		t.Fatalf("want 3 refs, got %+v", refs)
+	if len(got) != 4 {
+		t.Fatalf("want 4 refs (tree tag skipped), got %+v", refs)
 	}
-	for _, n := range []string{"refs/tags/v1.0.0", "refs/tags/v1.1.0", "refs/heads/main"} {
+	for _, n := range []string{"refs/tags/v1.0.0", "refs/tags/v1.1.0", "refs/heads/main", "refs/tags/nested"} {
 		r, ok := got[n]
 		if !ok || r.Commit != commit {
 			t.Errorf("%s: %+v want commit %s", n, r, commit)
@@ -155,7 +157,7 @@ func TestReadFile(t *testing.T) {
 	if _, err := m.ReadFile(ctx, commit, "nope.json"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("missing: %v", err)
 	}
-	for _, p := range []string{"../x", "a/../b", "/etc/passwd", ""} {
+	for _, p := range []string{"../x", "a/../b", "/etc/passwd", "", "./composer.json", "a/./b", "a//b", "a\nb"} {
 		if _, err := m.ReadFile(ctx, commit, p); err == nil || errors.Is(err, resolve.ErrNotFound) {
 			t.Errorf("path %q: %v", p, err)
 		}
@@ -164,6 +166,9 @@ func TestReadFile(t *testing.T) {
 		if _, err := m.ReadFile(ctx, c, "composer.json"); err == nil {
 			t.Errorf("commit %q accepted", c)
 		}
+	}
+	if _, err := m.ReadFile(ctx, commit, "src"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("directory: %v", err)
 	}
 	zeros := strings.Repeat("0", 40)
 	if _, err := m.ReadFile(ctx, zeros, "composer.json"); !errors.Is(err, resolve.ErrNotFound) {
@@ -208,7 +213,7 @@ func contains(s []string, v string) bool {
 }
 
 func TestNewRemoteValidation(t *testing.T) {
-	bad := []string{"file:///tmp/x", "/tmp/x", "ext::sh -c id", "http://example.com/x.git", "-oProxyCommand=x", "relative/path"}
+	bad := []string{"https://u:p@example.com/x.git", "https://tok@example.com/x.git", "ssh://u:p@example.com/x.git", "file:///tmp/x", "/tmp/x", "ext::sh -c id", "http://example.com/x.git", "-oProxyCommand=x", "relative/path"}
 	for _, r := range bad {
 		if _, err := New(Options{Remote: r, BaseDir: t.TempDir()}); err == nil {
 			t.Errorf("remote %q accepted", r)
@@ -235,7 +240,7 @@ func TestNewRemoteValidation(t *testing.T) {
 	if _, err := New(Options{Remote: "git@github.com:a/b.git", SSHKeyPath: key, BaseDir: t.TempDir()}); err == nil {
 		t.Error("ssh without known_hosts accepted")
 	}
-	for _, p := range []string{"/a b/key", `/a"b/key`, "/a'b/key"} {
+	for _, p := range []string{"/a b/key", `/a"b/key`, "/a'b/key", "/k/kh#", "/k/id;id", "/k/*", "/k/a|b", "rel/key", "-oFoo"} {
 		if _, err := New(Options{Remote: "git@github.com:a/b.git", SSHKeyPath: p, KnownHostsPath: kh, BaseDir: t.TempDir()}); err == nil {
 			t.Errorf("key path %q accepted", p)
 		}
@@ -291,7 +296,7 @@ func TestTokenNotInArgv(t *testing.T) {
 		t.Errorf("token in argv: %v", argv)
 	}
 	e := strings.Join(env, "\n")
-	for _, want := range []string{"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+	for _, want := range []string{"LC_ALL=C", "LANGUAGE=", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "} {
 		if !strings.Contains(e, want) {
 			t.Errorf("env missing %q", want)
@@ -301,7 +306,9 @@ func TestTokenNotInArgv(t *testing.T) {
 		t.Error("inherited GIT_DIR not dropped")
 	}
 	a := strings.Join(argv, "\n")
-	for _, want := range []string{"protocol.file.allow=never", "protocol.ext.allow=never", "core.hooksPath=/dev/null", "credential.helper=", " -- "} {
+	for _, want := range []string{"protocol.file.allow=never", "protocol.ext.allow=never", "core.hooksPath=/dev/null",
+		"credential.helper=", "http.followRedirects=false", "protocol.allow=never", "protocol.https.allow=always",
+		"protocol.ssh.allow=always", "gc.auto=0", "maintenance.auto=false", " -- "} {
 		if !strings.Contains(a, want) {
 			t.Errorf("argv missing %q: %s", want, a)
 		}
@@ -321,8 +328,100 @@ func TestSSHCommandEnv(t *testing.T) {
 	}
 	_ = m.Sync(context.Background())
 	b, _ := os.ReadFile(rec)
-	want := "GIT_SSH_COMMAND=ssh -i /k/id -o IdentitiesOnly=yes -o UserKnownHostsFile=/k/kh -o StrictHostKeyChecking=yes -o BatchMode=yes"
+	want := "GIT_SSH_COMMAND=ssh -F /dev/null -i /k/id -o IdentitiesOnly=yes -o UserKnownHostsFile=/k/kh -o StrictHostKeyChecking=yes -o BatchMode=yes"
 	if !strings.Contains(string(b), want) {
 		t.Errorf("env:\n%s", b)
+	}
+}
+
+func TestReadFileSizeCap(t *testing.T) {
+	src := makeRepo(t)
+	write(t, src, "big", strings.Repeat("x", maxReadFile+1))
+	write(t, src, "ok", strings.Repeat("x", maxReadFile))
+	git(t, src, "add", ".")
+	git(t, src, "commit", "-q", "-m", "big")
+	commit := git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	if _, err := m.ReadFile(context.Background(), commit, "big"); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("big: %v", err)
+	}
+	if b, err := m.ReadFile(context.Background(), commit, "ok"); err != nil || len(b) != maxReadFile {
+		t.Errorf("ok: %d %v", len(b), err)
+	}
+}
+
+func TestOnlyHeadsAndTagsAndDefaultBranchFollows(t *testing.T) {
+	src := makeRepo(t)
+	git(t, src, "update-ref", "refs/pull/1/head", "HEAD")
+	git(t, src, "update-ref", "refs/merge-requests/1/head", "HEAD")
+	git(t, src, "checkout", "-q", "-b", "dev")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	if out := git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
+		t.Errorf("unexpected refs:\n%s", out)
+	}
+	if b, err := m.DefaultBranch(ctx); err != nil || b != "dev" {
+		t.Errorf("DefaultBranch = %q, %v", b, err)
+	}
+	git(t, src, "checkout", "-q", "main")
+	if err := m.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := m.DefaultBranch(ctx); b != "main" {
+		t.Errorf("after switch DefaultBranch = %q", b)
+	}
+	if out := git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
+		t.Errorf("unexpected refs after resync:\n%s", out)
+	}
+}
+
+func TestStaleLocksRemoved(t *testing.T) {
+	src := makeRepo(t)
+	m := newMirror(t, src)
+	write(t, src, "x", "x")
+	git(t, src, "add", ".")
+	git(t, src, "commit", "-q", "-m", "two")
+	write(t, m.dir, "refs/heads/main.lock", "")
+	write(t, m.dir, "packed-refs.lock", "")
+	if err := m.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(m.dir, "refs/heads/main.lock")); !os.IsNotExist(err) {
+		t.Errorf("lock remains: %v", err)
+	}
+}
+
+func TestDirDependsOnCredentials(t *testing.T) {
+	base := t.TempDir()
+	mk := func(tok string) string {
+		m, err := New(Options{Remote: "https://x.example/a.git", BaseDir: base, Token: tok})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.dir
+	}
+	if mk("a") == mk("b") || mk("a") == mk("") || mk("a") != mk("a") {
+		t.Error("mirror dir does not track credential identity")
+	}
+}
+
+func TestCancelKillsProcessGroup(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nsleep 30 &\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m, err := New(Options{Remote: "https://example.com/a.git", BaseDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := m.Sync(ctx); err == nil {
+		t.Fatal("want error")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("cancel took %v", d)
 	}
 }
