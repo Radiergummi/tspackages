@@ -342,3 +342,12 @@ func TestBaseIsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestExampleConfigValidates(t *testing.T) {
+	for k, v := range map[string]string{"DEPLOY_KEY": "key", "KNOWN_HOSTS": "github.com ssh-ed25519 AAAA", "GITHUB_TOKEN": "t"} {
+		t.Setenv(k, v)
+	}
+	if _, err := Load("../../examples/config.yaml"); err != nil {
+		t.Fatal(err)
+	}
+}

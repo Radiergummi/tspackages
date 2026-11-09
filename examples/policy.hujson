@@ -1,0 +1,31 @@
+// Tailnet policy excerpt: humans read, one CI tag per publishing repo writes.
+{
+  "tagOwners": {
+    "tag:registry":   ["group:admins"],
+    "tag:ci-sdk-php": ["group:admins"],
+  },
+
+  "grants": [
+    {
+      "src": ["group:dev"],
+      "dst": ["tag:registry"],
+      "ip":  ["tcp:443"],
+      "app": {
+        "github.com/radiergummi/tspackages": [
+          {"read": ["*"]},
+        ],
+      },
+    },
+    {
+      // Read everything, publish only matchory-internal/sdk-php.
+      "src": ["tag:ci-sdk-php"],
+      "dst": ["tag:registry"],
+      "ip":  ["tcp:443"],
+      "app": {
+        "github.com/radiergummi/tspackages": [
+          {"read": ["*"], "write": ["composer:matchory-internal/sdk-php"]},
+        ],
+      },
+    },
+  ],
+}

@@ -45,6 +45,30 @@ const probeKey = ".tspackages-probe"
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
 
+// validationView returns cfg, except that with Hooks.AllowFileRemotes local
+// git remotes (which config validation rejects) are swapped for a placeholder
+// https URL in a copy; gitmirror still checks the real remote.
+func validationView(cfg *config.Config, h Hooks) *config.Config {
+	if !h.AllowFileRemotes {
+		return cfg
+	}
+	view := *cfg
+	view.Ecosystems = map[string]config.Ecosystem{}
+	for name, eco := range cfg.Ecosystems {
+		sources := slices.Clone(eco.Sources)
+		for i := range sources {
+			sources[i].Remotes = slices.Clone(sources[i].Remotes)
+			for j, r := range sources[i].Remotes {
+				if strings.HasPrefix(r, "/") || strings.HasPrefix(r, "file://") {
+					sources[i].Remotes[j] = "https://file-remote.invalid/" + strconv.Itoa(j) + ".git"
+				}
+			}
+		}
+		view.Ecosystems[name] = config.Ecosystem{Sources: sources}
+	}
+	return &view
+}
+
 type namedStore struct {
 	name string
 	d    storage.Driver
@@ -57,7 +81,7 @@ type namedStore struct {
 // start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
-	if err := config.Validate(cfg); err != nil {
+	if err := config.Validate(validationView(cfg, h)); err != nil {
 		return nil, nil, err
 	}
 	gitDir, keyDir, err := prepareWorkDir(cfg.Storage.WorkDir)
