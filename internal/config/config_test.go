@@ -148,6 +148,149 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
+func TestStoreOverlap(t *testing.T) {
+	storage := func(cache, state, hosted string) string {
+		return "storage:\n  cache: " + cache + "\n  state: " + state + "\n  stores:\n    main: " + hosted + "\n" +
+			"ecosystems:" + strings.SplitN(base, "ecosystems:", 2)[1]
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hosted = "{driver: s3, bucket: other, prefix: hosted/}"
+	tests := []struct {
+		name, cache, state, hosted string
+		wantErr                    string
+	}{
+		{"fs ancestor", "{driver: fs, path: /data}", "{driver: fs, path: /data/state}", hosted, "must not share a location"},
+		{"fs descendant", "{driver: fs, path: /data/cache}", "{driver: fs, path: /data}", hosted, "must not share a location"},
+		{"fs sibling with common name prefix", "{driver: fs, path: /data}", "{driver: fs, path: /data2}", hosted, ""},
+		{"fs relative equals absolute", "{driver: fs, path: " + cwd + "/rel}", "{driver: fs, path: ./rel/}", hosted, "must not share a location"},
+		{"fs root", "{driver: fs, path: /}", "{driver: fs, path: /state}", hosted, "must not share a location"},
+		{"s3 empty prefix contains all", "{driver: s3, bucket: b}", "{driver: s3, bucket: b, prefix: state/}", hosted, "must not share a location"},
+		{"s3 nested prefix", "{driver: s3, bucket: b, prefix: cache/}", "{driver: s3, bucket: b, prefix: cache/x/}", hosted, "must not share a location"},
+		{"s3 prefix without slash boundary", "{driver: s3, bucket: b, prefix: cache}", "{driver: s3, bucket: b, prefix: cache2}", hosted, ""},
+		{"s3 different endpoints", "{driver: s3, bucket: b, endpoint: 'https://a.example'}", "{driver: s3, bucket: b, endpoint: 'https://b.example'}", hosted, ""},
+		{"s3 same endpoint normalised", "{driver: s3, bucket: b, endpoint: 'https://A.example/'}", "{driver: s3, bucket: b, endpoint: 'https://a.example'}", hosted, "must not share a location"},
+		{"hosted store nested in state", "{driver: fs, path: /cache}", "{driver: s3, bucket: b, prefix: state/}", "{driver: s3, bucket: b, prefix: state/hosted/}", "must not share a location"},
+		{"missing storage block gives no overlap error", "{}", "{}", hosted, "driver must be fs or s3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := strings.Replace(storage(tt.cache, tt.state, tt.hosted), "SECRET", "x", 1)
+			_, err := Load(writeConfig(t, body))
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			case tt.name == "missing storage block gives no overlap error" && strings.Contains(err.Error(), "share a location"):
+				t.Fatalf("spurious overlap error: %v", err)
+			}
+		})
+	}
+}
+
+func TestRemoteKinds(t *testing.T) {
+	for _, r := range []string{"ext::sh -c 'touch /tmp/x'", "fd::3", "-oProxyCommand=a:b", "git@-evil.com:a/b.git", "host:", "/local/path"} {
+		t.Run(r, func(t *testing.T) {
+			body := strings.Replace(base, "SECRET", "x", 1) +
+				"      - {name: g, type: git, known_hosts: k, claims: [\"a/*\"], remotes: [\"" + strings.ReplaceAll(r, `"`, `\"`) + "\"]}\n"
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), "unsupported remote scheme") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	for _, r := range []string{"git@github.com:a/b.git", "github.com:a/b.git", "ssh://git@github.com/a/b.git", "https://github.com/a/b.git"} {
+		if remoteKind(r) == "" {
+			t.Errorf("%q rejected", r)
+		}
+	}
+}
+
+func TestNegativeNumbers(t *testing.T) {
+	for _, field := range []string{"burst", "requests_per_second", "upstream_fetches_per_second", "max_archive_entries"} {
+		t.Run(field, func(t *testing.T) {
+			body := strings.Replace(base, "SECRET", "x", 1) + "limits: {" + field + ": -1}\n"
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), "limits."+field+" must not be negative") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	for _, field := range []string{"metadata_ttl", "poll_interval"} {
+		t.Run(field, func(t *testing.T) {
+			body := strings.Replace(base, "SECRET", "x", 1) +
+				"      - {name: r, type: registry, url: 'https://a', fetch_hosts: [a], " + field + ": -1m}\n"
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), field+" must not be negative") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	// ByteSize cannot be negative through YAML, so exercise Validate directly.
+	c := &Config{
+		Storage: Storage{Cache: StoreConfig{Driver: "fs", Path: "/a", MaxSize: -1}, State: StoreConfig{Driver: "fs", Path: "/b"}},
+		Limits:  Limits{MaxUploadBytes: -1, MaxDecompressedBytes: -1},
+	}
+	err := Validate(c)
+	for _, want := range []string{"storage.cache: max_size", "limits.max_upload_bytes", "limits.max_decompressed_bytes"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestExpansionThroughPointersAndSlices(t *testing.T) {
+	t.Setenv("PW", "pw")
+	t.Setenv("REMOTE", "git@github.com:a/b.git")
+	t.Setenv("CLAIM", "acme/*")
+	body := strings.Replace(base, "SECRET", "x", 1) + `      - name: g
+        type: git
+        known_hosts: k
+        claims: ["${env:CLAIM}"]
+        remotes: ["${env:REMOTE}"]
+      - name: r
+        type: registry
+        url: https://a
+        fetch_hosts: [a]
+        credentials: {username: u, password: "${env:PW}"}
+`
+	c, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcs := c.Ecosystems["composer"].Sources
+	if srcs[1].Claims[0] != "acme/*" || srcs[1].Remotes[0] != "git@github.com:a/b.git" {
+		t.Errorf("slices not expanded: %+v", srcs[1])
+	}
+	if srcs[2].Credentials == nil || srcs[2].Credentials.Password != "pw" {
+		t.Errorf("credentials not expanded: %+v", srcs[2].Credentials)
+	}
+}
+
+func TestProblemsAreAggregatedInOrder(t *testing.T) {
+	body := strings.Replace(base, "SECRET", "x", 1) + `      - {name: a, type: registry, url: "https://a"}
+      - {name: a, type: git, claims: ["x/*"], remotes: ["file:///x"]}
+  npm: {sources: []}
+  pypi: {sources: []}
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("want error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"fetch_hosts is required", "duplicate source name", "unsupported remote scheme", `"npm" is not supported`, `"pypi" is not supported`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in:\n%s", want, msg)
+		}
+	}
+	if strings.Index(msg, `"npm"`) > strings.Index(msg, `"pypi"`) {
+		t.Errorf("ecosystem errors not sorted:\n%s", msg)
+	}
+}
+
 func TestBaseIsValid(t *testing.T) {
 	if _, err := Load(writeConfig(t, strings.Replace(base, "SECRET", "x", 1))); err != nil {
 		t.Fatal(err)

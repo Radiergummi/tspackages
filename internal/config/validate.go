@@ -3,7 +3,10 @@ package config
 import (
 	"errors"
 	"fmt"
-	"path"
+	"maps"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -13,8 +16,10 @@ func Validate(c *Config) error {
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
 	errs = append(errs, validateStores(&c.Storage)...)
+	errs = append(errs, validateLimits(&c.Limits)...)
 
-	for eco, e := range c.Ecosystems {
+	for _, eco := range slices.Sorted(maps.Keys(c.Ecosystems)) {
+		e := c.Ecosystems[eco]
 		if eco != "composer" {
 			add("ecosystem %q is not supported yet", eco)
 			continue
@@ -44,29 +49,99 @@ func validateStores(s *Storage) []error {
 	}
 	check("storage.cache", s.Cache)
 	check("storage.state", s.State)
-	for name, sc := range s.Stores {
-		check("storage.stores."+name, sc)
+	names := slices.Sorted(maps.Keys(s.Stores))
+	for _, name := range names {
+		check("storage.stores."+name, s.Stores[name])
 	}
 
-	if s.Cache.Driver == s.State.Driver && location(s.Cache) == location(s.State) {
-		add("storage.cache and storage.state must not share a location")
+	type named struct {
+		name string
+		sc   StoreConfig
 	}
-	for name, sc := range s.Stores {
-		for other, o := range map[string]StoreConfig{"cache": s.Cache, "state": s.State} {
-			if sc.Driver == o.Driver && location(sc) == location(o) {
-				add("storage.stores.%s and storage.%s must not share a location", name, other)
+	all := []named{{"storage.cache", s.Cache}, {"storage.state", s.State}}
+	for _, name := range names {
+		all = append(all, named{"storage.stores." + name, s.Stores[name]})
+	}
+	for _, n := range all {
+		if n.sc.MaxSize < 0 {
+			add("%s: max_size must not be negative", n.name)
+		}
+	}
+	for i := range all {
+		for j := i + 1; j < len(all); j++ {
+			if overlaps(all[i].sc, all[j].sc) {
+				add("%s and %s must not share a location", all[i].name, all[j].name)
 			}
 		}
 	}
 	return errs
 }
 
-// location identifies where a store keeps its data, within its driver.
-func location(sc StoreConfig) string {
-	if sc.Driver == "s3" {
-		return sc.Bucket + "/" + strings.Trim(sc.Prefix, "/")
+func validateLimits(l *Limits) []error {
+	var errs []error
+	neg := func(name string, negative bool) {
+		if negative {
+			errs = append(errs, fmt.Errorf("limits.%s must not be negative", name))
+		}
 	}
-	return path.Clean(sc.Path)
+	neg("max_upload_bytes", l.MaxUploadBytes < 0)
+	neg("max_decompressed_bytes", l.MaxDecompressedBytes < 0)
+	neg("max_archive_entries", l.MaxArchiveEntries < 0)
+	neg("requests_per_second", l.RequestsPerSecond < 0)
+	neg("burst", l.Burst < 0)
+	neg("upstream_fetches_per_second", l.UpstreamFetchesPerSecond < 0)
+	return errs
+}
+
+// overlaps reports whether two stores could read or write each other's data.
+// Stores with an invalid or incomplete location are skipped; check reports those.
+func overlaps(a, b StoreConfig) bool {
+	if a.Driver != b.Driver {
+		return false
+	}
+	switch a.Driver {
+	case "fs":
+		if a.Path == "" || b.Path == "" {
+			return false
+		}
+		pa, errA := filepath.Abs(a.Path)
+		pb, errB := filepath.Abs(b.Path)
+		if errA != nil || errB != nil {
+			return false
+		}
+		return pathContains(pa, pb) || pathContains(pb, pa)
+	case "s3":
+		if a.Bucket == "" || a.Bucket != b.Bucket || normEndpoint(a.Endpoint) != normEndpoint(b.Endpoint) {
+			return false
+		}
+		pa, pb := normPrefix(a.Prefix), normPrefix(b.Prefix)
+		return strings.HasPrefix(pa, pb) || strings.HasPrefix(pb, pa)
+	}
+	return false
+}
+
+// pathContains reports whether clean absolute path child is parent or below it.
+func pathContains(child, parent string) bool {
+	if child == parent {
+		return true
+	}
+	if !strings.HasSuffix(parent, string(filepath.Separator)) {
+		parent += string(filepath.Separator)
+	}
+	return strings.HasPrefix(child, parent)
+}
+
+func normEndpoint(e string) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(e)), "/")
+}
+
+// normPrefix returns "" for the bucket root, else a prefix ending in "/".
+func normPrefix(p string) string {
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return ""
+	}
+	return p + "/"
 }
 
 func validateSources(eco string, sources []Source, stores map[string]StoreConfig) []error {
@@ -86,6 +161,12 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 
 		if len(s.Claims) == 0 && s.Type != "storage" {
 			unclaimed++
+		}
+		if s.MetadataTTL < 0 {
+			add("metadata_ttl must not be negative")
+		}
+		if s.PollInterval < 0 {
+			add("poll_interval must not be negative")
 		}
 		switch s.Type {
 		case "storage":
@@ -149,9 +230,12 @@ func remoteKind(r string) string {
 	case strings.Contains(r, "://"):
 		return ""
 	}
-	// scp-style: a colon before any slash.
-	if i := strings.IndexAny(r, ":/"); i > 0 && r[i] == ':' {
+	if scpRe.MatchString(r) {
 		return "ssh"
 	}
 	return ""
 }
+
+// scpRe matches scp-style [user@]host:path; the host is plain hostname
+// characters, never starting with "-", and "::" (transport helpers) is out.
+var scpRe = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)
