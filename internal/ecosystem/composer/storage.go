@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/sync/singleflight"
@@ -170,7 +171,9 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	}
 	stored, err := s.entryFromZip(ctx, pkg, normalized, data)
 	if err != nil {
-		return Version{}, fmt.Errorf("composer: stored archive for %s %s is invalid: %w", pkg, v.Version, err)
+		// The version exists, it is just unreadable: a conflict for the client,
+		// with the reason for the server log.
+		return Version{}, fmt.Errorf("%w: stored archive unreadable: %v", ErrVersionExists, err)
 	}
 	added, err := s.addToIndex(ctx, pkg, stored)
 	if err != nil {
@@ -179,7 +182,12 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	if !added || !same {
 		return Version{}, fmt.Errorf("%w: %s %s", ErrVersionExists, pkg, v.Version)
 	}
-	if err := s.record(ctx, caller, pkg, stored, data); err != nil {
+	// Record the publish only if the interrupted original never got that far.
+	if _, err := s.rec.GetProvenance(ctx, "composer", pkg, stored.Version, stored.Reference); errors.Is(err, storage.ErrNotFound) {
+		if err := s.record(ctx, caller, pkg, stored, data); err != nil {
+			return Version{}, err
+		}
+	} else if err != nil {
 		return Version{}, err
 	}
 	return stored, nil
@@ -440,7 +448,7 @@ func (s *StorageSource) Rebuild(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	_, err = s.rebuild(ctx, pkg)
+	_, err = s.rebuild(ctx, pkg, true)
 	return err
 }
 
@@ -449,21 +457,48 @@ type rebuilt struct {
 	err error // skipped archives
 }
 
-// rebuild is shared per package: concurrent callers wait for one rebuild.
-func (s *StorageSource) rebuild(ctx context.Context, pkg string) ([]Version, error) {
-	res, err, _ := s.rebuilds.Do(pkg, func() (any, error) {
-		vs, skipped, err := s.doRebuild(ctx, pkg)
+const rebuildTimeout = 2 * time.Minute
+
+// rebuild is shared per package: concurrent callers wait for one rebuild. It
+// runs detached from the first caller's context (bounded by rebuildTimeout) so
+// that caller giving up does not fail the others; each caller still stops
+// waiting when its own ctx ends. Unless force is set, an index that appeared
+// in the meantime is used as is.
+func (s *StorageSource) rebuild(ctx context.Context, pkg string, force bool) ([]Version, error) {
+	ch := s.rebuilds.DoChan(pkg, func() (any, error) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rebuildTimeout)
+		defer cancel()
+		if !force {
+			if vs, _, err := s.loadIndex(rctx, pkg); err == nil {
+				return rebuilt{vs: vs}, nil
+			}
+		}
+		vs, skipped, err := s.doRebuild(rctx, pkg)
 		return rebuilt{vs: vs, err: errors.Join(skipped...)}, err
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		r := res.Val.(rebuilt)
+		return r.vs, r.err
 	}
-	r := res.(rebuilt)
-	return r.vs, r.err
 }
 
+// doRebuild takes the index etag before listing the zips, so an upload that
+// completes while it scans changes the etag and makes the write retry instead
+// of being overwritten.
 func (s *StorageSource) doRebuild(ctx context.Context, pkg string) ([]Version, []error, error) {
 	for range indexRetries {
+		etag := ""
+		if info, err := s.d.Stat(ctx, indexKey(pkg)); err == nil {
+			etag = info.ETag
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, err
+		}
 		vs, skipped, err := s.scan(ctx, pkg)
 		if err != nil {
 			return nil, nil, err
@@ -473,12 +508,6 @@ func (s *StorageSource) doRebuild(ctx context.Context, pkg string) ([]Version, [
 				return nil, nil, fmt.Errorf("composer: no readable archive for %s: %w", pkg, errors.Join(skipped...))
 			}
 			return nil, nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
-		}
-		etag := ""
-		if info, err := s.d.Stat(ctx, indexKey(pkg)); err == nil {
-			etag = info.ETag
-		} else if !errors.Is(err, storage.ErrNotFound) {
-			return nil, nil, err
 		}
 		err = s.writeIndex(ctx, pkg, vs, etag)
 		if errors.Is(err, storage.ErrPrecondition) {
@@ -499,7 +528,7 @@ func (s *StorageSource) Versions(ctx context.Context, name string) ([]Version, e
 	}
 	vs, _, err := s.loadIndex(ctx, pkg)
 	if errors.Is(err, storage.ErrNotFound) || errors.Is(err, errCorruptIndex) {
-		vs, err = s.rebuild(ctx, pkg)
+		vs, err = s.rebuild(ctx, pkg, false)
 		if len(vs) > 0 { // skipped archives are not fatal here
 			err = nil
 		}

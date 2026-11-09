@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -546,11 +547,128 @@ func TestRebuildRestoresSpelling(t *testing.T) {
 	}
 }
 
-func TestConcurrentReadersShareRebuild(t *testing.T) {
+// hooked counts package-prefix Lists and runs a one-shot hook after the first
+// of them has been fully consumed.
+type hooked struct {
+	storage.Driver
+	prefix string
+	lists  atomic.Int32
+	after  atomic.Pointer[func()]
+}
+
+func (h *hooked) List(ctx context.Context, prefix string) iter.Seq2[storage.Info, error] {
+	inner := h.Driver.List(ctx, prefix)
+	if prefix != h.prefix {
+		return inner
+	}
+	h.lists.Add(1)
+	return func(yield func(storage.Info, error) bool) {
+		for info, err := range inner {
+			if !yield(info, err) {
+				return
+			}
+		}
+		if f := h.after.Swap(nil); f != nil {
+			(*f)()
+		}
+	}
+}
+
+func hookedSource(t *testing.T) (*StorageSource, *hooked) {
+	d, err := storage.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &hooked{Driver: d, prefix: "composer/matchory-internal/foo/"}
+	return newSourceOn(h), h
+}
+
+func TestRebuildDoesNotDropConcurrentUpload(t *testing.T) {
+	s, h := hookedSource(t)
+	ctx := context.Background()
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON)); err != nil {
+		t.Fatal(err)
+	}
+	h.Delete(ctx, "composer/matchory-internal/foo/index.json")
+	// Upload B completes between the rebuild's List and its index write.
+	hook := func() {
+		if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "2.0.0", pkgZip(t, fooJSON)); err != nil {
+			t.Error(err)
+		}
+	}
+	h.after.Store(&hook)
+	if err := s.Rebuild(ctx, "matchory-internal/foo"); err != nil {
+		t.Fatal(err)
+	}
+	idx, _, err := s.loadIndex(ctx, "matchory-internal/foo")
+	if err != nil || len(idx) != 2 {
+		t.Fatalf("index has %d versions, want 2 (%v)", len(idx), err)
+	}
+}
+
+func TestRebuildSurvivesFirstCallerCancel(t *testing.T) {
+	s, h := hookedSource(t)
+	ctx := context.Background()
+	s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON))
+	h.Delete(ctx, "composer/matchory-internal/foo/index.json")
+	entered, release := make(chan struct{}), make(chan struct{})
+	hook := func() { close(entered); <-release }
+	h.after.Store(&hook)
+
+	ctx1, cancel1 := context.WithCancel(ctx)
+	first := make(chan error, 1)
+	go func() { _, err := s.Versions(ctx1, "matchory-internal/foo"); first <- err }()
+	<-entered
+	cancel1()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first caller: %v", err)
+	}
+	second := make(chan error, 1)
+	go func() {
+		vs, err := s.Versions(ctx, "matchory-internal/foo")
+		if err == nil && len(vs) != 1 {
+			err = fmt.Errorf("got %d versions", len(vs))
+		}
+		second <- err
+	}()
+	close(release)
+	if err := <-second; err != nil {
+		t.Fatalf("second caller: %v", err)
+	}
+}
+
+func TestRepairRecordsPublishOnce(t *testing.T) {
+	s, f := flakySource(t)
+	ctx := context.Background()
+	data := pkgZip(t, fooJSON)
+	f.fail.Store(true)
+	s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", data)
+	f.fail.Store(false)
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", data); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(t, f, "audit/"); len(got) != 1 {
+		t.Fatalf("want exactly one publish audit, got %v", got)
+	}
+}
+
+func TestRepairWithUnreadableStoredArchive(t *testing.T) {
 	s, d := newSource(t)
+	ctx := context.Background()
+	d.Put(ctx, zipKey("matchory-internal/foo", "1.0.0.0"), strings.NewReader("junk"))
+	_, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON))
+	if !errors.Is(err, ErrVersionExists) || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestConcurrentReadersShareRebuild(t *testing.T) {
+	s, h := hookedSource(t)
+	d := storage.Driver(h)
 	ctx := context.Background()
 	s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON))
 	d.Delete(ctx, "composer/matchory-internal/foo/index.json")
+	h.lists.Store(0)
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
@@ -562,4 +680,7 @@ func TestConcurrentReadersShareRebuild(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if n := h.lists.Load(); n != 1 {
+		t.Fatalf("rebuild ran %d times, want 1", n)
+	}
 }
