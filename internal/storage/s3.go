@@ -7,14 +7,19 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"math/rand/v2"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/radiergummi/tspackages/internal/config"
 )
@@ -23,6 +28,8 @@ type s3Driver struct {
 	client *s3.Client
 	bucket string
 	prefix string // "" or ends in "/"
+
+	bucketOK atomic.Bool // cached positive HeadBucket result
 }
 
 // NewS3 returns a driver backed by an S3-compatible bucket. A custom endpoint
@@ -79,16 +86,42 @@ func quoteETag(e string) string {
 	return `"` + e + `"`
 }
 
+func errCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return ""
+}
+
+func isNoSuchKey(err error) bool {
+	var nsk *types.NoSuchKey
+	return errors.As(err, &nsk) || errCode(err) == "NoSuchKey"
+}
+
+// bucketCheck returns nil if the bucket exists. A positive result is cached
+// for the driver's lifetime.
+func (d *s3Driver) bucketCheck(ctx context.Context) error {
+	if d.bucketOK.Load() {
+		return nil
+	}
+	if _, err := d.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &d.bucket}); err != nil {
+		return fmt.Errorf("storage: bucket %q: %w", d.bucket, err)
+	}
+	d.bucketOK.Store(true)
+	return nil
+}
+
 func (d *s3Driver) Get(ctx context.Context, key string) (io.ReadCloser, Info, error) {
 	if err := ValidKey(key); err != nil {
 		return nil, Info{}, err
 	}
 	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &d.bucket, Key: d.full(key)})
 	if err != nil {
-		if status(err) == http.StatusNotFound {
+		if isNoSuchKey(err) {
 			return nil, Info{}, ErrNotFound
 		}
-		return nil, Info{}, err
+		return nil, Info{}, fmt.Errorf("storage: get %q: %w", key, err)
 	}
 	return out.Body, Info{
 		Key:     key,
@@ -105,9 +138,13 @@ func (d *s3Driver) Stat(ctx context.Context, key string) (Info, error) {
 	out, err := d.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &d.bucket, Key: d.full(key)})
 	if err != nil {
 		if status(err) == http.StatusNotFound {
+			// HEAD carries no error code: tell a missing key from a missing bucket.
+			if berr := d.bucketCheck(ctx); berr != nil {
+				return Info{}, berr
+			}
 			return Info{}, ErrNotFound
 		}
-		return Info{}, err
+		return Info{}, fmt.Errorf("storage: stat %q: %w", key, err)
 	}
 	return Info{
 		Key:     key,
@@ -117,9 +154,18 @@ func (d *s3Driver) Stat(ctx context.Context, key string) (Info, error) {
 	}, nil
 }
 
+const (
+	maxPutAttempts = 5
+	minBackoff     = 20 * time.Millisecond
+	maxBackoff     = 200 * time.Millisecond
+)
+
+// errConflict marks a PutObject that kept hitting 409 conditional conflicts.
+var errConflict = errors.New("storage: conditional write conflict persisted")
+
 // put uploads r, optionally conditionally. The body is buffered because
-// PutObject needs a seekable payload; a 409 conditional conflict is retried
-// once.
+// PutObject needs a seekable payload. 409 conditional conflicts are retried
+// with jittered backoff.
 func (d *s3Driver) put(ctx context.Context, key string, r io.Reader, ifNoneMatch, ifMatch string) (Info, error) {
 	if err := ValidKey(key); err != nil {
 		return Info{}, err
@@ -128,7 +174,15 @@ func (d *s3Driver) put(ctx context.Context, key string, r io.Reader, ifNoneMatch
 	if err != nil {
 		return Info{}, err
 	}
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < maxPutAttempts; attempt++ {
+		if attempt > 0 {
+			wait := minBackoff + rand.N(maxBackoff-minBackoff)
+			select {
+			case <-ctx.Done():
+				return Info{}, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
 		in := &s3.PutObjectInput{
 			Bucket:        &d.bucket,
 			Key:           d.full(key),
@@ -143,25 +197,37 @@ func (d *s3Driver) put(ctx context.Context, key string, r io.Reader, ifNoneMatch
 		}
 		out, err := d.client.PutObject(ctx, in)
 		if err == nil {
-			return Info{Key: key, Size: int64(len(data)), ETag: cleanETag(out.ETag)}, nil
+			return Info{Key: key, Size: int64(len(data)), ETag: cleanETag(out.ETag), ModTime: time.Now().UTC()}, nil
 		}
-		if status(err) == http.StatusConflict && attempt == 0 {
+		if status(err) == http.StatusConflict {
 			continue
 		}
 		return Info{}, err
 	}
+	return Info{}, errConflict
 }
 
 func (d *s3Driver) Put(ctx context.Context, key string, r io.Reader) (Info, error) {
-	return d.put(ctx, key, r, "", "")
+	info, err := d.put(ctx, key, r, "", "")
+	if err != nil {
+		return Info{}, fmt.Errorf("storage: put %q: %w", key, err)
+	}
+	return info, nil
 }
 
 func (d *s3Driver) PutIfAbsent(ctx context.Context, key string, r io.Reader) (Info, error) {
 	info, err := d.put(ctx, key, r, "*", "")
-	if status(err) == http.StatusPreconditionFailed {
+	switch {
+	case err == nil:
+		return info, nil
+	case status(err) == http.StatusPreconditionFailed:
 		return Info{}, ErrExists
+	case errors.Is(err, errConflict):
+		if _, serr := d.Stat(ctx, key); serr == nil {
+			return Info{}, ErrExists
+		}
 	}
-	return info, err
+	return Info{}, fmt.Errorf("storage: put-if-absent %q: %w", key, err)
 }
 
 func (d *s3Driver) PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (Info, error) {
@@ -172,11 +238,21 @@ func (d *s3Driver) PutIfMatch(ctx context.Context, key string, r io.Reader, etag
 	} else {
 		info, err = d.put(ctx, key, r, "", etag)
 	}
-	// If-Match on a missing key yields 404 on AWS and 412 elsewhere.
-	if s := status(err); s == http.StatusPreconditionFailed || (etag != "" && s == http.StatusNotFound) {
+	switch {
+	case err == nil:
+		return info, nil
+	case status(err) == http.StatusPreconditionFailed:
 		return Info{}, ErrPrecondition
+	case errors.Is(err, errConflict):
+		return Info{}, fmt.Errorf("%w: %w", ErrPrecondition, err)
+	case etag != "" && status(err) == http.StatusNotFound:
+		// If-Match on a missing key is a 404: a missing key is a failed
+		// precondition, a missing bucket is a real error.
+		if isNoSuchKey(err) || d.bucketCheck(ctx) == nil {
+			return Info{}, ErrPrecondition
+		}
 	}
-	return info, err
+	return Info{}, fmt.Errorf("storage: put-if-match %q: %w", key, err)
 }
 
 func (d *s3Driver) Delete(ctx context.Context, key string) error {
@@ -184,10 +260,10 @@ func (d *s3Driver) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	_, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &d.bucket, Key: d.full(key)})
-	if status(err) == http.StatusNotFound {
-		return nil
+	if err != nil && !isNoSuchKey(err) {
+		return fmt.Errorf("storage: delete %q: %w", key, err)
 	}
-	return err
+	return nil
 }
 
 func (d *s3Driver) List(ctx context.Context, prefix string) iter.Seq2[Info, error] {

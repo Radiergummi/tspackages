@@ -11,7 +11,9 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,11 +24,18 @@ const (
 	tmpSuffix  = ".tmp"
 )
 
+var reservedSuffixes = []string{etagSuffix, lockSuffix, tmpSuffix}
+
 type fsDriver struct{ root string }
 
 // NewFS returns a driver storing objects as files below root. Next to each
-// object it keeps a "<key>.etag" sidecar and a "<key>.lock" file; keys ending
-// in .etag, .lock or .tmp are therefore rejected.
+// object it keeps a "<key>.etag" sidecar and a "<key>.lock" file; no path
+// segment of a key may end in .etag, .lock or .tmp. A key cannot also be a
+// prefix of another key (a file cannot be a directory); such writes fail with
+// ErrInvalidKey or ErrExists.
+//
+// Lock files are created on first write or read of an object and are never
+// removed, not even by Delete: removing a lock file races with holders.
 func NewFS(root string) (Driver, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -42,44 +51,42 @@ func (d *fsDriver) path(key string) (string, error) {
 	if err := ValidKey(key); err != nil {
 		return "", err
 	}
-	for _, s := range []string{etagSuffix, lockSuffix, tmpSuffix} {
-		if strings.HasSuffix(key, s) {
-			return "", fmt.Errorf("%w: reserved suffix %q", ErrInvalidKey, s)
+	for seg := range strings.SplitSeq(key, "/") {
+		for _, s := range reservedSuffixes {
+			if strings.HasSuffix(seg, s) {
+				return "", fmt.Errorf("%w: reserved suffix %q", ErrInvalidKey, s)
+			}
 		}
 	}
 	return filepath.Join(d.root, filepath.FromSlash(key)), nil
 }
 
-// lock takes an flock on "<p>.lock" and returns its release function. All
-// writers and Get/Stat use it, so an object and its sidecar are always seen
-// together.
-func lock(p string, how int) (func(), error) {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return nil, err
-	}
+// lock takes an flock on "<p>.lock", polling so that ctx can abort the wait,
+// and returns the release function. The parent directory must exist.
+func lock(ctx context.Context, p string, how int) (func(), error) {
 	f, err := os.OpenFile(p+lockSuffix, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	for {
-		err = unix.Flock(int(f.Fd()), how)
-		if !errors.Is(err, unix.EINTR) {
-			break
+		err = unix.Flock(int(f.Fd()), how|unix.LOCK_NB)
+		if err == nil {
+			return func() { f.Close() }, nil // closing releases the flock
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Millisecond):
 		}
 	}
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return func() { f.Close() }, nil // closing releases the flock
 }
 
-// etagOf reads the sidecar, falling back to hashing the object when it is
-// missing (e.g. after a crash between writing the object and its sidecar).
-func etagOf(p string) (string, error) {
-	if b, err := os.ReadFile(p + etagSuffix); err == nil {
-		return string(b), nil
-	}
+func hashFile(p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err
@@ -92,19 +99,44 @@ func etagOf(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// etagOf returns the object's ETag. The sidecar records "<etag> <size>
+// <mtime-ns>" of the object it was computed for; if the object no longer
+// matches (a crash between publishing the object and its sidecar) or the
+// sidecar is missing, the content is hashed instead.
+func etagOf(p string, fi fs.FileInfo) (string, error) {
+	if b, err := os.ReadFile(p + etagSuffix); err == nil {
+		var etag string
+		var size, mtime int64
+		if n, _ := fmt.Sscanf(string(b), "%s %d %d", &etag, &size, &mtime); n == 3 &&
+			size == fi.Size() && mtime == fi.ModTime().UnixNano() {
+			return etag, nil
+		}
+	}
+	return hashFile(p)
+}
+
 func (d *fsDriver) info(key, p string, fi fs.FileInfo) (Info, error) {
-	etag, err := etagOf(p)
+	etag, err := etagOf(p, fi)
 	if err != nil {
 		return Info{}, err
 	}
 	return Info{Key: key, Size: fi.Size(), ETag: etag, ModTime: fi.ModTime()}, nil
 }
 
-func mapNotExist(err error) error {
-	if errors.Is(err, fs.ErrNotExist) {
-		return ErrNotFound
+func isMissing(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOTDIR)
+}
+
+// regular stats p and reports whether a regular file lives there.
+func regular(p string) (fs.FileInfo, bool, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		if isMissing(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
-	return err
+	return fi, fi.Mode().IsRegular(), nil
 }
 
 func (d *fsDriver) Get(ctx context.Context, key string) (io.ReadCloser, Info, error) {
@@ -115,31 +147,37 @@ func (d *fsDriver) Get(ctx context.Context, key string) (io.ReadCloser, Info, er
 	if err := ctx.Err(); err != nil {
 		return nil, Info{}, err
 	}
+	// Reads never create anything for a missing object.
+	if _, ok, err := regular(p); err != nil {
+		return nil, Info{}, err
+	} else if !ok {
+		return nil, Info{}, ErrNotFound
+	}
 	// The shared lock is held only while opening; the open file stays valid
 	// across a concurrent rename.
-	if _, err := os.Stat(filepath.Dir(p)); err != nil {
-		return nil, Info{}, mapNotExist(err)
-	}
-	unlock, err := lock(p, unix.LOCK_SH)
+	unlock, err := lock(ctx, p, unix.LOCK_SH)
 	if err != nil {
 		return nil, Info{}, err
 	}
 	defer unlock()
 	f, err := os.Open(p)
 	if err != nil {
-		return nil, Info{}, mapNotExist(err)
+		if isMissing(err) {
+			return nil, Info{}, ErrNotFound
+		}
+		return nil, Info{}, err
 	}
 	fi, err := f.Stat()
-	if err == nil && fi.IsDir() {
-		err = fs.ErrNotExist
-	}
 	var info Info
 	if err == nil {
 		info, err = d.info(key, p, fi)
 	}
 	if err != nil {
 		f.Close()
-		return nil, Info{}, mapNotExist(err)
+		if isMissing(err) {
+			return nil, Info{}, ErrNotFound
+		}
+		return nil, Info{}, err
 	}
 	return f, info, nil
 }
@@ -153,8 +191,17 @@ func (d *fsDriver) Stat(ctx context.Context, key string) (Info, error) {
 	return info, nil
 }
 
-// stage streams r into a synced temp file next to p and returns its path and
-// content hash.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// stage streams r into a synced 0644 temp file next to p and returns its path
+// and content hash.
 func stage(p string, r io.Reader) (tmp, etag string, err error) {
 	f, err := os.CreateTemp(filepath.Dir(p), "*"+tmpSuffix)
 	if err != nil {
@@ -171,6 +218,9 @@ func stage(p string, r io.Reader) (tmp, etag string, err error) {
 	if _, err = io.Copy(io.MultiWriter(f, h), r); err != nil {
 		return "", "", err
 	}
+	if err = f.Chmod(0o644); err != nil {
+		return "", "", err
+	}
 	if err = f.Sync(); err != nil {
 		return "", "", err
 	}
@@ -180,12 +230,15 @@ func stage(p string, r io.Reader) (tmp, etag string, err error) {
 	return tmp, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func writeSidecar(p, etag string) error {
+func writeSidecar(p string, etag string, fi fs.FileInfo) error {
 	f, err := os.CreateTemp(filepath.Dir(p), "*"+tmpSuffix)
 	if err != nil {
 		return err
 	}
-	_, err = f.WriteString(etag)
+	_, err = fmt.Fprintf(f, "%s %d %d", etag, fi.Size(), fi.ModTime().UnixNano())
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
 	if err == nil {
 		err = f.Sync()
 	}
@@ -208,8 +261,20 @@ const (
 	modeCreate
 )
 
+func conflictErr(err error) error {
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENOTEMPTY) {
+		return fmt.Errorf("%w: key conflicts with another key's prefix", ErrInvalidKey)
+	}
+	return err
+}
+
 // write stores r at key under the key's exclusive lock. check, if non-nil,
 // runs under the lock before anything is published.
+//
+// Guarantees: readers see either the old or the new object, never a partial
+// one (temp file, fsync, atomic rename/link, directory fsync). The sidecar is
+// written after the object and records the object's size and mtime, so a crash
+// between the two leaves a sidecar that etagOf recognises as stale and ignores.
 func (d *fsDriver) write(ctx context.Context, key string, r io.Reader, mode commitMode, check func(p string) error) (Info, error) {
 	p, err := d.path(key)
 	if err != nil {
@@ -218,7 +283,11 @@ func (d *fsDriver) write(ctx context.Context, key string, r io.Reader, mode comm
 	if err := ctx.Err(); err != nil {
 		return Info{}, err
 	}
-	unlock, err := lock(p, unix.LOCK_EX)
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Info{}, conflictErr(err)
+	}
+	unlock, err := lock(ctx, p, unix.LOCK_EX)
 	if err != nil {
 		return Info{}, err
 	}
@@ -233,34 +302,30 @@ func (d *fsDriver) write(ctx context.Context, key string, r io.Reader, mode comm
 		return Info{}, err
 	}
 	defer os.Remove(tmp) // no-op once renamed
-	// The sidecar goes first; for a create the object does not exist yet, so
-	// a leftover sidecar is harmless.
-	if err := writeSidecar(p, etag); err != nil {
-		return Info{}, err
-	}
 	if mode == modeCreate {
 		if err := os.Link(tmp, p); err != nil {
 			if errors.Is(err, fs.ErrExist) {
 				return Info{}, ErrExists
 			}
-			return Info{}, err
+			return Info{}, conflictErr(err)
 		}
 	} else if err := os.Rename(tmp, p); err != nil {
-		return Info{}, err
+		if errors.Is(err, fs.ErrExist) { // a directory is in the way (macOS)
+			err = unix.EISDIR
+		}
+		return Info{}, conflictErr(err)
 	}
 	fi, err := os.Stat(p)
 	if err != nil {
 		return Info{}, err
 	}
-	return Info{Key: key, Size: fi.Size(), ETag: etag, ModTime: fi.ModTime()}, nil
-}
-
-func exists(p string) (bool, error) {
-	_, err := os.Lstat(p)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
+	if err := writeSidecar(p, etag, fi); err != nil {
+		return Info{}, err
 	}
-	return err == nil, err
+	if err := syncDir(dir); err != nil {
+		return Info{}, err
+	}
+	return Info{Key: key, Size: fi.Size(), ETag: etag, ModTime: fi.ModTime()}, nil
 }
 
 func (d *fsDriver) Put(ctx context.Context, key string, r io.Reader) (Info, error) {
@@ -269,10 +334,10 @@ func (d *fsDriver) Put(ctx context.Context, key string, r io.Reader) (Info, erro
 
 func (d *fsDriver) PutIfAbsent(ctx context.Context, key string, r io.Reader) (Info, error) {
 	return d.write(ctx, key, r, modeCreate, func(p string) error {
-		if ok, err := exists(p); err != nil {
-			return err
-		} else if ok {
+		if _, err := os.Lstat(p); err == nil {
 			return ErrExists
+		} else if !isMissing(err) {
+			return err
 		}
 		return nil
 	})
@@ -284,12 +349,12 @@ func (d *fsDriver) PutIfMatch(ctx context.Context, key string, r io.Reader, etag
 		mode = modeCreate
 	}
 	return d.write(ctx, key, r, mode, func(p string) error {
-		ok, err := exists(p)
+		fi, ok, err := regular(p)
 		if err != nil {
 			return err
 		}
 		if etag == "" {
-			if ok {
+			if _, err := os.Lstat(p); err == nil {
 				return ErrPrecondition
 			}
 			return nil
@@ -297,7 +362,7 @@ func (d *fsDriver) PutIfMatch(ctx context.Context, key string, r io.Reader, etag
 		if !ok {
 			return ErrPrecondition
 		}
-		cur, err := etagOf(p)
+		cur, err := etagOf(p, fi)
 		if err != nil {
 			return err
 		}
@@ -316,25 +381,30 @@ func (d *fsDriver) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if ok, _ := exists(filepath.Dir(p)); !ok {
-		return nil
+	if _, ok, err := regular(p); err != nil || !ok {
+		return err
 	}
-	unlock, err := lock(p, unix.LOCK_EX)
+	unlock, err := lock(ctx, p, unix.LOCK_EX)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := os.Remove(p); err != nil && !isMissing(err) {
 		return err
 	}
-	if err := os.Remove(p + etagSuffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := os.Remove(p + etagSuffix); err != nil && !isMissing(err) {
 		return err
 	}
 	return nil
 }
 
 func isSidecar(name string) bool {
-	return strings.HasSuffix(name, etagSuffix) || strings.HasSuffix(name, lockSuffix) || strings.HasSuffix(name, tmpSuffix)
+	for _, s := range reservedSuffixes {
+		if strings.HasSuffix(name, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, error] {
@@ -347,10 +417,12 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 		if i := strings.LastIndexByte(prefix, '/'); i >= 0 {
 			start = filepath.Join(d.root, filepath.FromSlash(prefix[:i]))
 		}
-		stop := errors.New("stop")
+		// Collect keys first and sort them byte-wise: directory walk order
+		// differs from key order ("a.b" sorts before "a/b").
+		var keys []string
 		err := filepath.WalkDir(start, func(p string, de fs.DirEntry, err error) error {
 			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
+				if isMissing(err) {
 					return nil
 				}
 				return err
@@ -365,31 +437,40 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 			if err != nil {
 				return err
 			}
-			key := filepath.ToSlash(rel)
-			if !strings.HasPrefix(key, prefix) {
-				return nil
-			}
-			fi, err := de.Info()
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return nil
-				}
-				return err
-			}
-			info, err := d.info(key, p, fi)
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					return nil
-				}
-				return err
-			}
-			if !yield(info, nil) {
-				return stop
+			if key := filepath.ToSlash(rel); strings.HasPrefix(key, prefix) {
+				keys = append(keys, key)
 			}
 			return nil
 		})
-		if err != nil && !errors.Is(err, stop) {
+		if err != nil {
 			yield(Info{}, err)
+			return
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if err := ctx.Err(); err != nil {
+				yield(Info{}, err)
+				return
+			}
+			p := filepath.Join(d.root, filepath.FromSlash(key))
+			fi, ok, err := regular(p)
+			if err == nil && !ok {
+				continue // deleted meanwhile
+			}
+			var info Info
+			if err == nil {
+				info, err = d.info(key, p, fi)
+			}
+			if err != nil {
+				if isMissing(err) {
+					continue
+				}
+				yield(Info{}, err)
+				return
+			}
+			if !yield(info, nil) {
+				return
+			}
 		}
 	}
 }

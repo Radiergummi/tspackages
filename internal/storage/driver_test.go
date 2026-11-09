@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"testing"
 )
@@ -167,6 +168,87 @@ func runDriverSuite(t *testing.T, d Driver) {
 
 	t.Run("GetMissing", func(t *testing.T) {
 		if _, _, err := d.Get(ctx, "nope/missing"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+
+	t.Run("PutIfMatchConcurrent", func(t *testing.T) {
+		base := put(t, d, "pimc/k", "base")
+		const n = 16
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = d.PutIfMatch(ctx, "pimc/k", bytes.NewReader([]byte(fmt.Sprintf("w-%d", i))), base.ETag)
+			}()
+		}
+		wg.Wait()
+		winner, lost := -1, 0
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				if winner != -1 {
+					t.Fatal("more than one winner")
+				}
+				winner = i
+			case errors.Is(err, ErrPrecondition):
+				lost++
+			default:
+				t.Fatalf("writer %d: %v", i, err)
+			}
+		}
+		if winner == -1 || lost != n-1 {
+			t.Fatalf("winner=%d lost=%d", winner, lost)
+		}
+		if body, _ := read(t, d, "pimc/k"); body != fmt.Sprintf("w-%d", winner) {
+			t.Fatalf("body=%q", body)
+		}
+	})
+
+	t.Run("DeleteMissing", func(t *testing.T) {
+		if err := d.Delete(ctx, "del/never-existed"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("ListInvalidPrefix", func(t *testing.T) {
+		for _, p := range []string{"../x", "a//b", "/a", `a\b`} {
+			var got error
+			for _, err := range d.List(ctx, p) {
+				got = err
+				break
+			}
+			if !errors.Is(got, ErrInvalidKey) {
+				t.Errorf("List(%q): %v", p, got)
+			}
+		}
+	})
+
+	t.Run("ListOrder", func(t *testing.T) {
+		keys := []string{"ord/b", "ord/x/y", "ord/x.y", "ord/x-y", "ord/a", "ord/x_y", "ord/0"}
+		for _, k := range keys {
+			put(t, d, k, "x")
+		}
+		sort.Strings(keys)
+		var got []string
+		for info, err := range d.List(ctx, "ord/") {
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, info.Key)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(keys) {
+			t.Fatalf("got %v, want %v", got, keys)
+		}
+	})
+
+	t.Run("GetCancelledContext", func(t *testing.T) {
+		put(t, d, "ctx/k", "x")
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		if _, _, err := d.Get(cctx, "ctx/k"); !errors.Is(err, context.Canceled) {
 			t.Fatalf("err=%v", err)
 		}
 	})

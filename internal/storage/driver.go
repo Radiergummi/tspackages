@@ -32,7 +32,10 @@ type Info struct {
 }
 
 // Driver is a flat key/value blob store with conditional writes. Keys are
-// validated with ValidKey. Delete of a missing key is not an error.
+// validated with ValidKey. Delete of a missing key is not an error. A key must
+// not also be a prefix of another key ("a" and "a/b"): the fs driver rejects
+// this, the S3 driver cannot detect it cheaply and allows it, so callers must
+// not rely on either.
 type Driver interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, Info, error)
 	Stat(ctx context.Context, key string) (Info, error)
@@ -40,7 +43,7 @@ type Driver interface {
 	PutIfAbsent(ctx context.Context, key string, r io.Reader) (Info, error)             // ErrExists
 	PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (Info, error) // etag "" = must not exist; ErrPrecondition
 	Delete(ctx context.Context, key string) error
-	// List yields every key that starts with prefix, in lexical order.
+	// List yields every key that starts with prefix, in byte-wise lexical order.
 	List(ctx context.Context, prefix string) iter.Seq2[Info, error]
 }
 
