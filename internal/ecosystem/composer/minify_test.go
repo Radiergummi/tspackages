@@ -34,3 +34,16 @@ func TestExpand(t *testing.T) {
 		t.Fatal("input was modified")
 	}
 }
+
+func TestExpandDoesNotShareNestedValues(t *testing.T) {
+	var in []map[string]any
+	if err := json.Unmarshal([]byte(`[{"version":"2","dist":{"url":"a"},"tags":["x"]},{"version":"1"}]`), &in); err != nil {
+		t.Fatal(err)
+	}
+	out := Expand(in)
+	out[0]["dist"].(map[string]any)["url"] = "changed"
+	out[0]["tags"].([]any)[0] = "changed"
+	if out[1]["dist"].(map[string]any)["url"] != "a" || out[1]["tags"].([]any)[0] != "x" {
+		t.Fatal("nested values shared")
+	}
+}

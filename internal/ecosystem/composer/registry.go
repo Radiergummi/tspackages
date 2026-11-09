@@ -3,13 +3,14 @@ package composer
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -21,15 +22,14 @@ import (
 
 const (
 	defaultFetchTimeout = 5 * time.Minute
-	maxMetadataSize     = 64 << 20
+	// maxMetadataSize caps one p2 response; the largest real packages are well under 16 MiB.
+	maxMetadataSize = 16 << 20
 )
 
 // notFoundMarker is cached in place of metadata when upstream answered 404,
 // so repeated lookups of an unknown name do not hammer upstream. Real p2
 // documents always carry a "packages" key, so they never equal it.
 var notFoundMarker = []byte(`{"tspackages":"not-found"}`)
-
-var plainSegmentRE = regexp.MustCompile(`^[a-z0-9._~+-]+$`)
 
 // RegistrySource passes through an upstream Composer v2 repository. Metadata
 // is cached for ttl and served stale when upstream fails; dist archives are
@@ -144,8 +144,14 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 		return cached, !bytes.Equal(cached, notFoundMarker), nil
 	}
 	body, found, err = s.fetchMeta(ctx, s.metaURL(pkg, dev))
+	if err == nil && found {
+		// Validate before caching, so garbage never replaces good bytes.
+		_, err = parseMetadata(body, pkg, dev)
+	}
 	if err != nil {
 		if have {
+			// A stale not-found marker is served too, deliberately: during an
+			// outage an unknown name stays unknown rather than turning into a 502.
 			s.log.Warn("serving stale composer metadata", "source", s.name, "package", pkg, "dev", dev, "error", err)
 			return cached, !bytes.Equal(cached, notFoundMarker), nil
 		}
@@ -178,6 +184,9 @@ func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 	for k, v := range doc.Packages {
 		if n, err := Normalize(k); err != nil || n != pkg {
 			return nil, fmt.Errorf("upstream metadata for %s contains package %q", pkg, k)
+		}
+		if raw != nil {
+			return nil, fmt.Errorf("upstream metadata for %s lists the package twice", pkg)
 		}
 		raw = v
 	}
@@ -225,9 +234,6 @@ func (s *RegistrySource) Versions(ctx context.Context, name string) ([]Version, 
 	if err != nil {
 		return nil, err
 	}
-	if !okStable && !okDev {
-		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
-	}
 	var out []Version
 	if okStable {
 		vs, err := parseMetadata(stable, pkg, false)
@@ -243,6 +249,9 @@ func (s *RegistrySource) Versions(ctx context.Context, name string) ([]Version, 
 		}
 		out = append(out, vs...)
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
+	}
 	return out, nil
 }
 
@@ -251,24 +260,24 @@ func (s *RegistrySource) distKey(sha256 string) string {
 }
 
 func (s *RegistrySource) distRefKey(pkg, version, reference string) string {
-	if !plainSegmentRE.MatchString(reference) {
-		reference = storage.EscapeSegment(reference)
-	}
-	return "composer/" + s.name + "/distref/" + pkg + "/" + storage.EscapeSegment(version) + "/" + reference
+	return "composer/" + s.name + "/distref/" + pkg + "/" + storage.EscapeSegment(version) + "/" + storage.EscapeSegment(reference)
 }
 
-// cachedDist serves a previously verified archive, if the cache still has it.
+// cachedDist serves a previously verified archive if the cache still has it
+// and its bytes still satisfy the currently declared shasum. Artifact.SHA1 is
+// always the sha1 of the bytes returned.
 func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string) (Artifact, bool) {
 	rc, _, err := s.cache.Get(ctx, refKey)
 	if err != nil {
 		return Artifact{}, false
 	}
-	sum, err := io.ReadAll(io.LimitReader(rc, 128))
+	sum, err := io.ReadAll(io.LimitReader(rc, 256))
 	rc.Close()
 	if err != nil {
 		return Artifact{}, false
 	}
-	zrc, _, err := s.cache.Get(ctx, s.distKey(strings.TrimSpace(string(sum))))
+	sha256Hex, _, _ := strings.Cut(strings.TrimSpace(string(sum)), " ")
+	zrc, _, err := s.cache.Get(ctx, s.distKey(sha256Hex))
 	if err != nil {
 		return Artifact{}, false
 	}
@@ -277,7 +286,12 @@ func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string
 	if err != nil {
 		return Artifact{}, false
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b)), SHA1: declared}, true
+	s1 := sha1.Sum(b)
+	sha1Hex := hex.EncodeToString(s1[:])
+	if declared != "" && !strings.EqualFold(declared, sha1Hex) {
+		return Artifact{}, false
+	}
+	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b)), SHA1: sha1Hex}, true
 }
 
 // Dist serves the archive of the version whose number and dist.reference
@@ -302,7 +316,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 		}
 	}
 	distURL, _ := dist["url"].(string)
-	if distURL == "" {
+	if distURL == "" || reference == "" {
 		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, pkg, version)
 	}
 	shasum, _ := dist["shasum"].(string)
@@ -319,6 +333,10 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 		declared = "sha1:" + shasum
 	}
 	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, want)
+	if errors.Is(err, resolve.ErrNotFound) {
+		// Listed in metadata but gone upstream: a source fault, not a miss.
+		return Artifact{}, fmt.Errorf("upstream dist missing for listed version: %v", err)
+	}
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -330,10 +348,10 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	}
 	if err := s.cache.Put(ctx, s.distKey(sha256Hex), bytes.NewReader(body)); err != nil {
 		s.log.Warn("caching composer dist failed", "source", s.name, "package", pkg, "version", version, "error", err)
-	} else if err := s.cache.Put(ctx, refKey, strings.NewReader(sha256Hex)); err != nil {
+	} else if err := s.cache.Put(ctx, refKey, strings.NewReader(sha256Hex+" "+sha1Hex)); err != nil {
 		s.log.Warn("caching composer distref failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body)), SHA1: shasum}, nil
+	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body)), SHA1: sha1Hex}, nil
 }
 
 func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstream.Digest) (body []byte, sha1Hex, sha256Hex string, err error) {

@@ -158,7 +158,7 @@ func TestVersionsFromMinified(t *testing.T) {
 	if len(vs) != 3 {
 		t.Fatalf("got %d versions", len(vs))
 	}
-	want := map[string]string{"3.8.0": "1111111111111111111111111111111111111111", "3.7.0": "2222222222222222222222222222222222222222", "2.9.3": ""}
+	want := map[string]string{"3.8.0": "55b265fe03500dcd5c45b8ca4e4a1330e262ac29", "3.7.0": "87407b1e7346a961c59934c1d0cf703f147c87fa", "2.9.3": ""}
 	for _, v := range vs {
 		dist := v.Package["dist"].(map[string]any)
 		if dist["shasum"] != want[v.Version] {
@@ -181,6 +181,13 @@ func TestVersionsFromMinified(t *testing.T) {
 	if e.f.count("/p2/monolog/monolog~dev.json") != 1 {
 		t.Error("~dev not requested")
 	}
+	// The fixture shasums are the real sha1 of these bodies.
+	e.f.set("/dist/monolog-3.8.0.zip", []byte("monolog-3.8.0-zip"))
+	a, err := e.src.Dist(context.Background(), "monolog/monolog", "3.8.0", "aef6ee73a77a66e404dd6540934a9ef1b3c855b4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Body.Close()
 }
 
 func TestVersionsDevOnlyAndDevFlag(t *testing.T) {
@@ -395,5 +402,111 @@ func TestRegistrySourceBasics(t *testing.T) {
 	n, enum, err := e.src.Packages(context.Background())
 	if n != nil || enum || err != nil {
 		t.Fatal("Packages")
+	}
+}
+
+func TestDistCacheHitRechecksDeclaredShasum(t *testing.T) {
+	e := newRegEnv(t)
+	old, fresh := []byte("PK-old"), []byte("PK-new")
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, sum1(old), "r1"))
+	e.f.set("/dist/pkg.zip", old)
+	a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Body.Close()
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, sum1(fresh), "r1"))
+	e.f.set("/dist/pkg.zip", fresh)
+	e.clock = e.clock.Add(time.Hour)
+	a, err = e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(a.Body)
+	if !bytes.Equal(got, fresh) || a.SHA1 != sum1(fresh) {
+		t.Fatalf("got %q sha1 %s", got, a.SHA1)
+	}
+}
+
+func TestDistEmptyShasumSHA1IsObserved(t *testing.T) {
+	e := newRegEnv(t)
+	zip := []byte("PK-observed")
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
+	e.f.set("/dist/pkg.zip", zip)
+	for range 2 { // miss, then hit
+		a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+		if err != nil || a.SHA1 != sum1(zip) {
+			t.Fatalf("a=%+v err=%v", a, err)
+		}
+		a.Body.Close()
+	}
+}
+
+func TestMetadataGarbageDoesNotReplaceCache(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
+	if _, err := e.src.Versions(context.Background(), "acme/pkg"); err != nil {
+		t.Fatal(err)
+	}
+	e.clock = e.clock.Add(time.Hour)
+	e.f.set("/p2/acme/pkg.json", []byte("<html>oops</html>"))
+	if vs, err := e.src.Versions(context.Background(), "acme/pkg"); err != nil || len(vs) != 1 {
+		t.Fatalf("garbage: vs=%v err=%v", vs, err)
+	}
+	e.f.setStatus(500)
+	if vs, err := e.src.Versions(context.Background(), "acme/pkg"); err != nil || len(vs) != 1 {
+		t.Fatalf("500: vs=%v err=%v", vs, err)
+	}
+	rc, _, err := e.cache.Get(context.Background(), "composer/packagist/p2/acme/pkg.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Contains(b, []byte(`"version":"1.0.0"`)) {
+		t.Fatalf("cache holds %q", b)
+	}
+}
+
+func TestDistRefKeyInjective(t *testing.T) {
+	e := newRegEnv(t)
+	if e.src.distRefKey("a/b", "1", "A") == e.src.distRefKey("a/b", "1", "84") {
+		t.Fatal("collision")
+	}
+	if err := storage.ValidKey(e.src.distRefKey("a/b", "1.0", "AbC/..")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDistEmptyReferenceNotFound(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", []byte(`{"packages":{"acme/pkg":[{"version":"1.0.0","dist":{"url":"http://x/y.zip","type":"zip","shasum":""}}]}}`))
+	if _, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", ""); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMetadataDuplicateNormalisedNamesRejected(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", []byte(`{"packages":{"acme/pkg":[{"version":"1.0.0"}],"Acme/Pkg":[{"version":"2.0.0"}]}}`))
+	if _, err := e.src.Versions(context.Background(), "acme/pkg"); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMetadataEmptyPackagesNotFound(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", []byte(`{"packages":{}}`))
+	if _, err := e.src.Versions(context.Background(), "acme/pkg"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDistUpstream404IsNotAMiss(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
+	_, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+	if err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("err = %v", err)
 	}
 }
