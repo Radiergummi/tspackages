@@ -150,6 +150,9 @@ func remoteKind(r string, allowFile bool) (string, error) {
 	return "", fmt.Errorf("gitmirror: unsupported remote %q (use https:// or ssh)", r)
 }
 
+// Remote returns the remote URL the mirror was configured with.
+func (m *Mirror) Remote() string { return m.opts.Remote }
+
 // LastSync returns the time of the last successful Sync (zero if none).
 func (m *Mirror) LastSync() time.Time {
 	m.stateMu.RLock()

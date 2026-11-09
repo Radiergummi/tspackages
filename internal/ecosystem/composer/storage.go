@@ -276,11 +276,7 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 	sha256sum := sha256.Sum256(zipData)
 	sha1sum := sha1.Sum(zipData)
 	ref := hex.EncodeToString(sha256sum[:])
-	pkgMap := PublishableFields(meta)
-	pkgMap["name"] = pkg
-	pkgMap["version"] = version
-	pkgMap["version_normalized"] = normalized
-	pkgMap["dist"] = map[string]any{"type": "zip", "reference": ref, "shasum": hex.EncodeToString(sha1sum[:])}
+	pkgMap := packageEntry(meta, pkg, version, normalized, ref, hex.EncodeToString(sha1sum[:]))
 	return Version{Package: pkgMap, Version: version, Reference: ref}, normalized, nil
 }
 
