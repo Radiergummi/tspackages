@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/radiergummi/tspackages/internal/authz"
@@ -44,10 +45,13 @@ func FromWhoIs(r *apitype.WhoIsResponse, capName tailcfg.PeerCapability) (Caller
 		NodeStableID: string(r.Node.StableID),
 	}
 	if r.Node.IsTagged() {
-		c.Tags = r.Node.Tags
+		c.Tags = slices.Clone(r.Node.Tags)
 	} else {
 		if r.UserProfile == nil {
 			return Caller{}, errors.New("whois response has no user profile")
+		}
+		if r.UserProfile.LoginName == "" {
+			return Caller{}, errors.New("whois response has empty login name")
 		}
 		c.Login = r.UserProfile.LoginName
 	}
@@ -73,6 +77,9 @@ func FromContext(ctx context.Context) (Caller, bool) {
 // Middleware strips client credentials, resolves the caller via WhoIs and
 // stores it in the request context. Any failure is a 403.
 func Middleware(w Whoiser, capName tailcfg.PeerCapability, log *slog.Logger) func(http.Handler) http.Handler {
+	if log == nil {
+		log = slog.Default()
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			r.Header.Del("Authorization")

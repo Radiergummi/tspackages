@@ -43,7 +43,9 @@ func TestFromWhoIsTagged(t *testing.T) {
 	if c.NodeName != "ci-1.tail.ts.net" || c.NodeStableID != "nStable" {
 		t.Fatalf("node = %q %q", c.NodeName, c.NodeStableID)
 	}
-	if len(c.Rules) != 1 || c.Rules[0].Write[0] != "composer:matchory/sdk-php" {
+	if len(c.Rules) != 1 ||
+		!slices.Equal(c.Rules[0].Read, []string{"*"}) ||
+		!slices.Equal(c.Rules[0].Write, []string{"composer:matchory/sdk-php"}) {
 		t.Fatalf("rules = %+v", c.Rules)
 	}
 	if c.String() != "tag:ci-sdk-php" {
@@ -84,6 +86,9 @@ func TestFromWhoIsErrors(t *testing.T) {
 		CapMap:      capMap(`{"read":`),
 	}, capName); err == nil {
 		t.Error("malformed cap accepted")
+	}
+	if _, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{}, UserProfile: &tailcfg.UserProfile{}}, capName); err == nil {
+		t.Error("empty login accepted")
 	}
 	if _, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{}}, capName); err == nil {
 		t.Error("untagged node without user profile accepted")
@@ -165,5 +170,26 @@ func TestWithCallerRoundTrip(t *testing.T) {
 	got, ok := FromContext(WithCaller(context.Background(), c))
 	if !ok || got.Login != "x" {
 		t.Fatal("round trip failed")
+	}
+}
+
+func TestFromWhoIsClonesTags(t *testing.T) {
+	tags := []string{"tag:a"}
+	c, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: tags}}, capName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tags[0] = "tag:evil"
+	if c.Tags[0] != "tag:a" {
+		t.Fatal("tags alias the response")
+	}
+}
+
+func TestMiddlewareNilLogger(t *testing.T) {
+	h := Middleware(&fakeWho{err: errors.New("boom")}, capName, nil)(http.NotFoundHandler())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != 403 {
+		t.Fatalf("code = %d", rec.Code)
 	}
 }

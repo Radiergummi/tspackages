@@ -4,11 +4,16 @@ package resolve
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
+	"os"
 
 	"github.com/radiergummi/tspackages/internal/authz"
 )
 
+// ErrNotFound is the only error that lets resolution move on to the next
+// source. Sources must return it (bare or wrapped with %w) only for a definite
+// miss, and never join it with other errors.
 var ErrNotFound = errors.New("not found")
 
 // Claimed is a source with a name and a set of claimed name patterns.
@@ -59,29 +64,48 @@ func First[S Claimed, T any](ctx context.Context, cands []S, fn func(context.Con
 		if err == nil {
 			return v, s, nil
 		}
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, ErrNotFound) && !isJoined(err) {
 			continue
 		}
 		return zeroT, zeroS, &SourceError{
 			Source:  s.Name(),
 			Err:     err,
-			Timeout: errors.Is(err, context.DeadlineExceeded),
+			Timeout: isTimeout(err),
 		}
 	}
 	return zeroT, zeroS, ErrNotFound
 }
 
+// isJoined reports whether a multi-error (errors.Join or similar) is anywhere
+// in the chain; such an error may hide a real failure next to a not-found.
+func isJoined(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if _, ok := err.(interface{ Unwrap() []error }); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 // HTTPStatus maps a resolution error to a response status.
 func HTTPStatus(err error) int {
-	if errors.Is(err, ErrNotFound) {
-		return http.StatusNotFound
-	}
 	var se *SourceError
 	if errors.As(err, &se) {
 		if se.Timeout {
 			return http.StatusGatewayTimeout
 		}
 		return http.StatusBadGateway
+	}
+	if errors.Is(err, ErrNotFound) {
+		return http.StatusNotFound
 	}
 	return http.StatusInternalServerError
 }
