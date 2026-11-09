@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -49,7 +51,7 @@ func TestHostAllowlistPortAndCase(t *testing.T) {
 
 func TestRejectsHTTPUnlessTesting(t *testing.T) {
 	c := New(Options{FetchHosts: []string{"example.com"}})
-	if _, err := c.Get(context.Background(), "http://example.com/x"); err == nil || errors.Is(err, ErrForbiddenAddress) {
+	if _, err := c.Get(context.Background(), "http://example.com/x"); !errors.Is(err, ErrSchemeNotAllowed) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -74,6 +76,11 @@ func TestForbiddenAddrs(t *testing.T) {
 		"fe80::1": true, "::": true, "ff02::1": true,
 		"::ffff:127.0.0.1": true, "::ffff:10.0.0.1": true, "::ffff:100.64.0.1": true, "::ffff:169.254.169.254": true,
 		"8.8.8.8": false, "172.32.0.1": false, "100.128.0.1": false, "2606:4700::1": false, "::ffff:8.8.8.8": false,
+		"0.1.2.3": true, "198.18.0.1": true, "198.19.255.255": true, "198.20.0.1": false,
+		"240.0.0.1": true, "255.255.255.255": true, "239.255.255.255": true,
+		"64:ff9b::7f00:1": true, "64:ff9b::a9fe:a9fe": true, "64:ff9b::808:808": false,
+		"64:ff9b:1::1": true, "2002:7f00:1::": true, "2002:a00:1::": true, "2002:808:808::": false,
+		"::7f00:1": true, "::a00:1": true, "::808:808": false,
 	} {
 		if got := forbiddenAddr(netip.MustParseAddr(s)); got != want {
 			t.Errorf("%s: got %v want %v", s, got, want)
@@ -269,4 +276,142 @@ func mustParse(t *testing.T, s string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+func TestRejectsUserinfo(t *testing.T) {
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	if _, err := c.Get(context.Background(), "http://u:p@127.0.0.1/a"); !errors.Is(err, ErrUserinfo) {
+		t.Fatalf("initial: %v", err)
+	}
+	var got []string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Path+":"+r.Header.Get("Authorization"))
+		if r.URL.Path == "/a" {
+			http.Redirect(w, r, "http://u:p@"+r.Host+"/b", http.StatusFound)
+		}
+	}))
+	defer s.Close()
+	_, err := c.Get(context.Background(), s.URL+"/a")
+	if !errors.Is(err, ErrUserinfo) {
+		t.Fatalf("redirect: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("redirect target was requested: %v", got)
+	}
+}
+
+func TestSameHostRedirectDropsCredentialsAndReferer(t *testing.T) {
+	type seen struct{ auth, referer string }
+	got := map[string]seen{}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got[r.URL.Path] = seen{r.Header.Get("Authorization"), r.Header.Get("Referer")}
+		if r.URL.Path == "/a" {
+			http.Redirect(w, r, "/b", http.StatusFound)
+		}
+	}))
+	defer s.Close()
+	host := strings.TrimPrefix(s.URL, "http://")
+	c := testClient(Options{
+		FetchHosts:  []string{"127.0.0.1"},
+		Credentials: map[string]config.Credential{host: {Bearer: "tok"}},
+	})
+	resp, err := c.Get(context.Background(), s.URL+"/a?secret=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got["/a"].auth != "Bearer tok" || got["/b"].auth != "" || got["/b"].referer != "" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestCredentialHostCaseInsensitive(t *testing.T) {
+	var auth string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+	}))
+	defer s.Close()
+	port := strings.TrimPrefix(s.URL, "http://127.0.0.1:")
+	c := testClient(Options{
+		FetchHosts:  []string{"localhost"},
+		Credentials: map[string]config.Credential{"LocalHost:" + port: {Bearer: "tok"}},
+	})
+	resp, err := c.Get(context.Background(), "http://LOCALHOST:"+port+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if auth != "Bearer tok" {
+		t.Fatalf("auth = %q", auth)
+	}
+}
+
+func TestErrorsRedactQuery(t *testing.T) {
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	_, err := c.Get(context.Background(), "http://127.0.0.1:1/p?token=secret#frag")
+	if err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "frag") {
+		t.Fatalf("err = %v", err)
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("lost cause: %v", err)
+	}
+}
+
+func TestMaxBytesValidation(t *testing.T) {
+	s := bodyServer("x")
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	for _, n := range []int64{0, -1} {
+		if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, n); err == nil {
+			t.Fatalf("maxBytes %d accepted", n)
+		}
+	}
+	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, math.MaxInt64); err != nil {
+		t.Fatalf("MaxInt64: %v", err)
+	}
+}
+
+func TestContentLengthRefusedEarly(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // never sends the body
+	}))
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, _, _, err := c.FetchVerified(ctx, s.URL, nil, 10)
+	if !errors.Is(err, ErrTooLarge) || time.Since(start) > 2*time.Second {
+		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+}
+
+func TestTimeoutBoundsHeadersNotBody(t *testing.T) {
+	slowHeaders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer slowHeaders.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}, Timeout: 100 * time.Millisecond})
+	if _, err := c.Get(context.Background(), slowHeaders.URL); err == nil {
+		t.Fatal("slow headers must time out")
+	}
+
+	slowBody := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		time.Sleep(400 * time.Millisecond)
+		w.Write([]byte("late"))
+	}))
+	defer slowBody.Close()
+	body, _, _, err := c.FetchVerified(context.Background(), slowBody.URL, nil, 100)
+	if err != nil || string(body) != "late" {
+		t.Fatalf("%q %v", body, err)
+	}
 }

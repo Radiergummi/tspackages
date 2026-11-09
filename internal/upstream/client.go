@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -29,12 +30,22 @@ var (
 	ErrForbiddenAddress = errors.New("upstream address forbidden")
 	ErrTooLarge         = errors.New("upstream response too large")
 	ErrDigestMismatch   = errors.New("upstream digest mismatch")
+	ErrUserinfo         = errors.New("upstream url must not contain userinfo")
+	ErrSchemeNotAllowed = errors.New("upstream scheme not allowed")
 )
 
 const (
 	defaultTimeout = 30 * time.Second
 	maxRedirects   = 5
 )
+
+// redactURL drops query, fragment and userinfo so errors and logs cannot leak
+// tokens carried in them.
+func redactURL(u *url.URL) string {
+	c := *u
+	c.RawQuery, c.ForceQuery, c.Fragment, c.RawFragment, c.User = "", false, "", "", nil
+	return c.String()
+}
 
 // StatusError is returned for non-2xx responses. A 404 also matches
 // resolve.ErrNotFound via errors.Is.
@@ -59,7 +70,9 @@ type Options struct {
 	// Credentials are keyed by the exact URL host as configured, including
 	// the port if one is part of the URL ("host" or "host:port").
 	Credentials map[string]config.Credential
-	// Timeout is the per-request limit; default 30s.
+	// Timeout (default 30s) bounds dialing, the TLS handshake and waiting
+	// for response headers. It does not bound the body read: that is limited
+	// by the caller's context and, in FetchVerified, by maxBytes.
 	Timeout time.Duration
 	// AllowPrivateForTesting permits the http scheme and loopback/private
 	// addresses. For tests only; never set it from configuration.
@@ -76,8 +89,11 @@ type Client struct {
 func New(o Options) *Client {
 	c := &Client{
 		hosts:        make(map[string]struct{}, len(o.FetchHosts)),
-		creds:        o.Credentials,
 		allowPrivate: o.AllowPrivateForTesting,
+	}
+	c.creds = make(map[string]config.Credential, len(o.Credentials))
+	for h, cr := range o.Credentials {
+		c.creds[strings.ToLower(h)] = cr
 	}
 	for _, h := range o.FetchHosts {
 		c.hosts[strings.ToLower(h)] = struct{}{}
@@ -86,16 +102,15 @@ func New(o Options) *Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: c.control}
+	dialer := &net.Dialer{Timeout: timeout, Control: c.control}
 	c.http = &http.Client{
-		Timeout: timeout,
 		Transport: &http.Transport{
 			// No proxy: it would connect on our behalf and bypass the
 			// dial-time address check.
 			Proxy:                 nil,
 			DialContext:           dialer.DialContext,
 			ForceAttemptHTTP2:     true,
-			TLSHandshakeTimeout:   10 * time.Second,
+			TLSHandshakeTimeout:   timeout,
 			ResponseHeaderTimeout: timeout,
 			MaxIdleConns:          20,
 			IdleConnTimeout:       90 * time.Second,
@@ -123,12 +138,43 @@ func (c *Client) control(_, address string, _ syscall.RawConn) error {
 
 func forbiddenAddr(a netip.Addr) bool {
 	a = a.Unmap().WithZone("")
+	if a.Is4() {
+		return forbiddenV4(a)
+	}
+	b := a.As16()
+	switch {
+	case nat64LocalUse.Contains(a):
+		return true // embedding position varies; block the whole range
+	case nat64.Contains(a):
+		return forbiddenV4(netip.AddrFrom4([4]byte(b[12:])))
+	case sixToFour.Contains(a):
+		return forbiddenV4(netip.AddrFrom4([4]byte(b[2:6])))
+	case v4Compat.Contains(a) && !a.IsUnspecified():
+		if forbiddenV4(netip.AddrFrom4([4]byte(b[12:]))) {
+			return true
+		}
+	}
 	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
 		a.IsLinkLocalMulticast() || a.IsInterfaceLocalMulticast() ||
-		a.IsMulticast() || a.IsUnspecified() || cgnat.Contains(a)
+		a.IsMulticast() || a.IsUnspecified()
 }
 
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+func forbiddenV4(a netip.Addr) bool {
+	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
+		a.IsMulticast() || a.IsUnspecified() || thisNetwork.Contains(a) ||
+		cgnat.Contains(a) || benchmark.Contains(a) || reserved.Contains(a)
+}
+
+var (
+	cgnat         = netip.MustParsePrefix("100.64.0.0/10")
+	thisNetwork   = netip.MustParsePrefix("0.0.0.0/8")
+	benchmark     = netip.MustParsePrefix("198.18.0.0/15")
+	reserved      = netip.MustParsePrefix("240.0.0.0/4") // incl. 255.255.255.255
+	nat64         = netip.MustParsePrefix("64:ff9b::/96")
+	nat64LocalUse = netip.MustParsePrefix("64:ff9b:1::/48")
+	sixToFour     = netip.MustParsePrefix("2002::/16")
+	v4Compat      = netip.MustParsePrefix("::/96")
+)
 
 func (c *Client) hostAllowed(u *url.URL) bool {
 	host := strings.ToLower(u.Hostname())
@@ -144,7 +190,10 @@ func (c *Client) hostAllowed(u *url.URL) bool {
 
 func (c *Client) checkURL(u *url.URL) error {
 	if u.Scheme != "https" && !(u.Scheme == "http" && c.allowPrivate) {
-		return fmt.Errorf("upstream scheme %q not allowed", u.Scheme)
+		return fmt.Errorf("%w: %q", ErrSchemeNotAllowed, u.Scheme)
+	}
+	if u.User != nil {
+		return ErrUserinfo
 	}
 	if !c.hostAllowed(u) {
 		return fmt.Errorf("%w: %s", ErrHostNotAllowed, u.Host)
@@ -160,6 +209,7 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 		return err
 	}
 	req.Header.Del("Authorization")
+	req.Header.Del("Referer")
 	return nil
 }
 
@@ -176,7 +226,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
-	if cr, ok := c.creds[u.Host]; ok {
+	if cr, ok := c.creds[strings.ToLower(u.Host)]; ok {
 		switch {
 		case cr.Bearer != "":
 			req.Header.Set("Authorization", "Bearer "+cr.Bearer)
@@ -184,7 +234,20 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 			req.SetBasicAuth(cr.Username, cr.Password)
 		}
 	}
-	return c.http.Do(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			// Keep the cause (errors.Is/As) but drop query/userinfo from the text.
+			if pu, perr := url.Parse(ue.URL); perr == nil {
+				ue.URL = redactURL(pu)
+			} else {
+				ue.URL = "(unparseable)"
+			}
+		}
+		return nil, err
+	}
+	return resp, nil
 }
 
 type Digest struct {
@@ -196,6 +259,9 @@ type Digest struct {
 // SHA-1 and SHA-256. If want is non-nil and differs, it returns
 // ErrDigestMismatch and no body.
 func (c *Client) FetchVerified(ctx context.Context, rawURL string, want *Digest, maxBytes int64) (body []byte, sha1Hex, sha256Hex string, err error) {
+	if maxBytes <= 0 {
+		return nil, "", "", fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
+	}
 	if want != nil && want.Algo != "sha1" && want.Algo != "sha256" {
 		return nil, "", "", fmt.Errorf("unsupported digest algorithm %q", want.Algo)
 	}
@@ -205,11 +271,16 @@ func (c *Client) FetchVerified(ctx context.Context, rawURL string, want *Digest,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		clean := *resp.Request.URL
-		clean.RawQuery, clean.Fragment, clean.User = "", "", nil
-		return nil, "", "", &StatusError{Code: resp.StatusCode, URL: clean.String()}
+		return nil, "", "", &StatusError{Code: resp.StatusCode, URL: redactURL(resp.Request.URL)}
 	}
-	body, err = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if resp.ContentLength > maxBytes {
+		return nil, "", "", ErrTooLarge
+	}
+	limit := maxBytes
+	if limit < math.MaxInt64 {
+		limit++ // one extra byte detects overflow
+	}
+	body, err = io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		return nil, "", "", err
 	}
