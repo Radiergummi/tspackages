@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +22,13 @@ type Config struct {
 	Storage    Storage              `yaml:"storage"`
 	Limits     Limits               `yaml:"limits"`
 	Ecosystems map[string]Ecosystem `yaml:"ecosystems"`
+
+	envRefs []string // names referenced via ${env:}, sorted
 }
+
+// EnvRefs returns the environment variables the file referenced via ${env:},
+// sorted, so the caller can unset them once the config is in use.
+func (c *Config) EnvRefs() []string { return slices.Clone(c.envRefs) }
 
 type Tailscale struct {
 	Hostname   string   `yaml:"hostname"`
@@ -42,9 +50,12 @@ type StoreConfig struct {
 }
 
 type Storage struct {
-	Cache  StoreConfig            `yaml:"cache"`
-	State  StoreConfig            `yaml:"state"`
-	Stores map[string]StoreConfig `yaml:"stores"`
+	// WorkDir holds git mirrors and SSH key material; it must be private and
+	// separate from every store and the tsnet state dir.
+	WorkDir string                 `yaml:"work_dir"`
+	Cache   StoreConfig            `yaml:"cache"`
+	State   StoreConfig            `yaml:"state"`
+	Stores  map[string]StoreConfig `yaml:"stores"`
 }
 
 type Limits struct {
@@ -117,18 +128,22 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if err := expand(reflect.ValueOf(&c).Elem()); err != nil {
+	refs := map[string]bool{}
+	if err := expand(reflect.ValueOf(&c).Elem(), refs); err != nil {
 		return nil, err
 	}
-	applyDefaults(&c)
+	c.envRefs = slices.Sorted(maps.Keys(refs))
+	ApplyDefaults(&c)
 	if err := Validate(&c); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func applyDefaults(c *Config) {
+// ApplyDefaults fills unset fields with their defaults. Load calls it.
+func ApplyDefaults(c *Config) {
 	setStr(&c.Tailscale.Hostname, "registry")
+	setNum(&c.Storage.Cache.MaxSize, 10<<30)
 	setStr(&c.Tailscale.Capability, "github.com/radiergummi/tspackages")
 	l := &c.Limits
 	setNum(&l.MaxUploadBytes, 100<<20)
@@ -161,44 +176,45 @@ func setNum[T ~int | ~int64 | ~float64](p *T, def T) {
 var refRe = regexp.MustCompile(`\$\{(env|file):([^}]*)\}`)
 
 // expand replaces ${env:NAME} and ${file:/path} in every string reachable
-// from v, collecting all failures.
-func expand(v reflect.Value) error {
+// from v, collecting all failures and recording ${env:} names in refs.
+func expand(v reflect.Value, refs map[string]bool) error {
 	var errs []error
 	switch v.Kind() {
 	case reflect.String:
-		s, err := expandString(v.String())
+		s, err := expandString(v.String(), refs)
 		if err != nil {
 			return err
 		}
 		v.SetString(s)
 	case reflect.Pointer:
 		if !v.IsNil() {
-			return expand(v.Elem())
+			return expand(v.Elem(), refs)
 		}
 	case reflect.Struct:
 		for i := range v.NumField() {
-			errs = append(errs, expand(v.Field(i)))
+			errs = append(errs, expand(v.Field(i), refs))
 		}
 	case reflect.Slice:
 		for i := range v.Len() {
-			errs = append(errs, expand(v.Index(i)))
+			errs = append(errs, expand(v.Index(i), refs))
 		}
 	case reflect.Map:
 		for _, k := range v.MapKeys() {
 			elem := reflect.New(v.Type().Elem()).Elem()
 			elem.Set(v.MapIndex(k))
-			errs = append(errs, expand(elem))
+			errs = append(errs, expand(elem, refs))
 			v.SetMapIndex(k, elem)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func expandString(s string) (string, error) {
+func expandString(s string, refs map[string]bool) (string, error) {
 	var errs []error
 	out := refRe.ReplaceAllStringFunc(s, func(ref string) string {
 		m := refRe.FindStringSubmatch(ref)
 		if m[1] == "env" {
+			refs[m[2]] = true
 			val, ok := os.LookupEnv(m[2])
 			if !ok {
 				errs = append(errs, fmt.Errorf("environment variable %s is not set", m[2]))

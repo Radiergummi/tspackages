@@ -153,6 +153,9 @@ func remoteKind(r string, allowFile bool) (string, error) {
 // Remote returns the remote URL the mirror was configured with.
 func (m *Mirror) Remote() string { return m.opts.Remote }
 
+// Dir returns the bare mirror's directory.
+func (m *Mirror) Dir() string { return m.dir }
+
 // LastSync returns the time of the last successful Sync (zero if none).
 func (m *Mirror) LastSync() time.Time {
 	m.stateMu.RLock()

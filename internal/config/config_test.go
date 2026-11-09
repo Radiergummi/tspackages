@@ -91,6 +91,7 @@ func TestByteSize(t *testing.T) {
 // base is a valid config; SECRET is a placeholder for a string field.
 const base = `
 storage:
+  work_dir: /work
   cache: {driver: fs, path: /cache}
   state: {driver: fs, path: /state}
   stores:
@@ -138,6 +139,21 @@ func TestValidateErrors(t *testing.T) {
 		{"cache and state overlap", strings.Replace(base, "state: {driver: fs, path: /state}", "state: {driver: fs, path: /cache/}", 1), "must not share a location"},
 		{"hosted store overlaps cache", strings.Replace(base, "main: {driver: s3, bucket: b, prefix: hosted/,", "main: {driver: fs, path: /cache,", 1), "must not share a location"},
 		{"unset env", strings.Replace(base, "SECRET", "${env:UNSET}", 1), "environment variable UNSET is not set"},
+		{"missing work_dir", strings.Replace(base, "  work_dir: /work\n", "", 1), "storage.work_dir is required"},
+		{"relative work_dir", strings.Replace(base, "work_dir: /work", "work_dir: work", 1), "storage.work_dir must be absolute"},
+		{"work_dir equals cache", strings.Replace(base, "work_dir: /work", "work_dir: /cache", 1), "storage.work_dir and storage.cache must not share a location"},
+		{"work_dir inside state", strings.Replace(base, "work_dir: /work", "work_dir: /state/work", 1), "storage.work_dir and storage.state must not share a location"},
+		{"work_dir contains fs store", strings.Replace(strings.Replace(base, "work_dir: /work", "work_dir: /data", 1), "main: {driver: s3, bucket: b, prefix: hosted/,", "main: {driver: fs, path: /data/hosted,", 1), "storage.work_dir and storage.stores.main must not share a location"},
+		{"work_dir overlaps state_dir", "tailscale: {state_dir: /work/ts}\n" + base, "storage.work_dir and tailscale.state_dir must not share a location"},
+		{"registry url host not in fetch_hosts", ecoc(`      - {name: r, type: registry, url: "https://a", fetch_hosts: [b]}
+`), `url host "a" is not in fetch_hosts`},
+		{"credentials host also in download_credentials", ecoc(`      - name: r
+        type: registry
+        url: https://a
+        fetch_hosts: [a]
+        credentials: {bearer: x}
+        download_credentials: {a: {bearer: y}}
+`), `host "a" has both credentials and download_credentials`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -152,7 +168,7 @@ func TestValidateErrors(t *testing.T) {
 
 func TestStoreOverlap(t *testing.T) {
 	storage := func(cache, state, hosted string) string {
-		return "storage:\n  cache: " + cache + "\n  state: " + state + "\n  stores:\n    main: " + hosted + "\n" +
+		return "storage:\n  work_dir: /work\n  cache: " + cache + "\n  state: " + state + "\n  stores:\n    main: " + hosted + "\n" +
 			"ecosystems:" + strings.SplitN(base, "ecosystems:", 2)[1]
 	}
 	cwd, err := os.Getwd()
@@ -290,6 +306,34 @@ func TestProblemsAreAggregatedInOrder(t *testing.T) {
 	}
 	if strings.Index(msg, `"npm"`) > strings.Index(msg, `"pypi"`) {
 		t.Errorf("ecosystem errors not sorted:\n%s", msg)
+	}
+}
+
+func TestCacheMaxSizeDefault(t *testing.T) {
+	c, err := Load(writeConfig(t, strings.Replace(base, "SECRET", "x", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Storage.Cache.MaxSize != 10<<30 {
+		t.Errorf("cache max_size = %d, want 10GiB", c.Storage.Cache.MaxSize)
+	}
+}
+
+func TestEnvRefs(t *testing.T) {
+	t.Setenv("TSP_SECRET", "s")
+	t.Setenv("TSP_PW", "p")
+	body := strings.Replace(base, "SECRET", "${env:TSP_SECRET}", 1) + `      - name: r
+        type: registry
+        url: https://a
+        fetch_hosts: [a]
+        credentials: {username: u, password: "${env:TSP_PW}${env:TSP_SECRET}"}
+`
+	c, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.EnvRefs(), ","); got != "TSP_PW,TSP_SECRET" {
+		t.Errorf("EnvRefs = %q, want TSP_PW,TSP_SECRET", got)
 	}
 }
 

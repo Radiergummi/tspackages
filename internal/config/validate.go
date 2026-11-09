@@ -17,6 +17,7 @@ func Validate(c *Config) error {
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
 	errs = append(errs, validateStores(&c.Storage)...)
+	errs = append(errs, validateWorkDir(c)...)
 	errs = append(errs, validateLimits(&c.Limits)...)
 
 	for _, eco := range slices.Sorted(maps.Keys(c.Ecosystems)) {
@@ -73,6 +74,44 @@ func validateStores(s *Storage) []error {
 			if overlaps(all[i].sc, all[j].sc) {
 				add("%s and %s must not share a location", all[i].name, all[j].name)
 			}
+		}
+	}
+	return errs
+}
+
+func validateWorkDir(c *Config) []error {
+	w := c.Storage.WorkDir
+	switch {
+	case w == "":
+		return []error{errors.New("storage.work_dir is required")}
+	case !filepath.IsAbs(w):
+		return []error{fmt.Errorf("storage.work_dir must be absolute, got %q", w)}
+	}
+	w = filepath.Clean(w)
+	type named struct{ name, path string }
+	others := []named{{"tailscale.state_dir", c.Tailscale.StateDir}}
+	if c.Storage.Cache.Driver == "fs" {
+		others = append(others, named{"storage.cache", c.Storage.Cache.Path})
+	}
+	if c.Storage.State.Driver == "fs" {
+		others = append(others, named{"storage.state", c.Storage.State.Path})
+	}
+	for _, name := range slices.Sorted(maps.Keys(c.Storage.Stores)) {
+		if sc := c.Storage.Stores[name]; sc.Driver == "fs" {
+			others = append(others, named{"storage.stores." + name, sc.Path})
+		}
+	}
+	var errs []error
+	for _, o := range others {
+		if o.path == "" {
+			continue
+		}
+		p, err := filepath.Abs(o.path)
+		if err != nil {
+			continue
+		}
+		if pathContains(w, p) || pathContains(p, w) {
+			errs = append(errs, fmt.Errorf("storage.work_dir and %s must not share a location", o.name))
 		}
 	}
 	return errs
@@ -208,6 +247,16 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			for _, h := range s.FetchHosts {
 				allowed[h] = true
 			}
+			if u, err := url.Parse(s.URL); s.URL != "" && (err != nil || u.Host == "") {
+				add("url %q is not a valid URL", s.URL)
+			} else if s.URL != "" {
+				if !hostAllowed(s.FetchHosts, u) {
+					add("url host %q is not in fetch_hosts", u.Host)
+				}
+				if _, dup := s.DownloadCredentials[u.Host]; dup && s.Credentials != nil {
+					add("host %q has both credentials and download_credentials", u.Host)
+				}
+			}
 			for host := range s.DownloadCredentials {
 				if !allowed[host] {
 					add("download_credentials host %q is not in fetch_hosts", host)
@@ -221,6 +270,17 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		errs = append(errs, fmt.Errorf("%s: at most one unclaimed source is allowed, found %d", eco, unclaimed))
 	}
 	return errs
+}
+
+// hostAllowed mirrors the upstream allowlist: an entry matches the URL's
+// hostname case-insensitively, and an entry with a port also needs that port.
+func hostAllowed(hosts []string, u *url.URL) bool {
+	for _, h := range hosts {
+		if strings.EqualFold(h, u.Hostname()) || strings.EqualFold(h, u.Host) {
+			return true
+		}
+	}
+	return false
 }
 
 // remoteKind classifies a git remote as "https", "ssh" (ssh:// or scp-style

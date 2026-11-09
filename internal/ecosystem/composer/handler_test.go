@@ -534,3 +534,23 @@ func TestClientAuthorizationStripped(t *testing.T) {
 		t.Fatalf("%d, header seen by handlers: %q", w.Code, seen)
 	}
 }
+
+// Over a real connection the upload handler sets a read deadline; the upload
+// must still succeed.
+func TestUploadOverRealServer(t *testing.T) {
+	store, _ := newSource(t)
+	srv := httptest.NewServer(server(t, []Source{store}, `{"write":["composer:matchory-internal/*"]}`))
+	defer srv.Close()
+	req, err := http.NewRequest("PUT", srv.URL+"/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(pkgZip(t, fooJSON)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}

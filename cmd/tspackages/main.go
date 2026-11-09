@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -43,8 +42,12 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureStateDir(cfg.Tailscale.StateDir); err != nil {
-		return err
+	// The state dir holds the node and TLS keys.
+	if cfg.Tailscale.StateDir == "" {
+		return errors.New("tailscale.state_dir is required")
+	}
+	if err := server.EnsurePrivateDir(cfg.Tailscale.StateDir); err != nil {
+		return fmt.Errorf("tsnet state dir: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -62,6 +65,8 @@ func run(configPath string, log *slog.Logger) error {
 	if _, err := srv.Up(ctx); err != nil {
 		return fmt.Errorf("join tailnet: %w", err)
 	}
+	// Keep the auth key out of the environment git and ssh inherit.
+	os.Unsetenv("TS_AUTHKEY")
 	lc, err := srv.LocalClient()
 	if err != nil {
 		return err
@@ -70,6 +75,9 @@ func run(configPath string, log *slog.Logger) error {
 	handler, start, err := server.Build(ctx, cfg, lc, log, server.Hooks{})
 	if err != nil {
 		return err
+	}
+	for _, name := range cfg.EnvRefs() {
+		os.Unsetenv(name)
 	}
 	ln, err := srv.ListenTLS("tcp", ":443")
 	if err != nil {
@@ -97,32 +105,8 @@ func run(configPath string, log *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := hs.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
-	}
-	return nil
-}
-
-// ensureStateDir creates dir with mode 0700, or checks that an existing dir
-// grants nothing to group or others: it holds the node and TLS keys.
-func ensureStateDir(dir string) error {
-	if dir == "" {
-		return errors.New("tailscale.state_dir is required")
-	}
-	st, err := os.Stat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create tsnet state dir: %w", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !st.IsDir() {
-		return fmt.Errorf("tsnet state dir %s is not a directory", dir)
-	}
-	if st.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("tsnet state dir %s has mode %04o, want 0700", dir, st.Mode().Perm())
+		log.Warn("graceful shutdown timed out; closing open connections", "error", err)
+		hs.Close()
 	}
 	return nil
 }

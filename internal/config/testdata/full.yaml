@@ -2,6 +2,7 @@ tailscale:
   state_dir: /var/lib/tspackages/tailscale
 
 storage:
+  work_dir: /var/lib/tspackages/work
   cache: {driver: fs, path: /var/lib/tspackages/cache, max_size: 50GiB}
   state: {driver: s3, bucket: matchory-registry, endpoint: "https://s3.example.com", prefix: state/}
   stores:

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/config"
+	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
@@ -41,9 +42,10 @@ func fsConfig(t *testing.T) *config.Config {
 	return &config.Config{
 		Tailscale: config.Tailscale{Hostname: "registry", Capability: testCap},
 		Storage: config.Storage{
-			Cache:  config.StoreConfig{Driver: "fs", Path: t.TempDir(), MaxSize: 1 << 30},
-			State:  config.StoreConfig{Driver: "fs", Path: t.TempDir()},
-			Stores: map[string]config.StoreConfig{"main": {Driver: "fs", Path: t.TempDir()}},
+			WorkDir: filepath.Join(t.TempDir(), "work"),
+			Cache:   config.StoreConfig{Driver: "fs", Path: t.TempDir(), MaxSize: 1 << 30},
+			State:   config.StoreConfig{Driver: "fs", Path: t.TempDir()},
+			Stores:  map[string]config.StoreConfig{"main": {Driver: "fs", Path: t.TempDir()}},
 		},
 		Limits: config.Limits{
 			MaxUploadBytes: 1 << 20, MaxDecompressedBytes: 16 << 20, MaxArchiveEntries: 1000,
@@ -122,70 +124,158 @@ func TestBuildWiresComposer(t *testing.T) {
 	}
 }
 
-// shortTempDir returns a directory whose path passes gitmirror's SSH path
-// allowlist; macOS's $TMPDIR contains "_", which does not.
-func shortTempDir(t *testing.T) string {
+func gitConfig(t *testing.T, sources ...config.Source) *config.Config {
 	t.Helper()
-	d, err := os.MkdirTemp("/tmp", "tspkg-test-")
+	cfg := fsConfig(t)
+	cfg.Ecosystems["composer"] = config.Ecosystem{Sources: sources}
+	return cfg
+}
+
+var sshSource = config.Source{
+	Name: "internal", Type: "git", Claims: []string{"acme/*"},
+	Remotes:    []string{"ssh://git@git.example.com/acme/repo.git"},
+	SSHKey:     "PRIVATE KEY MATERIAL",
+	KnownHosts: "git.example.com ssh-ed25519 AAAA",
+}
+
+func mode(t *testing.T, p string) os.FileMode {
+	t.Helper()
+	st, err := os.Lstat(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(d) })
-	return d
+	return st.Mode()
 }
 
 func TestBuildWritesSSHKeyFiles(t *testing.T) {
-	root := shortTempDir(t)
-	old := cacheRoot
-	cacheRoot = func() string { return root }
-	t.Cleanup(func() { cacheRoot = old })
-
-	cfg := fsConfig(t)
-	cfg.Ecosystems["composer"] = config.Ecosystem{Sources: []config.Source{{
-		Name: "internal", Type: "git", Claims: []string{"acme/*"},
-		Remotes:    []string{"ssh://git@git.example.com/acme/repo.git"},
-		SSHKey:     "PRIVATE KEY MATERIAL",
-		KnownHosts: "git.example.com ssh-ed25519 AAAA",
-	}}}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	if _, _, err := Build(ctx, cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	cfg := gitConfig(t, sshSource)
+	keys := filepath.Join(cfg.Storage.WorkDir, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
 		t.Fatal(err)
 	}
-
-	dirs, _ := filepath.Glob(filepath.Join(root, "keys-*"))
-	if len(dirs) != 1 {
-		t.Fatalf("key dirs = %v, want one", dirs)
+	stray := filepath.Join(keys, "old-0.key")
+	if err := os.WriteFile(stray, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if st, err := os.Stat(dirs[0]); err != nil || st.Mode().Perm() != 0o700 {
-		t.Fatalf("key dir stat = %v, %v; want mode 0700", st, err)
+	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		t.Fatal(err)
 	}
-	want := map[string]string{"PRIVATE KEY MATERIAL": "", "git.example.com ssh-ed25519 AAAA": ""}
-	files, _ := os.ReadDir(dirs[0])
+	for _, d := range []string{cfg.Storage.WorkDir, keys, filepath.Join(cfg.Storage.WorkDir, "git")} {
+		if m := mode(t, d); !m.IsDir() || m.Perm() != 0o700 {
+			t.Errorf("%s mode = %v, want 0700 dir", d, m)
+		}
+	}
+	want := map[string]string{
+		"internal-0.key":         "PRIVATE KEY MATERIAL\n",
+		"internal-0.known_hosts": "git.example.com ssh-ed25519 AAAA\n",
+	}
+	files, _ := os.ReadDir(keys)
 	if len(files) != len(want) {
-		t.Fatalf("key files = %v, want %d", files, len(want))
+		t.Fatalf("key files = %v, want %d (stray file must be removed)", files, len(want))
 	}
-	for _, f := range files {
-		p := filepath.Join(dirs[0], f.Name())
-		st, err := os.Stat(p)
-		if err != nil || st.Mode().Perm() != 0o600 {
-			t.Errorf("%s: %v, %v; want mode 0600", p, st, err)
+	for name, content := range want {
+		p := filepath.Join(keys, name)
+		if m := mode(t, p); m.Perm() != 0o600 {
+			t.Errorf("%s mode = %v, want 0600", p, m)
 		}
-		data, _ := os.ReadFile(p)
-		if _, ok := want[strings.TrimSuffix(string(data), "\n")]; !ok {
-			t.Errorf("%s: unexpected content %q", p, data)
+		if data, _ := os.ReadFile(p); string(data) != content {
+			t.Errorf("%s = %q, want %q", p, data, content)
 		}
+	}
+}
+
+// captureMirrors records every mirror Build creates.
+func captureMirrors(t *testing.T) *[]*gitmirror.Mirror {
+	t.Helper()
+	var got []*gitmirror.Mirror
+	old := onMirror
+	onMirror = func(m *gitmirror.Mirror) { got = append(got, m) }
+	t.Cleanup(func() { onMirror = old })
+	return &got
+}
+
+func TestBuildMirrorDirStable(t *testing.T) {
+	got := captureMirrors(t)
+	cfg := gitConfig(t, sshSource)
+	for range 2 {
+		if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(*got) != 2 || (*got)[0].Dir() != (*got)[1].Dir() {
+		t.Fatalf("mirror dirs across restarts = %v", *got)
+	}
+	if !strings.HasPrefix((*got)[0].Dir(), filepath.Join(cfg.Storage.WorkDir, "git")+"/") {
+		t.Errorf("mirror dir %s not under work_dir/git", (*got)[0].Dir())
+	}
+}
+
+func TestBuildSharesMirrors(t *testing.T) {
+	got := captureMirrors(t)
+	remote := []string{"https://git.example.com/acme/repo.git"}
+	cfg := gitConfig(t,
+		config.Source{Name: "a", Type: "git", Claims: []string{"acme/a"}, Remotes: remote},
+		config.Source{Name: "b", Type: "git", Claims: []string{"acme/b"}, Remotes: remote},
+		config.Source{Name: "c", Type: "git", Claims: []string{"acme/c"}, Remotes: remote, Token: "t"},
+	)
+	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("mirrors created = %d, want 2 (a and b share one, c has a token)", len(*got))
 	}
 
-	cancel()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(dirs[0]); err != nil && os.IsNotExist(err) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("key dir not removed after ctx ended")
-		}
-		time.Sleep(10 * time.Millisecond)
+	set := mirrorSet{}
+	o := gitmirror.Options{Remote: remote[0], BaseDir: t.TempDir()}
+	m1, err1 := set.get(o)
+	m2, err2 := set.get(o)
+	if err1 != nil || err2 != nil || m1 != m2 {
+		t.Fatalf("same options gave %p, %p (%v, %v); want one shared *Mirror", m1, m2, err1, err2)
 	}
+}
+
+func TestBuildRejectsPathInSourceName(t *testing.T) {
+	src := sshSource
+	src.Name = "../escape"
+	_, _, err := Build(t.Context(), gitConfig(t, src), fakeWho{}, quiet, Hooks{})
+	if err == nil || !strings.Contains(err.Error(), "path separator") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
+	t.Run("too wide", func(t *testing.T) {
+		cfg := fsConfig(t)
+		if err := os.MkdirAll(cfg.Storage.WorkDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(cfg.Storage.WorkDir, 0o755)
+		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
+			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		cfg := fsConfig(t)
+		target := t.TempDir()
+		if err := os.Symlink(target, cfg.Storage.WorkDir); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
+			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
+		}
+	})
+	t.Run("keys subdir too wide", func(t *testing.T) {
+		cfg := fsConfig(t)
+		keys := filepath.Join(cfg.Storage.WorkDir, "keys")
+		if err := os.MkdirAll(keys, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(keys, 0o750)
+		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		if err == nil || !strings.Contains(err.Error(), keys) {
+			t.Fatalf("err = %v, want one naming %s", err, keys)
+		}
+	})
 }

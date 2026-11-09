@@ -5,16 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/config"
@@ -41,18 +42,8 @@ type Hooks struct {
 // reachable.
 const probeKey = ".tspackages-probe"
 
-// cacheRoot is the local directory for git mirrors and SSH key files.
-// Replaced in tests.
-var cacheRoot = func() string {
-	d, err := os.UserCacheDir()
-	if err != nil {
-		d = os.TempDir()
-	}
-	return filepath.Join(d, "tspackages")
-}
-
-// sshPathRe mirrors gitmirror's allowlist for SSH key and known_hosts paths.
-var sshPathRe = regexp.MustCompile(`^/[A-Za-z0-9._/@+=,-]+$`)
+// onMirror is called for every mirror Build creates. Replaced in tests.
+var onMirror = func(*gitmirror.Mirror) {}
 
 type namedStore struct {
 	name string
@@ -61,10 +52,16 @@ type namedStore struct {
 
 // Build validates cfg, opens and probes every store, builds the sources in
 // config order and returns the handler (identity → rate limits → routes) and a
-// function that starts the background loops. SSH key material is written to
-// a 0700 directory that is removed when ctx ends.
+// function that starts the background loops. Git mirrors live in
+// <work_dir>/git; SSH key material is rewritten to <work_dir>/keys at every
+// start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
+	config.ApplyDefaults(cfg)
 	if err := config.Validate(cfg); err != nil {
+		return nil, nil, err
+	}
+	gitDir, keyDir, err := prepareWorkDir(cfg.Storage.WorkDir)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -106,14 +103,9 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		sources    []composer.Source
 		gitSources []*composer.GitSource
 		status     []web.StatusSource
-		keys       *keyDir
+		mirrors    = mirrorSet{}
 	)
-	fail := func(err error) (http.Handler, func(context.Context), error) {
-		if keys != nil {
-			keys.remove()
-		}
-		return nil, nil, err
-	}
+	fail := func(err error) (http.Handler, func(context.Context), error) { return nil, nil, err }
 	eco, hasComposer := cfg.Ecosystems["composer"]
 	for i, s := range eco.Sources {
 		switch s.Type {
@@ -142,33 +134,31 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			sources, status = append(sources, src), append(status, src)
 		case "git":
 			opts := gitmirror.Options{
-				BaseDir:                    filepath.Join(cacheRoot(), "git"),
+				BaseDir:                    gitDir,
 				Token:                      s.Token,
 				AllowFileRemotesForTesting: h.AllowFileRemotes,
 			}
-			if s.SSHKey != "" || s.KnownHosts != "" {
-				if keys == nil {
-					if keys, err = newKeyDir(ctx, cacheRoot()); err != nil {
-						return fail(err)
-					}
-				}
-				if opts.SSHKeyPath, err = keys.write(strconv.Itoa(i)+".key", s.SSHKey); err != nil {
-					return fail(err)
-				}
-				if opts.KnownHostsPath, err = keys.write(strconv.Itoa(i)+".known-hosts", s.KnownHosts); err != nil {
-					return fail(err)
-				}
+			if filepath.Base(s.Name) != s.Name || strings.HasPrefix(s.Name, ".") {
+				return fail(fmt.Errorf("composer source %q: name must not contain a path separator or start with a dot", s.Name))
 			}
-			var mirrors []*gitmirror.Mirror
+			// Fixed names keep the mirror directory (derived from the key path) stable across restarts.
+			prefix := filepath.Join(keyDir, s.Name+"-"+strconv.Itoa(i))
+			if opts.SSHKeyPath, err = writeSecret(prefix+".key", s.SSHKey); err != nil {
+				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
+			}
+			if opts.KnownHostsPath, err = writeSecret(prefix+".known_hosts", s.KnownHosts); err != nil {
+				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
+			}
+			var ms []*gitmirror.Mirror
 			for _, remote := range s.Remotes {
 				opts.Remote = remote
-				m, err := gitmirror.New(opts)
+				m, err := mirrors.get(opts)
 				if err != nil {
 					return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
 				}
-				mirrors = append(mirrors, m)
+				ms = append(ms, m)
 			}
-			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, mirrors, pinStore, rec, stateDriver,
+			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stateDriver,
 				s.PollInterval, log, int64(l.MaxDecompressedBytes))
 			if err != nil {
 				return fail(err)
@@ -241,37 +231,78 @@ func openStores(ctx context.Context, s config.Storage) ([]namedStore, error) {
 	return out, nil
 }
 
-// keyDir holds SSH key material expanded from the configuration.
-type keyDir struct{ path string }
+// mirrorSet shares one Mirror per mirror directory, which gitmirror derives
+// from the remote and the credential (token or SSH key path).
+type mirrorSet map[[3]string]*gitmirror.Mirror
 
-func newKeyDir(ctx context.Context, parent string) (*keyDir, error) {
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return nil, fmt.Errorf("create key directory: %w", err)
+func (s mirrorSet) get(o gitmirror.Options) (*gitmirror.Mirror, error) {
+	k := [3]string{o.Remote, o.Token, o.SSHKeyPath}
+	if m, ok := s[k]; ok {
+		return m, nil
 	}
-	p, err := os.MkdirTemp(parent, "keys-")
+	m, err := gitmirror.New(o)
 	if err != nil {
-		return nil, fmt.Errorf("create key directory: %w", err)
+		return nil, err
 	}
-	k := &keyDir{path: p}
-	if !sshPathRe.MatchString(p) {
-		k.remove()
-		return nil, fmt.Errorf("key directory %q must use only [A-Za-z0-9._/@+=,-]", p)
-	}
-	context.AfterFunc(ctx, k.remove)
-	return k, nil
+	onMirror(m)
+	s[k] = m
+	return m, nil
 }
 
-// write stores content in a 0600 file and returns its path, or "" for empty content.
-func (k *keyDir) write(name, content string) (string, error) {
+// prepareWorkDir makes work_dir and its git/ and keys/ subdirectories
+// private, and empties keys/ so only the current key material remains.
+func prepareWorkDir(dir string) (gitDir, keyDir string, err error) {
+	gitDir, keyDir = filepath.Join(dir, "git"), filepath.Join(dir, "keys")
+	for _, d := range []string{dir, gitDir, keyDir} {
+		if err := EnsurePrivateDir(d); err != nil {
+			return "", "", err
+		}
+	}
+	entries, err := os.ReadDir(keyDir)
+	if err != nil {
+		return "", "", err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(keyDir, e.Name())); err != nil {
+			return "", "", fmt.Errorf("clear %s: %w", keyDir, err)
+		}
+	}
+	return gitDir, keyDir, nil
+}
+
+// EnsurePrivateDir creates dir with mode 0700 if it is missing, then checks
+// that it is a real directory (not a symlink) owned by the current user with
+// mode 0700.
+func EnsurePrivateDir(dir string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+	}
+	st, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("%s must be a directory, not a symlink or file", dir)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || int(sys.Uid) != os.Getuid() {
+		return fmt.Errorf("%s must be owned by uid %d", dir, os.Getuid())
+	}
+	if st.Mode().Perm() != 0o700 {
+		return fmt.Errorf("%s has mode %04o, want 0700", dir, st.Mode().Perm())
+	}
+	return nil
+}
+
+// writeSecret writes content plus a newline (ssh rejects a key without one)
+// to a 0600 file and returns its path, or "" for empty content.
+func writeSecret(p, content string) (string, error) {
 	if content == "" {
 		return "", nil
 	}
-	p := filepath.Join(k.path, name)
-	// ssh rejects a private key without a trailing newline.
 	if err := os.WriteFile(p, []byte(content+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("write key file: %w", err)
+		return "", fmt.Errorf("write %s: %w", p, err)
 	}
 	return p, nil
 }
-
-func (k *keyDir) remove() { _ = os.RemoveAll(k.path) }

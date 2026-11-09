@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/authz"
@@ -22,6 +23,9 @@ import (
 )
 
 const ecoName = "composer"
+
+// uploadReadTimeout bounds reading an upload's body.
+const uploadReadTimeout = 10 * time.Minute
 
 // Composer serves the Composer v2 repository protocol under /composer/.
 type Composer struct {
@@ -276,6 +280,10 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 		return
 	}
 	e.source = store.Name()
+	// The server has no ReadTimeout (downloads are large); bound the upload body here.
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadReadTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		c.log.Warn("composer upload: set read deadline", "error", err)
+	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, c.limits.MaxBytes))
 	if err != nil {
 		var tooBig *http.MaxBytesError
