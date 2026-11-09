@@ -4,7 +4,7 @@ package storage
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -47,9 +47,11 @@ type Driver interface {
 	List(ctx context.Context, prefix string) iter.Seq2[Info, error]
 }
 
-var segmentRE = regexp.MustCompile(`^[A-Za-z0-9._~+-]+$`)
+var segmentRE = regexp.MustCompile(`^[a-z0-9._~+-]+$`)
 
 // ValidKey reports whether key is a "/"-separated path of safe segments.
+// Uppercase letters are rejected so that two keys never differ only in case
+// (the fs driver may sit on a case-insensitive filesystem).
 func ValidKey(key string) error {
 	if key == "" || len(key) > 1024 {
 		return fmt.Errorf("%w: length %d", ErrInvalidKey, len(key))
@@ -62,10 +64,13 @@ func ValidKey(key string) error {
 	return nil
 }
 
-// EscapeSegment encodes an arbitrary string as a single valid key segment
-// (unpadded base64url).
+var segmentEncoding = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv").WithPadding(base32.NoPadding)
+
+// EscapeSegment encodes an arbitrary string as a single valid key segment:
+// unpadded base32 with the lowercase extended-hex alphabet. It is lowercase
+// because keys must stay unique on case-insensitive filesystems.
 func EscapeSegment(s string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(s))
+	return segmentEncoding.EncodeToString([]byte(s))
 }
 
 // validPrefix accepts "" or a key prefix, optionally ending in "/".

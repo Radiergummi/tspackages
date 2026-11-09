@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -132,7 +133,7 @@ func runDriverSuite(t *testing.T, d Driver) {
 	})
 
 	t.Run("InvalidKeys", func(t *testing.T) {
-		for _, k := range []string{"../x", "a//b", "/a", "a/./b", "a/..", `a\b`, "a/", "", "a b"} {
+		for _, k := range []string{"../x", "a//b", "/a", "a/./b", "a/..", `a\b`, "a/", "", "a b", "Abc/def"} {
 			if _, _, err := d.Get(ctx, k); !errors.Is(err, ErrInvalidKey) {
 				t.Errorf("Get(%q): %v", k, err)
 			}
@@ -255,7 +256,7 @@ func runDriverSuite(t *testing.T, d Driver) {
 }
 
 func TestValidKey(t *testing.T) {
-	for _, k := range []string{"a", "a/b", "A.b_c~d+e-f/x"} {
+	for _, k := range []string{"a", "a/b", "a.b_c~d+e-f/x"} {
 		if err := ValidKey(k); err != nil {
 			t.Errorf("%q: %v", k, err)
 		}
@@ -276,5 +277,21 @@ func TestEscapeSegment(t *testing.T) {
 	}
 	if EscapeSegment("") != "" {
 		t.Fatal("empty")
+	}
+	if EscapeSegment("A") == EscapeSegment("a") {
+		t.Fatal("A and a collide")
+	}
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	for _, in := range []string{"A", "a", "release/2026-01", "Zz9", string(all)} {
+		out := EscapeSegment(in)
+		if strings.ToLower(out) != out {
+			t.Errorf("%q -> %q has uppercase", in, out)
+		}
+		if err := ValidKey(out); err != nil {
+			t.Errorf("%q -> %q: %v", in, out, err)
+		}
 	}
 }
