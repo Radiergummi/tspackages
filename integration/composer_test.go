@@ -97,6 +97,12 @@ func (f *fakePackagist) saw(path string) bool {
 	return false
 }
 
+func (f *fakePackagist) seen() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.paths...)
+}
+
 func newFakePackagist(t *testing.T) *fakePackagist {
 	t.Helper()
 	logZip := zipOf(t, map[string]string{
@@ -188,7 +194,10 @@ func TestComposerEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start(ctx)
+	loops := make(chan struct{})
+	go func() { start(ctx); close(loops) }()
+	// The git loop writes below root: stop it before TempDir cleanup.
+	defer func() { cancel(); <-loops }()
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
 
@@ -299,6 +308,6 @@ func TestComposerEndToEnd(t *testing.T) {
 	t.Log(out)
 	checkLock()
 	if packagist.saw("/p2/matchory/a.json") || packagist.saw("/p2/matchory/a~dev.json") {
-		t.Errorf("fake Packagist received a request for matchory/a: %v", packagist.paths)
+		t.Errorf("fake Packagist received a request for matchory/a: %v", packagist.seen())
 	}
 }
