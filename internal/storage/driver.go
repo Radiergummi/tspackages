@@ -43,7 +43,9 @@ type Driver interface {
 	PutIfAbsent(ctx context.Context, key string, r io.Reader) (Info, error)             // ErrExists
 	PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (Info, error) // etag "" = must not exist; ErrPrecondition
 	Delete(ctx context.Context, key string) error
-	// List yields every key that starts with prefix, in byte-wise lexical order.
+	// List yields every key that starts with prefix, in byte-wise lexical
+	// order. Info.ETag may be empty (the fs driver leaves it out, as it costs
+	// a read per object); use Stat for it.
 	List(ctx context.Context, prefix string) iter.Seq2[Info, error]
 }
 

@@ -23,7 +23,9 @@ type Artifact struct {
 }
 
 // Source provides Composer packages. Methods return an error wrapping
-// resolve.ErrNotFound only for a definite miss.
+// resolve.ErrNotFound only for a definite miss. The Versions a source returns
+// may be shared with other callers and must be treated as read-only; the
+// handler copies them once per response.
 type Source interface {
 	resolve.Claimed
 	// Versions returns the stable (dev=false) or dev (dev=true) versions of

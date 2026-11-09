@@ -92,6 +92,7 @@ type remoteResult struct {
 	ok       bool // indexed successfully at least once
 	pkg      string
 	versions []Version
+	sizes    map[string]int64 // archive size by commit, for the versions
 }
 
 // sums are the hex digests of an archive.
@@ -112,6 +113,7 @@ type gitIndex struct {
 	done      bool // first pass finished
 	pending   bool // some remote has never been indexed successfully
 	pkgs      map[string][]Version
+	sizes     map[string]int64 // archive size by commit, for the served versions
 	conflicts []Conflict
 }
 
@@ -134,7 +136,7 @@ func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.M
 		loaded: map[string]loaded{},
 		prov:   map[string]bool{},
 	}
-	g.idx.Store(&gitIndex{pkgs: map[string][]Version{}})
+	g.idx.Store(&gitIndex{pkgs: map[string][]Version{}, sizes: map[string]int64{}})
 	return g, nil
 }
 
@@ -174,12 +176,12 @@ func archiveMetaKey(source, commit string) string {
 func (g *GitSource) Index(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	syncErrs := g.syncAll(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	for i, m := range g.mirrors {
-		syncErr := m.Sync(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if syncErr != nil {
+		if syncErr := syncErrs[m]; syncErr != nil {
 			if g.prev[i].ok {
 				g.log.Warn("composer git sync failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", syncErr)
 				g.setFailing(i)
@@ -188,7 +190,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 			g.log.Warn("composer git sync failed; indexing the local mirror", "source", g.name, "remote", m.Remote(), "error", syncErr)
 		}
 		res, err := g.indexRemote(ctx, m)
-		degraded := syncErr != nil
+		degraded := syncErrs[m] != nil
 		if err != nil && !g.prev[i].ok && ctx.Err() == nil {
 			res, err = g.fallbackToPins(ctx, m, err)
 			degraded = true
@@ -210,6 +212,34 @@ func (g *GitSource) Index(ctx context.Context) error {
 	g.prune()
 	metrics.SetGitLastSync(g.name, g.oldestSync())
 	return nil
+}
+
+// maxConcurrentSyncs bounds the mirrors one Index pass syncs at once.
+const maxConcurrentSyncs = 4
+
+// syncAll syncs every distinct mirror once, at most maxConcurrentSyncs at a
+// time, and returns each one's error.
+func (g *GitSource) syncAll(ctx context.Context) map[*gitmirror.Mirror]error {
+	errs := map[*gitmirror.Mirror]error{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentSyncs)
+	for _, m := range g.mirrors {
+		if _, ok := errs[m]; ok {
+			continue // listed twice: one sync serves both
+		}
+		errs[m] = nil
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := m.Sync(ctx)
+			mu.Lock()
+			errs[m] = err
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	return errs
 }
 
 // prune drops loaded and prov entries the current index no longer references.
@@ -303,7 +333,7 @@ type versionCollector struct {
 }
 
 func (g *GitSource) collector(m *gitmirror.Mirror, pkg string) *versionCollector {
-	return &versionCollector{g: g, m: m, res: remoteResult{ok: true, pkg: pkg}, seen: map[string]bool{}}
+	return &versionCollector{g: g, m: m, res: remoteResult{ok: true, pkg: pkg, sizes: map[string]int64{}}, seen: map[string]bool{}}
 }
 
 // add records the version's provenance and appends it, unless a version with
@@ -319,6 +349,7 @@ func (c *versionCollector) add(ctx context.Context, version, normalized, commit 
 		return false
 	}
 	c.seen[normalized] = true
+	c.res.sizes[commit] = l.size
 	c.res.versions = append(c.res.versions, Version{
 		Package:   packageEntry(l.meta, c.res.pkg, version, normalized, commit, l.d.sha1),
 		Version:   version,
@@ -347,7 +378,7 @@ func (g *GitSource) oldestSync() time.Time {
 // dropped and reported as a conflict.
 func (g *GitSource) assemble() *gitIndex {
 	owners := map[string][]string{}
-	out := &gitIndex{done: true, pkgs: map[string][]Version{}}
+	out := &gitIndex{done: true, pkgs: map[string][]Version{}, sizes: map[string]int64{}}
 	for i, r := range g.prev {
 		if !r.ok {
 			out.pending = true
@@ -359,6 +390,7 @@ func (g *GitSource) assemble() *gitIndex {
 	for _, r := range g.prev {
 		if r.pkg != "" && len(owners[r.pkg]) == 1 && len(r.versions) > 0 {
 			out.pkgs[r.pkg] = r.versions
+			maps.Copy(out.sizes, r.sizes)
 		}
 	}
 	for pkg, remotes := range owners {
@@ -402,8 +434,10 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 	if head == "" {
 		return remoteResult{}, fmt.Errorf("default branch %q has no commit", def)
 	}
-	meta, _, err := readComposerJSON(ctx, m, head)
-	if err != nil {
+	var meta map[string]any
+	if l, ok := g.loaded[head]; ok {
+		meta = l.meta
+	} else if meta, _, err = readComposerJSON(ctx, m, head); err != nil {
 		return remoteResult{}, fmt.Errorf("composer.json on default branch: %w", err)
 	}
 	declared, _ := meta["name"].(string)
@@ -610,7 +644,7 @@ func (g *GitSource) load(ctx context.Context, m *gitmirror.Mirror, commit string
 	key := archiveMetaKey(g.name, commit)
 	l, err := g.readMeta(ctx, key)
 	if errors.Is(err, storage.ErrNotFound) {
-		_, raw, rerr := readComposerJSON(ctx, m, commit)
+		meta, raw, rerr := readComposerJSON(ctx, m, commit)
 		if rerr != nil {
 			return loaded{}, rerr
 		}
@@ -626,11 +660,15 @@ func (g *GitSource) load(ctx context.Context, m *gitmirror.Mirror, commit string
 		if merr != nil {
 			return loaded{}, merr
 		}
-		if _, perr := g.state.PutIfAbsent(ctx, key, bytes.NewReader(body)); perr != nil && !errors.Is(perr, storage.ErrExists) {
+		switch _, perr := g.state.PutIfAbsent(ctx, key, bytes.NewReader(body)); {
+		case perr == nil:
+			l, err = loaded{meta: meta, d: d, size: int64(len(data))}, nil
+		case errors.Is(perr, storage.ErrExists):
+			// Read back what won, so every instance agrees on the digests.
+			l, err = g.readMeta(ctx, key)
+		default:
 			return loaded{}, perr
 		}
-		// Read back whatever won, so every instance agrees on the digests.
-		l, err = g.readMeta(ctx, key)
 	}
 	if err != nil {
 		return loaded{}, err
@@ -760,10 +798,9 @@ func (g *GitSource) MovedPackage(m pins.MovedTag) string {
 // Conflicts lists package names declared by several remotes in the last pass.
 func (g *GitSource) Conflicts() []Conflict { return slices.Clone(g.idx.Load().conflicts) }
 
-// lookup returns the indexed versions of pkg, ErrUnavailable when the source
+// lookup returns the versions of pkg in idx, ErrUnavailable when the source
 // cannot yet say whether the name exists, or a not-found.
-func (g *GitSource) lookup(pkg string) ([]Version, error) {
-	idx := g.idx.Load()
+func (g *GitSource) lookup(idx *gitIndex, pkg string) ([]Version, error) {
 	for _, c := range idx.conflicts {
 		if c.Package == pkg {
 			return nil, fmt.Errorf("%w: %s is declared by several remotes", ErrUnavailable, pkg)
@@ -781,25 +818,21 @@ func (g *GitSource) lookup(pkg string) ([]Version, error) {
 }
 
 // Versions returns the indexed tags (highest first) or, with dev, the indexed
-// dev branches of name. The returned metadata is a copy the caller may modify.
+// dev branches of name. The metadata is shared and read-only (see Source).
 func (g *GitSource) Versions(_ context.Context, name string, dev bool) ([]Version, error) {
 	pkg, err := lookupName(name)
 	if err != nil {
 		return nil, err
 	}
-	vs, err := g.lookup(pkg)
+	vs, err := g.lookup(g.idx.Load(), pkg)
 	if err != nil {
 		return nil, err
 	}
 	out := []Version{}
 	for _, v := range vs {
-		if v.Dev != dev {
-			continue
+		if v.Dev == dev {
+			out = append(out, v)
 		}
-		p := maps.Clone(v.Package)
-		p["dist"] = maps.Clone(p["dist"].(map[string]any))
-		v.Package = p
-		out = append(out, v)
 	}
 	return out, nil
 }
@@ -812,7 +845,8 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 	if err != nil {
 		return Artifact{}, err
 	}
-	vs, err := g.lookup(pkg)
+	idx := g.idx.Load()
+	vs, err := g.lookup(idx, pkg)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -829,10 +863,7 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 	}
 	// The reference is indexed, so a missing or altered zip is a fault of this
 	// source, never a not-found that would let resolution try another one.
-	l, err := g.readMeta(ctx, archiveMetaKey(g.name, found.Reference))
-	if err != nil {
-		return Artifact{}, fmt.Errorf("composer git: archive metadata of %s %s: %v", name, version, err)
-	}
+	size := idx.sizes[found.Reference]
 	rc, info, err := g.state.Get(ctx, archiveKey(g.name, found.Reference))
 	if errors.Is(err, storage.ErrNotFound) {
 		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is missing", name, version)
@@ -840,9 +871,9 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 	if err != nil {
 		return Artifact{}, err
 	}
-	if info.Size != l.size {
+	if info.Size != size {
 		rc.Close()
-		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is %d bytes, expected %d", name, version, info.Size, l.size)
+		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is %d bytes, expected %d", name, version, info.Size, size)
 	}
 	return Artifact{Body: rc, Size: info.Size}, nil
 }

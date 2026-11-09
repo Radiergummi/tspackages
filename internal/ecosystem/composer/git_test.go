@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -715,7 +716,9 @@ func TestNewGitSourceValidation(t *testing.T) {
 	}
 }
 
-func TestDistMissingSidecarIsNotNotFound(t *testing.T) {
+// Dist checks the size recorded at indexing, not the sidecar; a missing zip
+// of an indexed version is a source fault, never a not-found.
+func TestDistMissingArchiveIsNotNotFound(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
 	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
@@ -726,6 +729,14 @@ func TestDistMissingSidecarIsNotNotFound(t *testing.T) {
 	}
 	ref := versionsOf(t, g, "matchory/a")["v1.0.0"].Reference
 	if err := d.Delete(ctx, "composer-git/git/"+ref+".meta.json"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := g.Dist(ctx, "matchory/a", "v1.0.0", ref)
+	if err != nil {
+		t.Fatalf("without sidecar: %v", err)
+	}
+	a.Body.Close()
+	if err := d.Delete(ctx, "composer-git/git/"+ref+".zip"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := g.Dist(ctx, "matchory/a", "v1.0.0", ref); err == nil || errors.Is(err, resolve.ErrNotFound) || errors.Is(err, storage.ErrNotFound) {
@@ -913,5 +924,37 @@ func TestLoadedAndProvenanceCachesPruned(t *testing.T) {
 	}
 	if len(g.prov) != 1 || !g.prov[head+"\x00dev-main"] {
 		t.Errorf("prov not pruned: %v", g.prov)
+	}
+}
+
+// GitSource returns its indexed metadata without copying: the handler's copy
+// must keep consecutive responses apart.
+func TestP2ResponsesDoNotShareMetadata(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	g, _ := newGit(t, fsState(t), nil, src)
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h := server(t, []Source{g}, readAll)
+	get := func(host string) string {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/composer/p2/matchory/a.json", nil)
+		req.Host = host
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("%s: %d %s", host, w.Code, w.Body)
+		}
+		return w.Body.String()
+	}
+	first, second := get("a.example"), get("b.example")
+	if !strings.Contains(first, "http://a.example/composer/dist/") || strings.ReplaceAll(first, "a.example", "b.example") != second {
+		t.Fatalf("responses differ beyond the host:\n%s\n%s", first, second)
+	}
+	for _, v := range mustVersions(t, g, "matchory/a") {
+		if _, ok := v.Package["dist"].(map[string]any)["url"]; ok {
+			t.Fatalf("%s: source metadata was modified", v.Version)
+		}
 	}
 }

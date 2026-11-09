@@ -222,11 +222,22 @@ func openStores(ctx context.Context, s config.Storage) (*openedStores, error) {
 	return out, nil
 }
 
-// ready checks that every store is reachable.
+// ready probes every store concurrently and returns the first failure in
+// store order.
 func (s *openedStores) ready(ctx context.Context) error {
-	for _, o := range s.all {
-		if err := storage.Reachable(ctx, o.d); err != nil {
-			return fmt.Errorf("%s: %w", o.path, err)
+	errs := make([]error, len(s.all))
+	var wg sync.WaitGroup
+	for i, o := range s.all {
+		wg.Go(func() {
+			if err := storage.Reachable(ctx, o.d); err != nil {
+				errs[i] = fmt.Errorf("%s: %w", o.path, err)
+			}
+		})
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil

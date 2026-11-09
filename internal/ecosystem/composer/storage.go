@@ -1,6 +1,7 @@
 package composer
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -62,10 +62,6 @@ type StorageSource struct {
 	unhealthy atomic.Bool        // last Health probe failed; logs only on change
 	locks     sync.Map           // "<pkg>@<normalized>" -> *sync.Mutex; serialises uploads of one version (entries are tiny and never freed)
 }
-
-// trustedLimits is for archives this source already accepted once: the current
-// upload limits must not make old versions disappear from a rebuilt index.
-var trustedLimits = archive.Limits{MaxBytes: math.MaxInt64, MaxDecompressed: math.MaxInt64, MaxEntries: math.MaxInt}
 
 // errCorruptIndex marks an index.json that cannot be decoded.
 var errCorruptIndex = errors.New("composer: corrupt index")
@@ -130,7 +126,7 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, name
 		return Version{}, rejectUpload("version %q is not a plain version string", version)
 	}
 	d := sumsOf(zipData)
-	v, normalized, err := s.inspect(pkg, version, zipData, s.limits, d)
+	v, normalized, err := s.inspect(pkg, version, zipData, &s.limits, d)
 	if err != nil {
 		return Version{}, err
 	}
@@ -227,9 +223,12 @@ func (s *StorageSource) readZip(ctx context.Context, pkg, normalized string) ([]
 	return io.ReadAll(rc)
 }
 
-// inspect validates a zip with digests d under limits l and builds its index entry; it is
-// shared by Upload and the rebuild so both derive identical entries.
-func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.Limits, d sums) (Version, string, error) {
+// inspect validates a zip with digests d under limits l and builds its index
+// entry; it is shared by Upload and the rebuild so both derive identical
+// entries. A nil l is for archives this source already accepted once: they are
+// not inspected again (and the current upload limits must not make old
+// versions disappear from a rebuilt index), only composer.json is read.
+func (s *StorageSource) inspect(pkg, version string, zipData []byte, l *archive.Limits, d sums) (Version, string, error) {
 	normalized, err := NormalizeVersion(version)
 	if err != nil {
 		return Version{}, "", rejectUpload("%v", err)
@@ -237,7 +236,12 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 	if isDevVersion(normalized) {
 		return Version{}, "", rejectUpload("dev versions cannot be uploaded: %q", version)
 	}
-	zr, err := archive.InspectZip(zipData, l)
+	var zr *zip.Reader
+	if l != nil {
+		zr, err = archive.InspectZip(zipData, *l)
+	} else {
+		zr, err = zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	}
 	if err != nil {
 		return Version{}, "", err
 	}
@@ -339,7 +343,9 @@ func (s *StorageSource) loadIndex(ctx context.Context, pkg string) ([]Version, s
 	return idx.Versions, info.ETag, nil
 }
 
+// writeIndex stores vs, sorted highest first in place, as the index of pkg.
 func (s *StorageSource) writeIndex(ctx context.Context, pkg string, vs []Version, etag string) error {
+	slices.SortStableFunc(vs, highestFirst)
 	body, err := json.Marshal(index{Versions: vs})
 	if err != nil {
 		return err
@@ -350,7 +356,7 @@ func (s *StorageSource) writeIndex(ctx context.Context, pkg string, vs []Version
 
 // scan rebuilds the version entries from the stored zips, skipping (and
 // returning) those that cannot be read so one bad archive does not hide the
-// rest. Archives are inspected under trustedLimits. The version spelling comes
+// rest. Archives are not inspected again (see inspect). The version spelling comes
 // from the sidecar; without one it is the normalised version with trailing ".0"
 // parts trimmed ("1.2.0.0" becomes "1.2.0").
 func (s *StorageSource) scan(ctx context.Context, pkg string) (vs []Version, skipped []error, err error) {
@@ -399,7 +405,7 @@ func (s *StorageSource) entryFromZip(ctx context.Context, pkg, normalized string
 		}
 		rc.Close()
 	}
-	v, _, err := s.inspect(pkg, version, data, trustedLimits, d)
+	v, _, err := s.inspect(pkg, version, data, nil, d)
 	return v, err
 }
 
@@ -514,12 +520,17 @@ func (s *StorageSource) versions(ctx context.Context, pkg string) ([]Version, er
 	if err != nil {
 		return nil, err
 	}
-	vs = slices.Clone(vs)
-	slices.SortStableFunc(vs, func(a, b Version) int {
-		return compareNormalized(normalizedOf(b), normalizedOf(a))
-	})
+	// Indexes are written sorted; one written otherwise is sorted here. A
+	// rebuilt list is shared with concurrent callers, so sort a copy.
+	if !slices.IsSortedFunc(vs, highestFirst) {
+		vs = slices.Clone(vs)
+		slices.SortStableFunc(vs, highestFirst)
+	}
 	return vs, nil
 }
+
+// highestFirst orders versions by their normalised form, highest first.
+func highestFirst(a, b Version) int { return compareNormalized(normalizedOf(b), normalizedOf(a)) }
 
 // Dist serves the stored zip for the version whose normalised form equals
 // that of version and whose reference (sha256) equals reference.

@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -50,6 +52,9 @@ type RegistrySource struct {
 	wait         func(context.Context) error
 	log          *slog.Logger
 	now          func() time.Time // replaced in tests
+
+	metaFlight singleflight.Group // by metadata cache key: one upstream fetch at a time
+	distFlight singleflight.Group // by distref key: one fetch, verify and store at a time
 
 	hmu      sync.Mutex // guards the health fields
 	fetchErr error      // last metadata fetch failure; nil once one succeeds
@@ -153,12 +158,9 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (vs
 		metrics.ObserveCacheHit(ecoName, s.name)
 		return parseCached(cached, pkg, dev)
 	}
-	body, found, err := s.fetchMeta(ctx, s.metaURL(pkg, dev))
-	if err == nil && found {
-		// Validate before caching, so garbage never replaces good bytes.
-		vs, err = parseMetadata(body, pkg, dev)
-	}
-	s.noteFetch(ctx, err, have)
+	res, err := flight(ctx, &s.metaFlight, key, func() (fetchedMeta, error) {
+		return s.refreshMetadata(ctx, key, pkg, dev, have)
+	})
 	if err != nil {
 		if have {
 			// A stale not-found marker is served too, deliberately: during an
@@ -168,6 +170,27 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (vs
 		}
 		return nil, false, err
 	}
+	return res.vs, res.found, nil
+}
+
+type fetchedMeta struct {
+	vs    []Version
+	found bool
+}
+
+// refreshMetadata fetches, validates and caches the p2 document of pkg.
+// haveCache says whether a stale copy is cached (for Health).
+func (s *RegistrySource) refreshMetadata(ctx context.Context, key, pkg string, dev, haveCache bool) (fetchedMeta, error) {
+	body, found, err := s.fetchMeta(ctx, s.metaURL(pkg, dev))
+	var vs []Version
+	if err == nil && found {
+		// Validate before caching, so garbage never replaces good bytes.
+		vs, err = parseMetadata(body, pkg, dev)
+	}
+	s.noteFetch(ctx, err, haveCache)
+	if err != nil {
+		return fetchedMeta{}, err
+	}
 	toStore := body
 	if !found {
 		toStore = notFoundMarker
@@ -175,7 +198,21 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (vs
 	if perr := s.cache.Put(ctx, key, bytes.NewReader(toStore)); perr != nil {
 		s.log.Warn("caching composer metadata failed", "source", s.name, "package", pkg, "error", perr)
 	}
-	return vs, found, nil
+	return fetchedMeta{vs: vs, found: found}, nil
+}
+
+// flight runs fn once for all concurrent callers with the same key, with the
+// context of the caller that started it. A caller whose result was cut short
+// by another caller's cancellation tries again.
+func flight[T any](ctx context.Context, g *singleflight.Group, key string, fn func() (T, error)) (T, error) {
+	for {
+		v, err, shared := g.Do(key, func() (any, error) { return fn() })
+		if shared && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			continue
+		}
+		t, _ := v.(T)
+		return t, err
+	}
 }
 
 // parseCached parses cached metadata; the not-found marker is a definite miss.
@@ -310,9 +347,11 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 		return Artifact{}, err
 	}
 	// The route does not say whether version is a dev version: look in the
-	// stable file first, then in ~dev.
+	// file its form suggests first, then in the other one.
+	normalized, _ := NormalizeVersion(version)
+	dev := isDevVersion(normalized)
 	var vs []Version
-	for _, dev := range []bool{false, true} {
+	for _, dev := range []bool{dev, !dev} {
 		dvs, err := s.Versions(ctx, pkg, dev)
 		if err != nil && !errors.Is(err, resolve.ErrNotFound) {
 			return Artifact{}, err
@@ -344,6 +383,18 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 		return a, nil
 	}
 
+	body, err := flight(ctx, &s.distFlight, refKey, func() ([]byte, error) {
+		return s.fetchAndStoreDist(ctx, pkg, version, distURL, shasum, refKey)
+	})
+	if err != nil {
+		return Artifact{}, err
+	}
+	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body))}, nil
+}
+
+// fetchAndStoreDist downloads and verifies the archive, records its
+// provenance and caches it under refKey.
+func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, distURL, shasum, refKey string) ([]byte, error) {
 	declared := ""
 	if shasum != "" {
 		declared = "sha1:" + shasum
@@ -351,23 +402,23 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, shasum)
 	if errors.Is(err, resolve.ErrNotFound) {
 		// Listed in metadata but gone upstream: a source fault, not a miss.
-		return Artifact{}, fmt.Errorf("upstream dist missing for listed version: %v", err)
+		return nil, fmt.Errorf("upstream dist missing for listed version: %v", err)
 	}
 	if err != nil {
-		return Artifact{}, err
+		return nil, err
 	}
 	if err := s.rec.PutProvenance(ctx, records.Provenance{
 		Ecosystem: "composer", Package: pkg, Version: version, Source: s.name, SourceType: "registry",
 		UpstreamURL: distURL, DeclaredDigest: declared, SHA1: sha1Hex, SHA256: sha256Hex,
 	}); err != nil {
-		return Artifact{}, fmt.Errorf("record provenance: %w", err)
+		return nil, fmt.Errorf("record provenance: %w", err)
 	}
 	if err := s.cache.Put(ctx, s.distKey(sha256Hex), bytes.NewReader(body)); err != nil {
 		s.log.Warn("caching composer dist failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	} else if err := s.cache.Put(ctx, refKey, strings.NewReader(sha256Hex+" "+sha1Hex)); err != nil {
 		s.log.Warn("caching composer distref failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body))}, nil
+	return body, nil
 }
 
 func (s *RegistrySource) fetchDist(ctx context.Context, url, wantSHA1 string) (body []byte, sha1Hex, sha256Hex string, err error) {

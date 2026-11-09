@@ -439,23 +439,15 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 				yield(Info{}, err)
 				return
 			}
-			p := filepath.Join(d.root, filepath.FromSlash(key))
-			fi, ok, err := regular(p)
-			if err == nil && !ok {
-				continue // deleted meanwhile
-			}
-			var info Info
-			if err == nil {
-				info, err = d.info(key, p, fi)
-			}
+			fi, ok, err := regular(filepath.Join(d.root, filepath.FromSlash(key)))
 			if err != nil {
-				if isMissing(err) {
-					continue
-				}
 				yield(Info{}, err)
 				return
 			}
-			if !yield(info, nil) {
+			if !ok {
+				continue // deleted meanwhile
+			}
+			if !yield(Info{Key: key, Size: fi.Size(), ModTime: fi.ModTime()}, nil) {
 				return
 			}
 		}
