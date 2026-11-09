@@ -65,30 +65,43 @@ func lyingZip(t *testing.T) []byte {
 func TestInspectZip(t *testing.T) {
 	many := make([]entry, 20001)
 	for i := range many {
-		many[i] = entry{name: "f" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + "/" + itoa(i)}
+		many[i] = entry{name: "d" + itoa(i) + "/f"}
 	}
+	big := Limits{MaxBytes: 1 << 30, MaxDecompressed: 1 << 30, MaxEntries: 20000}
+	dupJSON := makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "composer.json", body: "{\"x\":1}"})
 	tests := []struct {
-		name    string
-		data    []byte
-		limits  Limits
-		wantErr bool
+		name   string
+		data   []byte
+		limits Limits
+		reason string // "" = accepted; otherwise a substring of Error.Reason
 	}{
-		{"normal", makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "src/a.php", body: "<?php"}), testLimits, false},
-		{"dotdot", makeZip(t, entry{name: "../evil", body: "x"}), testLimits, true},
-		{"dotdot nested", makeZip(t, entry{name: "a/../../evil", body: "x"}), testLimits, true},
-		{"absolute", makeZip(t, entry{name: "/abs", body: "x"}), testLimits, true},
-		{"backslash", makeZip(t, entry{name: `a\b`, body: "x"}), testLimits, true},
-		{"symlink", makeZip(t, entry{name: "link", body: "/etc/passwd", mode: fs.ModeSymlink | 0o777}), testLimits, true},
-		{"too many entries", makeZip(t, many...), testLimits, true},
-		{"declared total too big", makeZip(t, entry{name: "a", body: strings.Repeat("a", 2048)}), Limits{MaxBytes: 1 << 20, MaxDecompressed: 1024, MaxEntries: 10}, true},
-		{"lying size", lyingZip(t), Limits{MaxBytes: 1 << 20, MaxDecompressed: 64 << 20, MaxEntries: 10}, true},
-		{"too large archive", makeZip(t, entry{name: "a", body: "x"}), Limits{MaxBytes: 10, MaxDecompressed: 1 << 20, MaxEntries: 10}, true},
-		{"not a zip", []byte("hello"), testLimits, true},
+		{"normal", makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "src/", body: ""}, entry{name: "src/a.php", body: "<?php", mode: 0o755}), testLimits, ""},
+		{"dotdot", makeZip(t, entry{name: "../evil", body: "x"}), testLimits, "not allowed"},
+		{"dotdot nested", makeZip(t, entry{name: "a/../../evil", body: "x"}), testLimits, "not canonical"},
+		{"absolute", makeZip(t, entry{name: "/abs", body: "x"}), testLimits, "not allowed"},
+		{"backslash", makeZip(t, entry{name: `a\b`, body: "x"}), testLimits, "not allowed"},
+		{"drive prefix", makeZip(t, entry{name: "C:evil", body: "x"}), testLimits, "not allowed"},
+		{"dot slash", makeZip(t, entry{name: "./composer.json", body: "{}"}), testLimits, "not canonical"},
+		{"double slash", makeZip(t, entry{name: "a//b", body: "x"}), testLimits, "not canonical"},
+		{"dot", makeZip(t, entry{name: ".", body: ""}), testLimits, "not canonical"},
+		{"duplicate", dupJSON, testLimits, "duplicate"},
+		{"case duplicate", makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "COMPOSER.JSON", body: "{}"}), testLimits, "duplicate"},
+		{"symlink", makeZip(t, entry{name: "link", body: "/etc/passwd", mode: fs.ModeSymlink | 0o777}), testLimits, "symlink"},
+		{"fifo", makeZip(t, entry{name: "p", body: "", mode: fs.ModeNamedPipe | 0o644}), testLimits, "special"},
+		{"device", makeZip(t, entry{name: "d", body: "", mode: fs.ModeDevice | 0o644}), testLimits, "special"},
+		{"setuid", makeZip(t, entry{name: "s", body: "x", mode: fs.ModeSetuid | 0o755}), testLimits, "special"},
+		{"setgid", makeZip(t, entry{name: "s", body: "x", mode: fs.ModeSetgid | 0o755}), testLimits, "special"},
+		{"too many entries", makeZip(t, many...), big, "more than 20000 entries"},
+		{"entry declares too much", makeZip(t, entry{name: "a", body: strings.Repeat("a", 2048)}), Limits{MaxBytes: 1 << 20, MaxDecompressed: 1024, MaxEntries: 10}, "entry \"a\" declares"},
+		{"declared total too big", makeZip(t, entry{name: "a", body: strings.Repeat("a", 600)}, entry{name: "b", body: strings.Repeat("b", 600)}), Limits{MaxBytes: 1 << 20, MaxDecompressed: 1024, MaxEntries: 10}, "in total"},
+		{"lying size", lyingZip(t), Limits{MaxBytes: 1 << 30, MaxDecompressed: 64 << 20, MaxEntries: 10}, "corrupt"},
+		{"too large archive", makeZip(t, entry{name: "a", body: "x"}), Limits{MaxBytes: 10, MaxDecompressed: 1 << 20, MaxEntries: 10}, "exceeds 10 bytes"},
+		{"not a zip", []byte("hello"), testLimits, "not a valid zip"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			zr, err := InspectZip(tc.data, tc.limits)
-			if !tc.wantErr {
+			if tc.reason == "" {
 				if err != nil || zr == nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
@@ -97,6 +110,9 @@ func TestInspectZip(t *testing.T) {
 			var ae *Error
 			if !errors.As(err, &ae) {
 				t.Fatalf("want *Error, got %T %v", err, err)
+			}
+			if !strings.Contains(ae.Reason, tc.reason) {
+				t.Fatalf("reason %q does not contain %q", ae.Reason, tc.reason)
 			}
 		})
 	}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path"
 	"strings"
 )
 
@@ -33,7 +34,9 @@ var ErrNotFound = errors.New("archive: file not found")
 // l.MaxBytes, has more than l.MaxEntries entries, has an entry whose name is
 // absolute, contains a ".." segment or a backslash, has a symlink, declares more
 // than l.MaxDecompressed bytes in total, or has an entry that inflates to more
-// than it declares. Every entry is inflated once (bounded by its declared size)
+// than it declares. Names must be canonical (path.Clean, a directory keeps its
+// trailing "/"), have no drive prefix and be unique ignoring case; modes must
+// be regular files or directories without setuid/setgid. Every entry is inflated once (bounded by its declared size)
 // so a lying header cannot be used to bypass the cap later.
 func InspectZip(data []byte, l Limits) (*zip.Reader, error) {
 	if int64(len(data)) > l.MaxBytes {
@@ -47,19 +50,29 @@ func InspectZip(data []byte, l Limits) (*zip.Reader, error) {
 		return nil, reject("archive has more than %d entries", l.MaxEntries)
 	}
 	var total uint64
+	seen := make(map[string]struct{}, len(zr.File))
 	for _, f := range zr.File {
 		if err := checkName(f.Name); err != nil {
 			return nil, err
 		}
-		if f.Mode()&fs.ModeSymlink != 0 {
+		lower := strings.ToLower(f.Name)
+		if _, dup := seen[lower]; dup {
+			return nil, reject("archive has duplicate entry %q", f.Name)
+		}
+		seen[lower] = struct{}{}
+		mode := f.Mode()
+		if mode&fs.ModeSymlink != 0 {
 			return nil, reject("archive entry %q is a symlink", f.Name)
 		}
-		if f.UncompressedSize64 > uint64(l.MaxDecompressed) {
-			return nil, reject("archive declares more than %d uncompressed bytes", l.MaxDecompressed)
+		if mode&(fs.ModeNamedPipe|fs.ModeSocket|fs.ModeDevice|fs.ModeCharDevice|fs.ModeIrregular|fs.ModeSetuid|fs.ModeSetgid) != 0 {
+			return nil, reject("archive entry %q has a special file mode", f.Name)
 		}
-		total += f.UncompressedSize64 // each term <= MaxDecompressed, entries bounded: cannot overflow
+		if f.UncompressedSize64 > uint64(l.MaxDecompressed) {
+			return nil, reject("archive entry %q declares more than %d uncompressed bytes", f.Name, l.MaxDecompressed)
+		}
+		total += f.UncompressedSize64 // each term <= MaxInt64, total checked every step: cannot overflow
 		if total > uint64(l.MaxDecompressed) {
-			return nil, reject("archive declares more than %d uncompressed bytes", l.MaxDecompressed)
+			return nil, reject("archive declares more than %d uncompressed bytes in total", l.MaxDecompressed)
 		}
 	}
 	for _, f := range zr.File {
@@ -74,7 +87,14 @@ func checkName(name string) error {
 	if name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\\\x00") {
 		return reject("archive entry name %q is not allowed", name)
 	}
-	for seg := range strings.SplitSeq(name, "/") {
+	if len(name) >= 2 && name[1] == ':' && (name[0]|0x20 >= 'a' && name[0]|0x20 <= 'z') {
+		return reject("archive entry name %q is not allowed", name)
+	}
+	trimmed := strings.TrimSuffix(name, "/")
+	if trimmed == "" || trimmed == "." || path.Clean(trimmed) != trimmed {
+		return reject("archive entry name %q is not canonical", name)
+	}
+	for seg := range strings.SplitSeq(trimmed, "/") {
 		if seg == ".." {
 			return reject("archive entry name %q is not allowed", name)
 		}

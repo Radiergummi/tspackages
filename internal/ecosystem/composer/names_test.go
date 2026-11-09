@@ -16,7 +16,7 @@ func TestNormalize(t *testing.T) {
 			t.Errorf("Normalize(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"matchory", "matchory/../x", "", "/x", "x/", "a/b/c", "a b/c", "-a/b", "a/b-", "a//b", "a/b---c", "a__b/c", "a/.b", "a/b..c"} {
+	for _, in := range []string{"matchory", "matchory/../x", "", "/x", "x/", "a/b/c", "a b/c", "-a/b", "a/b-", "a//b", "a/b---c", "a__b/c", "a/.b", "a/b..c", "matchory/\u212Ait", "m\u00e4/x"} {
 		if got, err := Normalize(in); err == nil {
 			t.Errorf("Normalize(%q) = %q, want error", in, got)
 		}
