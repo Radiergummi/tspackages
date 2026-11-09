@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -111,57 +113,144 @@ func TestCacheOverwriteAdjustsSize(t *testing.T) {
 }
 
 func TestCacheIndexRebuild(t *testing.T) {
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// Lexical order is a, b, c but age order is c (oldest), a, b.
+	now := time.Now()
+	for k, age := range map[string]time.Duration{"a": 2 * time.Hour, "b": time.Hour, "c": 3 * time.Hour} {
+		if _, err := d.Put(ctx, k, strings.NewReader("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(d.(*fsDriver).root, k), now, now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := NewCache(ctx, d, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.total != 30 || len(c.entries) != 3 {
+		t.Fatalf("total=%d entries=%d", c.total, len(c.entries))
+	}
+	cachePut(t, c, "d")
+	if cacheHas(c, "c") {
+		t.Error("oldest entry c should be evicted after rebuild")
+	}
+	for _, k := range []string{"a", "b", "d"} {
+		if !cacheHas(c, k) {
+			t.Errorf("%s should remain", k)
+		}
+	}
+}
+
+func TestCacheRebuildTrims(t *testing.T) {
 	c, d := newTestCache(t, 30)
 	for _, k := range []string{"a", "b", "c"} {
 		cachePut(t, c, k)
 	}
-	c2, err := NewCache(context.Background(), d, 30)
+	c2, err := NewCache(context.Background(), d, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c2.total != 30 || len(c2.entries) != 3 {
+	if c2.total != 20 || len(c2.entries) != 2 {
 		t.Fatalf("total=%d entries=%d", c2.total, len(c2.entries))
-	}
-	cachePut(t, c2, "d")
-	if cacheHas(c2, "a") {
-		t.Error("oldest entry a should be evicted after rebuild")
 	}
 }
 
-type failDelete struct{ Driver }
+// failKeyDelete fails Delete for one key.
+type failKeyDelete struct {
+	Driver
+	key string
+}
 
-func (failDelete) Delete(context.Context, string) error { return errors.New("boom") }
+func (f failKeyDelete) Delete(ctx context.Context, key string) error {
+	if key == f.key {
+		return errors.New("boom")
+	}
+	return f.Driver.Delete(ctx, key)
+}
 
 func TestCacheEvictDeleteFailure(t *testing.T) {
-	d, _ := NewFS(t.TempDir())
-	c, err := NewCache(context.Background(), failDelete{d}, 10)
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	c, err := NewCache(ctx, failKeyDelete{d, "a"}, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cachePut(t, c, "a")
-	if err := c.Put(context.Background(), "b", strings.NewReader("0123456789")); err == nil {
-		t.Fatal("want error from failed eviction")
+	cachePut(t, c, "b")
+	if err := c.Put(ctx, "c", strings.NewReader("0123456789")); err == nil {
+		t.Fatal("want error from failed eviction of a")
 	}
-	if _, ok := c.entries["a"]; !ok {
-		t.Fatal("a must stay indexed after failed delete")
+	if _, ok := c.entries["a"]; !ok || c.total != 30 {
+		t.Fatalf("a must stay indexed and counted: total=%d", c.total)
+	}
+	// Progress continues: a is now most recently used, so b is evicted next.
+	cachePut(t, c, "d")
+	if _, ok := c.entries["b"]; ok {
+		t.Fatal("b should have been evicted despite a's failure")
+	}
+}
+
+func TestCacheOversizeDeleteFailureStaysIndexed(t *testing.T) {
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCache(context.Background(), failKeyDelete{d, "big"}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The delete fails twice (oversize check, then eviction): error surfaces.
+	if err := c.Put(context.Background(), "big", strings.NewReader("0123456789")); err == nil {
+		t.Fatal("want delete error")
+	}
+	if _, ok := c.entries["big"]; !ok || c.total != 10 {
+		t.Fatalf("orphaned object must stay indexed: total=%d", c.total)
 	}
 }
 
 func TestCacheConcurrent(t *testing.T) {
-	c, _ := newTestCache(t, 50)
+	const maxSize = 50
+	c, d := newTestCache(t, maxSize)
+	ctx := context.Background()
 	var wg sync.WaitGroup
 	for i := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range 20 {
-				k := fmt.Sprintf("k%d", (i+j)%10)
-				_ = c.Put(context.Background(), k, strings.NewReader("0123456789"))
-				if rc, _, err := c.Get(context.Background(), k); err == nil {
+			for j := range 40 {
+				n := (i + j) % 10
+				k := fmt.Sprintf("k%d", n)
+				body := strings.Repeat("x", 1+(i+j)%12) // size varies per write
+				_ = c.Put(ctx, k, strings.NewReader(body))
+				if rc, _, err := c.Get(ctx, k); err == nil {
 					rc.Close()
 				}
 			}
 		}()
 	}
 	wg.Wait()
+
+	var disk int64
+	for info, err := range d.List(ctx, "") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		disk += info.Size
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.total > maxSize {
+		t.Errorf("total %d exceeds max %d", c.total, maxSize)
+	}
+	if c.total != disk {
+		t.Errorf("index total %d != bytes on disk %d", c.total, disk)
+	}
 }
