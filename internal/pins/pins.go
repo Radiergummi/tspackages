@@ -38,10 +38,11 @@ type Store struct {
 
 	mu    sync.Mutex
 	moved map[[4]string]MovedTag
+	cache map[string]pinFile // by key; a pin never changes once written
 }
 
 func New(d storage.Driver) *Store {
-	return &Store{d: d, moved: map[[4]string]MovedTag{}}
+	return &Store{d: d, moved: map[[4]string]MovedTag{}, cache: map[string]pinFile{}}
 }
 
 // Pin records sha for the tag on first sight and returns the pinned SHA. If
@@ -63,21 +64,9 @@ func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha str
 	if !errors.Is(err, storage.ErrExists) {
 		return "", false, err
 	}
-	rc, _, err := s.d.Get(ctx, key)
+	pf, err := s.read(ctx, key)
 	if err != nil {
 		return "", false, err
-	}
-	defer rc.Close()
-	raw, err := io.ReadAll(rc)
-	if err != nil {
-		return "", false, err
-	}
-	var pf pinFile
-	if err := json.Unmarshal(raw, &pf); err != nil {
-		return "", false, fmt.Errorf("pins: corrupt pin %s: %w", key, err)
-	}
-	if !shaRE.MatchString(pf.SHA) {
-		return "", false, fmt.Errorf("pins: corrupt pin %s: invalid sha", key)
 	}
 	if pf.SHA == sha {
 		return pf.SHA, false, nil
@@ -101,35 +90,61 @@ type Pin struct {
 	FirstSeen time.Time
 }
 
-// List returns every pin of the remote, sorted by tag. Pins whose tag no
-// longer exists upstream are included.
-func (s *Store) List(ctx context.Context, ecosystem, source, remote string) ([]Pin, error) {
+// read returns the pin stored at key. Valid pins are cached, since a pin is
+// immutable once written; corrupt ones are re-read every time.
+func (s *Store) read(ctx context.Context, key string) (pinFile, error) {
+	s.mu.Lock()
+	pf, ok := s.cache[key]
+	s.mu.Unlock()
+	if ok {
+		return pf, nil
+	}
+	rc, _, err := s.d.Get(ctx, key)
+	if err != nil {
+		return pinFile{}, err
+	}
+	defer rc.Close()
+	raw, err := io.ReadAll(rc)
+	if err != nil {
+		return pinFile{}, err
+	}
+	if err := json.Unmarshal(raw, &pf); err != nil {
+		return pinFile{}, fmt.Errorf("pins: corrupt pin %s: %w", key, err)
+	}
+	if !shaRE.MatchString(pf.SHA) {
+		return pinFile{}, fmt.Errorf("pins: corrupt pin %s: invalid sha", key)
+	}
+	s.mu.Lock()
+	s.cache[key] = pf
+	s.mu.Unlock()
+	return pf, nil
+}
+
+// List returns every readable pin of the remote, sorted by tag. Pins whose tag
+// no longer exists upstream are included. Corrupt pins are left out and
+// returned in corrupt, so one bad file does not hide the others; err is a
+// failure to list or read at all.
+func (s *Store) List(ctx context.Context, ecosystem, source, remote string) (pins []Pin, corrupt []error, err error) {
 	var keys []string
 	for info, err := range s.d.List(ctx, keyPrefix(ecosystem, source, remote)) {
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		keys = append(keys, info.Key)
 	}
-	var out []Pin
 	for _, key := range keys {
-		rc, _, err := s.d.Get(ctx, key)
+		pf, err := s.read(ctx, key)
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil || !strings.HasPrefix(err.Error(), "pins: corrupt") {
+				return nil, nil, err
+			}
+			corrupt = append(corrupt, err)
+			continue
 		}
-		raw, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, err
-		}
-		var pf pinFile
-		if err := json.Unmarshal(raw, &pf); err != nil || !shaRE.MatchString(pf.SHA) {
-			return nil, fmt.Errorf("pins: corrupt pin %s", key)
-		}
-		out = append(out, Pin{Tag: pf.Tag, SHA: pf.SHA, FirstSeen: pf.FirstSeen})
+		pins = append(pins, Pin{Tag: pf.Tag, SHA: pf.SHA, FirstSeen: pf.FirstSeen})
 	}
-	slices.SortFunc(out, func(a, b Pin) int { return strings.Compare(a.Tag, b.Tag) })
-	return out, nil
+	slices.SortFunc(pins, func(a, b Pin) int { return strings.Compare(a.Tag, b.Tag) })
+	return pins, corrupt, nil
 }
 
 // Moved returns the moved tags seen since start, sorted.

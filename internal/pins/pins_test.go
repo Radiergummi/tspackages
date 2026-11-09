@@ -162,11 +162,56 @@ func TestListScopedAndSorted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.List(ctx, "composer", "src", "r1")
+	got, _, err := s.List(ctx, "composer", "src", "r1")
 	if err != nil || len(got) != 2 || got[0].Tag != "v1" || got[1].Tag != "v2" || got[0].SHA != sha || got[0].FirstSeen.IsZero() {
 		t.Fatalf("List = %+v, %v", got, err)
 	}
-	if got, err := s.List(ctx, "composer", "src", "none"); err != nil || len(got) != 0 {
+	if got, _, err := s.List(ctx, "composer", "src", "none"); err != nil || len(got) != 0 {
 		t.Fatalf("empty List = %+v, %v", got, err)
+	}
+}
+
+type countingDriver struct {
+	storage.Driver
+	gets int
+}
+
+func (c *countingDriver) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	c.gets++
+	return c.Driver.Get(ctx, key)
+}
+
+func TestListCachesPins(t *testing.T) {
+	fs, _ := storage.NewFS(t.TempDir())
+	cd := &countingDriver{Driver: fs}
+	ctx := context.Background()
+	for _, tag := range []string{"v1", "v2"} {
+		if _, _, err := New(fs).Pin(ctx, "composer", "src", "r", tag, sha1a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New(cd)
+	if got, _, err := s.List(ctx, "composer", "src", "r"); err != nil || len(got) != 2 || cd.gets != 2 {
+		t.Fatalf("first List: %v %v gets=%d", got, err, cd.gets)
+	}
+	if got, _, err := s.List(ctx, "composer", "src", "r"); err != nil || len(got) != 2 || cd.gets != 2 {
+		t.Fatalf("second List: %v %v gets=%d", got, err, cd.gets)
+	}
+}
+
+func TestListSkipsCorruptPins(t *testing.T) {
+	d, _ := storage.NewFS(t.TempDir())
+	s := New(d)
+	ctx := context.Background()
+	if _, _, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1a); err != nil {
+		t.Fatal(err)
+	}
+	key := "pins/composer/src/" + storage.EscapeSegment("r") + "/" + storage.EscapeSegment("v2") + ".json"
+	if _, err := d.Put(ctx, key, strings.NewReader("{garbage")); err != nil {
+		t.Fatal(err)
+	}
+	got, corrupt, err := s.List(ctx, "composer", "src", "r")
+	if err != nil || len(got) != 1 || got[0].Tag != "v1" || len(corrupt) != 1 {
+		t.Fatalf("List = %+v corrupt=%v err=%v", got, corrupt, err)
 	}
 }

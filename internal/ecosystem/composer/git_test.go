@@ -589,7 +589,46 @@ func TestClaimsFilterIndexedPackages(t *testing.T) {
 	}
 }
 
+// cancelOnPin cancels a context once the first pin is written.
+type cancelOnPin struct {
+	storage.Driver
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnPin) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	info, err := c.Driver.PutIfAbsent(ctx, key, r)
+	if c.cancel != nil && strings.HasPrefix(key, "pins/") {
+		c.cancel()
+	}
+	return info, err
+}
+
 func TestCancelledPassDoesNotChangeIndex(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	d := &cancelOnPin{Driver: fsState(t)}
+	g, _ := newGit(t, d, nil, src)
+	var logs bytes.Buffer
+	g.log = slog.New(slog.NewTextHandler(&logs, nil))
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "tag", "v2.0.0") // first sight: pinned mid-pass, then the pass is cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	d.cancel = cancel
+	logs.Reset()
+	if err := g.Index(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Index = %v", err)
+	}
+	if got := versionNames(mapVals(versionsOf(t, g, "matchory/a"))); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
+		t.Fatalf("versions = %v", got)
+	}
+	if strings.Contains(logs.String(), "skipped") || strings.Contains(logs.String(), "failed") {
+		t.Fatalf("noise on cancel:\n%s", logs.String())
+	}
+}
+
+func TestBeforeFirstPassIsUnavailable(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
 	g, _ := newGit(t, fsState(t), nil, src)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -599,6 +638,80 @@ func TestCancelledPassDoesNotChangeIndex(t *testing.T) {
 	}
 	if _, err := g.Versions(context.Background(), "matchory/a"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUnclaimedSourceNotFoundWhilePending(t *testing.T) {
+	good := gitRepo(t, "matchory/a")
+	bad := gitRepo(t, "matchory/b")
+	commitFile(t, bad, "composer.json", `{broken`, "break")
+	g, _ := newGit(t, fsState(t), nil, good, bad)
+	g.claims = nil
+	ctx := context.Background()
+	if _, err := g.Versions(ctx, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("before first pass: %v", err)
+	}
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Versions(ctx, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("pending remote: %v", err)
+	}
+	if _, err := g.Versions(ctx, "matchory/a"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDistFaultsAreNotNotFound(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	d := fsState(t)
+	g, _ := newGit(t, d, nil, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ref := versionsOf(t, g, "matchory/a")["v1.0.0"].Reference
+	zipK := "composer-git/git/" + ref + ".zip"
+
+	if _, err := d.Put(ctx, zipK, strings.NewReader("short")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Dist(ctx, "matchory/a", "v1.0.0", ref); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("size mismatch: %v", err)
+	}
+	if err := d.Delete(ctx, zipK); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Dist(ctx, "matchory/a", "v1.0.0", ref); err == nil || errors.Is(err, resolve.ErrNotFound) || errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("missing zip: %v", err)
+	}
+}
+
+func TestCorruptPinDoesNotFreezeRemote(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	runGit(t, src, "tag", "v1.1.0")
+	d := fsState(t)
+	g, _ := newGit(t, d, nil, src)
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	key := "pins/composer/git/" + storage.EscapeSegment(src) + "/" + storage.EscapeSegment("v1.1.0") + ".json"
+	if _, err := d.Put(context.Background(), key, strings.NewReader("{garbage")); err != nil {
+		t.Fatal(err)
+	}
+	g2, _ := newGit(t, d, nil, src)
+	var logs bytes.Buffer
+	g2.log = slog.New(slog.NewTextHandler(&logs, nil))
+	if err := g2.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := versionsOf(t, g2, "matchory/a")["v1.0.0"]; !ok {
+		t.Fatal("v1.0.0 lost")
+	}
+	if !strings.Contains(logs.String(), "unreadable pin") {
+		t.Fatalf("corrupt pin not logged:\n%s", logs.String())
 	}
 }
 

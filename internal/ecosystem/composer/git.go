@@ -89,6 +89,7 @@ type digest struct{ sha1, sha256 string }
 type loaded struct {
 	meta map[string]any
 	d    digest
+	size int64
 }
 
 type gitIndex struct {
@@ -246,9 +247,12 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 		g.log.Warn("composer git: package is outside the source's claims; ignored", "source", g.name, "remote", remote, "package", pkg)
 		return remoteResult{ok: true}, nil
 	}
-	pinned, err := g.pins.List(ctx, "composer", g.name, remote)
+	pinned, corrupt, err := g.pins.List(ctx, "composer", g.name, remote)
 	if err != nil {
 		return remoteResult{}, fmt.Errorf("listing pins: %w", err)
+	}
+	for _, cerr := range corrupt {
+		g.log.Error("composer git: unreadable pin ignored", "source", g.name, "remote", remote, "error", cerr)
 	}
 
 	res := remoteResult{ok: true, pkg: pkg}
@@ -305,10 +309,14 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 				g.skip(ctx, "composer git: tag skipped", "source", g.name, "remote", remote, "tag", tag, "error", err)
 				continue
 			}
-			commit, _, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
+			var moved bool
+			commit, moved, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
 			if err != nil {
 				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
 				continue
+			}
+			if moved { // another instance pinned it first
+				g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", commit, "seen", up)
 			}
 		case up != "" && up != commit: // an existing pin always wins; record the move
 			if commit, _, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up); err != nil {
@@ -494,7 +502,7 @@ func (g *GitSource) readMeta(ctx context.Context, key string) (loaded, error) {
 	if err != nil || am.SHA1 == "" || am.SHA256 == "" {
 		return loaded{}, fmt.Errorf("corrupt %s", key)
 	}
-	return loaded{meta: meta, d: digest{sha1: am.SHA1, sha256: am.SHA256}}, nil
+	return loaded{meta: meta, d: digest{sha1: am.SHA1, sha256: am.SHA256}, size: am.Size}, nil
 }
 
 func (g *GitSource) recordProvenance(ctx context.Context, m *gitmirror.Mirror, pkg, version, commit string, d digest) error {
@@ -569,7 +577,9 @@ func (g *GitSource) lookup(pkg string) ([]Version, error) {
 	if vs, ok := idx.pkgs[pkg]; ok {
 		return vs, nil
 	}
-	if (!idx.done || idx.pending) && g.claimsName(pkg) {
+	// Only a claimed name can fall through to another source, so only there
+	// is a not-found wrong while the answer is unknown.
+	if (!idx.done || idx.pending) && len(g.claims) > 0 && g.claimsName(pkg) {
 		return nil, fmt.Errorf("%w: %s (not every remote is indexed yet)", ErrUnavailable, pkg)
 	}
 	return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
@@ -625,12 +635,22 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 	if found == nil {
 		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, name, version)
 	}
+	// The reference is indexed, so a missing or altered zip is a fault of this
+	// source, never a not-found that would let resolution try another one.
+	l, err := g.readMeta(ctx, archiveMetaKey(g.name, found.Reference))
+	if err != nil {
+		return Artifact{}, fmt.Errorf("composer git: archive metadata of %s %s: %v", name, version, err)
+	}
 	rc, info, err := g.state.Get(ctx, archiveKey(g.name, found.Reference))
 	if errors.Is(err, storage.ErrNotFound) {
-		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, name, version)
+		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is missing", name, version)
 	}
 	if err != nil {
 		return Artifact{}, err
+	}
+	if info.Size != l.size {
+		rc.Close()
+		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is %d bytes, expected %d", name, version, info.Size, l.size)
 	}
 	dist, _ := found.Package["dist"].(map[string]any)
 	return Artifact{Body: rc, Size: info.Size, SHA1: strOf(dist["shasum"])}, nil
