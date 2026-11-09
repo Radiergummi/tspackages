@@ -18,19 +18,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Sidecar, lock and temp file names contain "#", which ValidKey never
+// accepts, so they cannot collide with a key.
 const (
-	etagSuffix = ".etag"
-	lockSuffix = ".lock"
-	tmpSuffix  = ".tmp"
+	etagSuffix = "#etag"
+	lockSuffix = "#lock"
+	tmpSuffix  = "#tmp"
 )
-
-var reservedSuffixes = []string{etagSuffix, lockSuffix, tmpSuffix}
 
 type fsDriver struct{ root string }
 
 // NewFS returns a driver storing objects as files below root. Next to each
-// object it keeps a "<key>.etag" sidecar and a "<key>.lock" file; no path
-// segment of a key may end in .etag, .lock or .tmp. A key cannot also be a
+// object it keeps a "<key>#etag" sidecar and a "<key>#lock" file (temp files
+// end in "#tmp"); keys cannot contain "#", so these never collide. A key cannot also be a
 // prefix of another key (a file cannot be a directory); such writes fail with
 // ErrInvalidKey or ErrExists.
 //
@@ -50,13 +50,6 @@ func NewFS(root string) (Driver, error) {
 func (d *fsDriver) path(key string) (string, error) {
 	if err := ValidKey(key); err != nil {
 		return "", err
-	}
-	for seg := range strings.SplitSeq(key, "/") {
-		for _, s := range reservedSuffixes {
-			if strings.HasSuffix(seg, s) {
-				return "", fmt.Errorf("%w: reserved suffix %q", ErrInvalidKey, s)
-			}
-		}
 	}
 	return filepath.Join(d.root, filepath.FromSlash(key)), nil
 }
@@ -398,14 +391,8 @@ func (d *fsDriver) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-func isSidecar(name string) bool {
-	for _, s := range reservedSuffixes {
-		if strings.HasSuffix(name, s) {
-			return true
-		}
-	}
-	return false
-}
+// isSidecar reports whether a file name is a sidecar, lock or temp file.
+func isSidecar(name string) bool { return strings.Contains(name, "#") }
 
 func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, error] {
 	return func(yield func(Info, error) bool) {

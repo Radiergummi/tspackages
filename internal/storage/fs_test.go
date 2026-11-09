@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -41,12 +43,43 @@ func TestFSKeyPrefixConflict(t *testing.T) {
 	}
 }
 
-func TestFSReservedSegments(t *testing.T) {
-	d, _ := NewFS(t.TempDir())
-	for _, k := range []string{"x.lock", "x.etag", "x.tmp", "a.lock/b", "a.etag/b", "a.tmp/b"} {
-		if _, err := d.Put(context.Background(), k, bytes.NewReader(nil)); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("Put(%q): %v", k, err)
+// Sidecar, lock and temp files use "#", which keys cannot contain, so keys
+// ending in .lock, .etag or .tmp are ordinary keys.
+func TestFSSidecarNamesCannotCollide(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	d, _ := NewFS(root)
+	keys := []string{"x", "x.lock", "x.etag", "x.tmp", "a.lock/b", "a.etag/b", "a.tmp/b"}
+	for _, k := range keys {
+		put(t, d, k, "v-"+k)
+	}
+	for _, k := range keys {
+		rc, _, err := d.Get(ctx, k)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", k, err)
 		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(b) != "v-"+k {
+			t.Errorf("Get(%q) = %q", k, b)
+		}
+	}
+	var listed []string
+	for info, err := range d.List(ctx, "") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed = append(listed, info.Key)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(listed, keys) {
+		t.Errorf("List = %v, want %v", listed, keys)
+	}
+	if _, err := os.Stat(filepath.Join(root, "x#etag")); err != nil {
+		t.Errorf("sidecar: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "x#lock")); err != nil {
+		t.Errorf("lock file: %v", err)
 	}
 }
 
@@ -67,9 +100,9 @@ func TestFSStaleSidecarIgnored(t *testing.T) {
 	d, _ := NewFS(root)
 	first := put(t, d, "k", "one")
 	// Simulate a crash after the new object was renamed but before its sidecar.
-	side, _ := os.ReadFile(filepath.Join(root, "k.etag"))
+	side, _ := os.ReadFile(filepath.Join(root, "k#etag"))
 	second := put(t, d, "k", "two!")
-	os.WriteFile(filepath.Join(root, "k.etag"), side, 0o644)
+	os.WriteFile(filepath.Join(root, "k#etag"), side, 0o644)
 	st, err := d.Stat(context.Background(), "k")
 	if err != nil || st.ETag != second.ETag || st.ETag == first.ETag {
 		t.Fatalf("stat=%+v err=%v first=%q second=%q", st, err, first.ETag, second.ETag)

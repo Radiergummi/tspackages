@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -81,6 +82,10 @@ func TestForbiddenAddrs(t *testing.T) {
 		"64:ff9b::7f00:1": true, "64:ff9b::a9fe:a9fe": true, "64:ff9b::808:808": false,
 		"64:ff9b:1::1": true, "2002:7f00:1::": true, "2002:a00:1::": true, "2002:808:808::": false,
 		"::7f00:1": true, "::a00:1": true, "::808:808": false,
+		"192.0.0.1": true, "192.0.2.1": true, "198.51.100.1": true, "203.0.113.1": true, "192.88.99.1": true,
+		"192.0.3.1": false, "198.51.101.1": false, "203.0.114.1": false,
+		"2001:db8::1": true, "2001::1": true, "2001:0:ffff::1": true, "100::1": true, "100:0:0:1::1": false,
+		"2001:4860::8888": false,
 	} {
 		if got := forbiddenAddr(netip.MustParseAddr(s)); got != want {
 			t.Errorf("%s: got %v want %v", s, got, want)
@@ -336,6 +341,10 @@ func TestCredentialHostCaseInsensitive(t *testing.T) {
 		FetchHosts:  []string{"localhost"},
 		Credentials: map[string]config.Credential{"LocalHost:" + port: {Bearer: "tok"}},
 	})
+	// "localhost" may resolve to ::1 first; the server listens on 127.0.0.1.
+	c.http.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, s.Listener.Addr().String())
+	}
 	resp, err := c.Get(context.Background(), "http://LOCALHOST:"+port+"/")
 	if err != nil {
 		t.Fatal(err)
@@ -355,6 +364,14 @@ func TestErrorsRedactQuery(t *testing.T) {
 	var ue *url.Error
 	if !errors.As(err, &ue) {
 		t.Fatalf("lost cause: %v", err)
+	}
+}
+
+func TestParseErrorRedactsURL(t *testing.T) {
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	_, err := c.Get(context.Background(), "http://u:pw-secret@127.0.0.1:bad/p?token=s3cret")
+	if err == nil || strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "pw-secret") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

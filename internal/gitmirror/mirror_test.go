@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -423,5 +426,114 @@ func TestCancelKillsProcessGroup(t *testing.T) {
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("cancel took %v", d)
+	}
+}
+
+// A hung git that ignores SIGTERM (and has a child that does too) is ended by
+// the per-Sync timeout and the group SIGKILL after killDelay.
+func TestSyncTimeoutKillsHungGroup(t *testing.T) {
+	bin := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child")
+	script := "#!/bin/sh\ntrap '' TERM\nsleep 30 &\necho $! > " + pidFile + "\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m, err := New(Options{Remote: "https://example.com/a.git", BaseDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.syncTimeout, m.killDelay = 300*time.Millisecond, 300*time.Millisecond
+	start := time.Now()
+	if err := m.Sync(context.Background()); err == nil {
+		t.Fatal("want error")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("hung sync took %v", d)
+	}
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatal("child of hung git survived")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestTransportTimeoutOptions(t *testing.T) {
+	bin := t.TempDir()
+	rec := filepath.Join(t.TempDir(), "rec")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n{ echo \"ARGV: $*\"; env; } >> "+rec+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m, err := New(Options{Remote: "git@github.com:a/b.git", BaseDir: t.TempDir(), KnownHostsPath: "/k/kh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.syncTimeout != 10*time.Minute {
+		t.Errorf("syncTimeout = %v", m.syncTimeout)
+	}
+	_ = m.Sync(context.Background())
+	b, _ := os.ReadFile(rec)
+	for _, want := range []string{"http.lowSpeedLimit=1000", "http.lowSpeedTime=60",
+		"-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("missing %q in:\n%s", want, b)
+		}
+	}
+}
+
+// A failing ls-remote after a successful fetch keeps the HEAD, warns and still
+// counts as a sync.
+func TestLsRemoteFailureKeepsHead(t *testing.T) {
+	src := makeRepo(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	m, err := New(Options{Remote: src, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := m.LastSync()
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor a; do [ \"$a\" = ls-remote ] && { echo 'fatal: unable to access' >&2; exit 128; }; done\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	time.Sleep(10 * time.Millisecond)
+	if err := m.Sync(context.Background()); err != nil {
+		t.Fatalf("transient ls-remote failure failed the sync: %v", err)
+	}
+	if !m.LastSync().After(first) {
+		t.Error("lastSync not updated")
+	}
+	if b, err := m.DefaultBranch(context.Background()); err != nil || b != "main" {
+		t.Errorf("default branch = %q, %v", b, err)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("no warning logged: %s", logs.String())
+	}
+}
+
+func TestSCPUserMustNotStartWithDash(t *testing.T) {
+	if scpRe.MatchString("-u@github.com:a/b.git") {
+		t.Error("user starting with - accepted")
+	}
+	if !scpRe.MatchString("git@github.com:a/b.git") || !scpRe.MatchString("_x.y-z@github.com:a/b.git") {
+		t.Error("valid user rejected")
 	}
 }

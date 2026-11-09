@@ -90,6 +90,9 @@ func TestFromWhoIsErrors(t *testing.T) {
 	if _, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{}, UserProfile: &tailcfg.UserProfile{}}, capName); err == nil {
 		t.Error("empty login accepted")
 	}
+	if _, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{}, UserProfile: &tailcfg.UserProfile{LoginName: " \t "}}, capName); err == nil {
+		t.Error("whitespace-only login accepted")
+	}
 	if _, err := FromWhoIs(&apitype.WhoIsResponse{Node: &tailcfg.Node{}}, capName); err == nil {
 		t.Error("untagged node without user profile accepted")
 	}

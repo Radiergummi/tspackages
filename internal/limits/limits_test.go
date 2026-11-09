@@ -78,7 +78,7 @@ func TestIdleEviction(t *testing.T) {
 	var mu sync.Mutex
 	now := time.Unix(1000, 0)
 	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
-	l := newLimiter(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1}, clock)
+	l := newLimiter(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1}, clock, time.Hour)
 	defer l.Close()
 	do(l.Middleware()(ok), "A")
 	if l.size() != 1 {
@@ -93,13 +93,83 @@ func TestIdleEviction(t *testing.T) {
 	}
 }
 
-func TestZeroRateUnlimited(t *testing.T) {
-	l := New(config.Limits{})
+func TestUpstreamLimiterPerIdentity(t *testing.T) {
+	l := New(config.Limits{RequestsPerSecond: 100, Burst: 100, UpstreamFetchesPerSecond: 0.001})
 	defer l.Close()
-	h := l.Middleware()(ok)
-	for i := 0; i < 500; i++ {
-		if w := do(h, "A"); w.Code != 200 {
-			t.Fatalf("req %d = %d", i, w.Code)
-		}
+	ctxs := map[string]context.Context{}
+	h := l.Middleware()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		c, _ := identity.FromContext(r.Context())
+		ctxs[c.NodeStableID] = r.Context()
+	}))
+	do(h, "A")
+	do(h, "B")
+	if err := UpstreamWait(ctxs["A"]); err != nil { // A's only token
+		t.Fatal(err)
 	}
+	short, cancel := context.WithTimeout(ctxs["A"], 20*time.Millisecond)
+	defer cancel()
+	if err := UpstreamWait(short); err == nil {
+		t.Fatal("A got a second token")
+	}
+	if err := UpstreamWait(ctxs["B"]); err != nil {
+		t.Fatalf("B starved by A: %v", err)
+	}
+}
+
+func TestUpstreamBurstFormula(t *testing.T) {
+	for rate, want := range map[float64]int{10: 20, 2.5: 5, 0.1: 1, 0.001: 1} {
+		l := New(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: rate})
+		if got := l.get("A").upstream.Burst(); got != want {
+			t.Errorf("rate %v: burst %d, want %d", rate, got, want)
+		}
+		l.Close()
+	}
+}
+
+func TestJanitorSweeps(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Unix(1000, 0)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	l := newLimiter(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1}, clock, 10*time.Millisecond)
+	defer l.Close()
+	do(l.Middleware()(ok), "A")
+	mu.Lock()
+	now = now.Add(idleTTL + time.Second)
+	mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for l.size() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("janitor never swept the idle entry")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestLastSeenTouchedAtRequestEnd(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Unix(1000, 0)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	l := newLimiter(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1}, clock, time.Hour)
+	defer l.Close()
+	slow := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		mu.Lock()
+		now = now.Add(idleTTL + time.Second) // a long download
+		mu.Unlock()
+	})
+	do(l.Middleware()(slow), "A")
+	l.sweep()
+	if l.size() != 1 {
+		t.Fatal("entry of a request that just finished was evicted")
+	}
+}
+
+func TestCloseTwice(t *testing.T) {
+	l := New(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() { defer wg.Done(); l.Close() }()
+	}
+	wg.Wait()
+	l.Close()
 }

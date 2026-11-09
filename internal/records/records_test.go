@@ -103,12 +103,16 @@ func TestAuditValidationAndAttestation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rc, _, _ := d.Get(ctx, info.Key)
-		var a Audit
-		if err := json.NewDecoder(rc).Decode(&a); err != nil {
+		rc, _, err := d.Get(ctx, info.Key)
+		if err != nil {
 			t.Fatal(err)
 		}
+		var a Audit
+		err = json.NewDecoder(rc).Decode(&a)
 		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if a.Attestation != "id" {
 			t.Fatalf("attestation = %q", a.Attestation)
 		}

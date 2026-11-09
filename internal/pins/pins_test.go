@@ -17,13 +17,15 @@ var (
 	sha1b = strings.Repeat("b", 40)
 )
 
-func newStore(t *testing.T) *Store {
+func newStore(t *testing.T) *Store { return New(newFS(t)) }
+
+func newFS(t *testing.T) storage.Driver {
 	t.Helper()
 	d, err := storage.NewFS(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(d)
+	return d
 }
 
 func TestPinFirstSight(t *testing.T) {
@@ -83,7 +85,7 @@ func TestPinRejectsBadSHA(t *testing.T) {
 }
 
 func TestPinCorruptFileNotOverwritten(t *testing.T) {
-	d, _ := storage.NewFS(t.TempDir())
+	d := newFS(t)
 	s := New(d)
 	key := "pins/composer/gh/" + storage.EscapeSegment("r") + "/" + storage.EscapeSegment("v1") + ".json"
 	if _, err := d.Put(context.Background(), key, strings.NewReader("{garbage")); err != nil {
@@ -97,7 +99,10 @@ func TestPinCorruptFileNotOverwritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	got, _ := io.ReadAll(rc)
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(got) != "{garbage" {
 		t.Fatalf("pin overwritten: %q", got)
 	}
@@ -183,7 +188,7 @@ func (c *countingDriver) Get(ctx context.Context, key string) (io.ReadCloser, st
 }
 
 func TestListCachesPins(t *testing.T) {
-	fs, _ := storage.NewFS(t.TempDir())
+	fs := newFS(t)
 	cd := &countingDriver{Driver: fs}
 	ctx := context.Background()
 	for _, tag := range []string{"v1", "v2"} {
@@ -201,7 +206,7 @@ func TestListCachesPins(t *testing.T) {
 }
 
 func TestListSkipsCorruptPins(t *testing.T) {
-	d, _ := storage.NewFS(t.TempDir())
+	d := newFS(t)
 	s := New(d)
 	ctx := context.Background()
 	if _, _, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1a); err != nil {
@@ -218,7 +223,7 @@ func TestListSkipsCorruptPins(t *testing.T) {
 }
 
 func TestDeletedPinIsNotServedFromCache(t *testing.T) {
-	d, _ := storage.NewFS(t.TempDir())
+	d := newFS(t)
 	s := New(d)
 	ctx := context.Background()
 	if _, _, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1a); err != nil {
@@ -252,7 +257,7 @@ func TestDeletedPinIsNotServedFromCache(t *testing.T) {
 }
 
 func TestListCorruptIsErrCorrupt(t *testing.T) {
-	d, _ := storage.NewFS(t.TempDir())
+	d := newFS(t)
 	s := New(d)
 	key := "pins/composer/src/" + storage.EscapeSegment("r") + "/" + storage.EscapeSegment("v1") + ".json"
 	if _, err := d.Put(context.Background(), key, strings.NewReader("{garbage")); err != nil {

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,7 +33,8 @@ import (
 // Options configures a Mirror. Secrets arrive as file paths (SSH) or a token
 // string (HTTPS).
 type Options struct {
-	Remote  string
+	Remote string
+	// BaseDir holds the mirror; New creates it or tightens it to mode 0700.
 	BaseDir string
 	// SSHKeyPath is an absolute path matching sshPathRe. When empty, ssh
 	// falls back to its default identity files (and, because the environment
@@ -40,6 +42,9 @@ type Options struct {
 	SSHKeyPath     string
 	KnownHostsPath string
 	Token          string
+
+	// Logger receives warnings; nil means slog.Default().
+	Logger *slog.Logger
 
 	// AllowFileRemotesForTesting permits file:// URLs and local paths as
 	// remotes. Tests only; never set from configuration.
@@ -56,8 +61,10 @@ type Ref struct {
 
 // Mirror is a bare mirror of a remote's branches and tags.
 type Mirror struct {
-	opts Options
-	dir  string
+	opts        Options
+	dir         string
+	syncTimeout time.Duration // bounds one Sync; replaced in tests
+	killDelay   time.Duration // SIGTERM to SIGKILL of a cancelled git's process group
 
 	mu       sync.Mutex // serialises Sync
 	stateMu  sync.RWMutex
@@ -65,6 +72,11 @@ type Mirror struct {
 }
 
 const (
+	// syncTimeout bounds one Sync (all its git runs together).
+	syncTimeout = 10 * time.Minute
+	// killDelay is how long a cancelled git's process group gets between
+	// SIGTERM and SIGKILL.
+	killDelay   = 5 * time.Second
 	maxReadFile = 1 << 20
 	headsSpec   = "+refs/heads/*:refs/heads/*"
 	tagsSpec    = "+refs/tags/*:refs/tags/*"
@@ -72,14 +84,15 @@ const (
 
 var (
 	commitRe  = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
-	scpRe     = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)
+	scpRe     = regexp.MustCompile(`^(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)
 	sshPathRe = regexp.MustCompile(`^/[A-Za-z0-9._/@+=,-]+$`)
 )
 
 // New validates the options and prepares the mirror directory
 // BaseDir/<first 16 hex of sha256(Remote, credential identity)>.git. The
 // credential identity keeps mirrors fetched with different credentials apart.
-// It does not touch the network.
+// BaseDir is created with mode 0700, and an existing BaseDir that is group- or
+// world-accessible is chmod-ed to 0700. It does not touch the network.
 func New(o Options) (*Mirror, error) {
 	kind, err := remoteKind(o.Remote, o.AllowFileRemotesForTesting)
 	if err != nil {
@@ -119,7 +132,7 @@ func New(o Options) (*Mirror, error) {
 		identity = hex.EncodeToString(t[:])
 	}
 	sum := sha256.Sum256([]byte(o.Remote + "\x00" + identity))
-	return &Mirror{opts: o, dir: filepath.Join(base, hex.EncodeToString(sum[:])[:16]+".git")}, nil
+	return &Mirror{opts: o, dir: filepath.Join(base, hex.EncodeToString(sum[:])[:16]+".git"), syncTimeout: syncTimeout, killDelay: killDelay}, nil
 }
 
 func remoteKind(r string, allowFile bool) (string, error) {
@@ -150,6 +163,13 @@ func remoteKind(r string, allowFile bool) (string, error) {
 	return "", fmt.Errorf("gitmirror: unsupported remote %q (use https:// or ssh)", r)
 }
 
+func (m *Mirror) log() *slog.Logger {
+	if m.opts.Logger != nil {
+		return m.opts.Logger
+	}
+	return slog.Default()
+}
+
 // Remote returns the remote URL the mirror was configured with.
 func (m *Mirror) Remote() string { return m.opts.Remote }
 
@@ -166,9 +186,13 @@ func (m *Mirror) LastSync() time.Time {
 // Sync creates the mirror on first use and fetches branches and tags
 // (pruning, force-updating tags) afterwards. Only refs/heads and refs/tags
 // are ever fetched. The mirror's HEAD follows the remote's default branch.
+// One Sync is bounded by syncTimeout (10 minutes); transfers slower than
+// 1000 B/s for 60 s and unresponsive SSH peers are abandoned earlier.
 func (m *Mirror) Sync(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, m.syncTimeout)
+	defer cancel()
 
 	_, err := os.Stat(filepath.Join(m.dir, "HEAD"))
 	switch {
@@ -184,8 +208,14 @@ func (m *Mirror) Sync(ctx context.Context) error {
 	default:
 		return err
 	}
+	// The refs are fetched; a failure to learn the remote's default branch
+	// only keeps the previous HEAD.
 	if err := m.followRemoteHead(ctx); err != nil {
-		return err
+		if ctx.Err() != nil {
+			return err
+		}
+		m.log().Warn("gitmirror: could not read the remote's default branch; keeping the previous HEAD",
+			"remote", m.opts.Remote, "error", err)
 	}
 	m.stateMu.Lock()
 	m.lastSync = time.Now()
@@ -402,6 +432,8 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 		"-c", "protocol.file.allow=" + fileAllow,
 		"-c", "protocol.ext.allow=never",
 		"-c", "http.followRedirects=false",
+		"-c", "http.lowSpeedLimit=1000",
+		"-c", "http.lowSpeedTime=60",
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "credential.helper=",
 		"-c", "gc.auto=0",
@@ -415,10 +447,17 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 	cmd.Dir = m.opts.BaseDir
 	cmd.Env = m.env()
 	cmd.Stdin = stdin
-	// Own process group, so cancellation also reaches ssh and remote helpers.
+	// Own process group, so cancellation also reaches ssh and remote helpers:
+	// SIGTERM to the group, SIGKILL to the group killDelay later.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
-	cmd.WaitDelay = 5 * time.Second
+	var kill *time.Timer
+	cmd.Cancel = func() error {
+		pgid := -cmd.Process.Pid
+		kill = time.AfterFunc(m.killDelay, func() { _ = syscall.Kill(pgid, syscall.SIGKILL) })
+		return syscall.Kill(pgid, syscall.SIGTERM)
+	}
+	// Past this, Wait stops waiting for pipes the group still holds.
+	cmd.WaitDelay = m.killDelay + time.Second
 	var out, errBuf bytes.Buffer
 	if stdout != nil {
 		cmd.Stdout = stdout
@@ -426,7 +465,11 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 		cmd.Stdout = &out
 	}
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if kill != nil {
+		kill.Stop() // git has exited; do not signal a group id that may be reused
+	}
+	if err != nil {
 		return nil, &gitError{args: args[0], err: err, stderr: m.redact(errBuf.String())}
 	}
 	return out.Bytes(), nil
@@ -459,7 +502,8 @@ func (m *Mirror) env() []string {
 			cmd += " -i " + m.opts.SSHKeyPath
 		}
 		cmd += " -o IdentitiesOnly=yes -o UserKnownHostsFile=" + m.opts.KnownHostsPath +
-			" -o StrictHostKeyChecking=yes -o BatchMode=yes"
+			" -o StrictHostKeyChecking=yes -o BatchMode=yes" +
+			" -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 		env = append(env, "GIT_SSH_COMMAND="+cmd)
 	}
 	return env

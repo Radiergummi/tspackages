@@ -41,7 +41,7 @@ type Store struct {
 
 	mu    sync.Mutex
 	moved map[[4]string]MovedTag
-	cache map[string]pinFile // by key; a pin never changes once written
+	cache map[string]pinFile // by key; tspackages never rewrites a pin, but operators may delete one (List and Pin drop or replace such entries)
 }
 
 func New(d storage.Driver) *Store {
@@ -97,8 +97,10 @@ type Pin struct {
 	FirstSeen time.Time
 }
 
-// read returns the pin stored at key. Valid pins are cached, since a pin is
-// immutable once written; corrupt ones are re-read every time.
+// read returns the pin stored at key. Valid pins are cached: tspackages never
+// rewrites a pin, and an operator's deletion is noticed by List (which drops
+// the entry) and Pin (which replaces it on re-pinning). Corrupt pins are
+// re-read every time.
 func (s *Store) read(ctx context.Context, key string) (pinFile, error) {
 	s.mu.Lock()
 	pf, ok := s.cache[key]

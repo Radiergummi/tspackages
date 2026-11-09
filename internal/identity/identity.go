@@ -50,7 +50,7 @@ func FromWhoIs(r *apitype.WhoIsResponse, capName tailcfg.PeerCapability) (Caller
 		if r.UserProfile == nil {
 			return Caller{}, errors.New("whois response has no user profile")
 		}
-		if r.UserProfile.LoginName == "" {
+		if strings.TrimSpace(r.UserProfile.LoginName) == "" {
 			return Caller{}, errors.New("whois response has empty login name")
 		}
 		c.Login = r.UserProfile.LoginName

@@ -4,7 +4,6 @@ package limits
 
 import (
 	"context"
-	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -28,7 +27,7 @@ type entry struct {
 }
 
 // Limiter holds one request limiter and one upstream-fetch limiter per node.
-// A rate of 0 in the configuration means unlimited.
+// Rates must be positive; config validation enforces it.
 type Limiter struct {
 	cfg      config.Limits
 	now      func() time.Time
@@ -37,12 +36,13 @@ type Limiter struct {
 	rejected atomic.Uint64
 	stop     chan struct{}
 	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // New returns a Limiter and starts its idle-eviction janitor; call Close to stop it.
-func New(l config.Limits) *Limiter { return newLimiter(l, time.Now) }
+func New(l config.Limits) *Limiter { return newLimiter(l, time.Now, sweepInterval) }
 
-func newLimiter(l config.Limits, now func() time.Time) *Limiter {
+func newLimiter(l config.Limits, now func() time.Time, sweep time.Duration) *Limiter {
 	lim := &Limiter{
 		cfg:     l,
 		now:     now,
@@ -50,26 +50,22 @@ func newLimiter(l config.Limits, now func() time.Time) *Limiter {
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	go lim.janitor()
+	go lim.janitor(sweep)
 	return lim
 }
 
 // Close stops the janitor.
 func (l *Limiter) Close() {
-	select {
-	case <-l.stop:
-	default:
-		close(l.stop)
-	}
+	l.stopOnce.Do(func() { close(l.stop) })
 	<-l.done
 }
 
 // Rejected returns the number of requests answered with 429.
 func (l *Limiter) Rejected() uint64 { return l.rejected.Load() }
 
-func (l *Limiter) janitor() {
+func (l *Limiter) janitor(every time.Duration) {
 	defer close(l.done)
-	t := time.NewTicker(sweepInterval)
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
@@ -114,10 +110,13 @@ func (l *Limiter) get(key string) *entry {
 	return e
 }
 
+func (l *Limiter) touch(e *entry) {
+	l.mu.Lock()
+	e.lastSeen = l.now()
+	l.mu.Unlock()
+}
+
 func newRate(perSecond float64, burst int) *rate.Limiter {
-	if perSecond <= 0 {
-		return rate.NewLimiter(rate.Inf, math.MaxInt32)
-	}
 	return rate.NewLimiter(rate.Limit(perSecond), max(1, burst))
 }
 
@@ -141,6 +140,7 @@ func (l *Limiter) Middleware() func(http.Handler) http.Handler {
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, e.upstream)))
+			l.touch(e) // a long request keeps its entry from idle eviction
 		})
 	}
 }
