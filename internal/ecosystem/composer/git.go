@@ -3,9 +3,6 @@ package composer
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
@@ -92,11 +90,17 @@ type remoteResult struct {
 	versions []Version
 }
 
-type digest struct{ sha1, sha256 string }
+// sums are the hex digests of an archive.
+type sums struct{ sha1, sha256 string }
+
+func sumsOf(b []byte) sums {
+	s1, s256 := digest.Of(b)
+	return sums{sha1: s1, sha256: s256}
+}
 
 type loaded struct {
 	meta map[string]any
-	d    digest
+	d    sums
 	size int64
 }
 
@@ -607,9 +611,9 @@ func (g *GitSource) load(ctx context.Context, m *gitmirror.Mirror, commit string
 		if zerr != nil {
 			return loaded{}, zerr
 		}
-		s1, s256 := sha1.Sum(data), sha256.Sum256(data)
+		d := sumsOf(data)
 		body, merr := json.Marshal(archiveMeta{
-			SHA1: hex.EncodeToString(s1[:]), SHA256: hex.EncodeToString(s256[:]),
+			SHA1: d.sha1, SHA256: d.sha256,
 			Size: int64(len(data)), ComposerJSON: raw,
 		})
 		if merr != nil {
@@ -641,10 +645,10 @@ func (g *GitSource) readMeta(ctx context.Context, key string) (loaded, error) {
 	if err != nil || am.SHA1 == "" || am.SHA256 == "" {
 		return loaded{}, fmt.Errorf("corrupt %s", key)
 	}
-	return loaded{meta: meta, d: digest{sha1: am.SHA1, sha256: am.SHA256}, size: am.Size}, nil
+	return loaded{meta: meta, d: sums{sha1: am.SHA1, sha256: am.SHA256}, size: am.Size}, nil
 }
 
-func (g *GitSource) recordProvenance(ctx context.Context, m *gitmirror.Mirror, pkg, version, commit string, d digest) error {
+func (g *GitSource) recordProvenance(ctx context.Context, m *gitmirror.Mirror, pkg, version, commit string, d sums) error {
 	pk := commit + "\x00" + version
 	if g.prov[pk] {
 		return nil

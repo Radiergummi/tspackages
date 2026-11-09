@@ -18,7 +18,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/resolve"
-	"tailscale.com/client/tailscale/apitype"
+	"github.com/radiergummi/tspackages/internal/testutil"
 	"tailscale.com/tailcfg"
 )
 
@@ -71,19 +71,6 @@ func ver(name, v string, dev bool) Version {
 	}
 }
 
-type whoiser struct{ rules []string }
-
-func (w whoiser) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	var vals []tailcfg.RawMessage
-	for _, r := range w.rules {
-		vals = append(vals, tailcfg.RawMessage(r))
-	}
-	return &apitype.WhoIsResponse{
-		Node:   &tailcfg.Node{Name: "n.ts.net.", StableID: "nid", Tags: []string{"tag:ci"}},
-		CapMap: tailcfg.PeerCapMap{hCap: vals},
-	}, nil
-}
-
 const readAll = `{"read":["*"]}`
 
 func server(t *testing.T, srcs []Source, rules ...string) http.Handler {
@@ -95,7 +82,7 @@ func serverLog(t *testing.T, log *slog.Logger, srcs []Source, rules ...string) h
 	t.Helper()
 	mux := http.NewServeMux()
 	New(srcs, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}, log).Mount(mux)
-	return identity.Middleware(whoiser{rules}, hCap, nil)(mux)
+	return identity.Middleware(testutil.Who{Cap: hCap, Rules: rules}, hCap, nil)(mux)
 }
 
 func do(h http.Handler, method, path string, body io.Reader, hdr ...string) *httptest.ResponseRecorder {
@@ -522,7 +509,7 @@ func TestClientAuthorizationStripped(t *testing.T) {
 	mux := http.NewServeMux()
 	New([]Source{store}, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}, nil).Mount(mux)
 	var seen string
-	h := identity.Middleware(whoiser{[]string{`{"write":["composer:matchory-internal/*"]}`}}, hCap, nil)(
+	h := identity.Middleware(testutil.Who{Cap: hCap, Rules: []string{`{"write":["composer:matchory-internal/*"]}`}}, hCap, nil)(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			seen = r.Header.Get("Authorization") + r.Header.Get("Proxy-Authorization")
 			mux.ServeHTTP(w, r)
@@ -582,7 +569,7 @@ func TestUploadLogLine(t *testing.T) {
 		t.Fatalf("%v", ls)
 	}
 	l := ls[0]
-	if l["level"] != "INFO" || l["caller"] != "tag:ci" || l["node"] != "nid" || l["node_name"] != "n.ts.net" ||
+	if l["level"] != "INFO" || l["caller"] != "tag:ci" || l["node"] != "nid" || l["node_name"] != "ci.ts.net" ||
 		l["package"] != "matchory-internal/foo" || l["version"] != "1.0.0" || l["sha256"] != hex.EncodeToString(sum[:]) {
 		t.Fatalf("log line: %v", l)
 	}

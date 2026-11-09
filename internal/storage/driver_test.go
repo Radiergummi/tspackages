@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -232,7 +232,7 @@ func runDriverSuite(t *testing.T, d Driver) {
 		for _, k := range keys {
 			put(t, d, k, "x")
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		var got []string
 		for info, err := range d.List(ctx, "ord/") {
 			if err != nil {

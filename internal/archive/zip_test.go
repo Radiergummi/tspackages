@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io/fs"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -65,7 +66,7 @@ func lyingZip(t *testing.T) []byte {
 func TestInspectZip(t *testing.T) {
 	many := make([]entry, 20001)
 	for i := range many {
-		many[i] = entry{name: "d" + itoa(i) + "/f"}
+		many[i] = entry{name: "d" + strconv.Itoa(i) + "/f"}
 	}
 	big := Limits{MaxBytes: 1 << 30, MaxDecompressed: 1 << 30, MaxEntries: 20000}
 	dupJSON := makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "composer.json", body: "{\"x\":1}"})
@@ -116,18 +117,6 @@ func TestInspectZip(t *testing.T) {
 			}
 		})
 	}
-}
-
-func itoa(i int) string {
-	const d = "0123456789"
-	if i == 0 {
-		return "0"
-	}
-	s := ""
-	for ; i > 0; i /= 10 {
-		s = string(d[i%10]) + s
-	}
-	return s
 }
 
 func TestFindFile(t *testing.T) {

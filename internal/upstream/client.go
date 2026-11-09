@@ -6,9 +6,6 @@ package upstream
 
 import (
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +19,7 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/config"
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -80,7 +78,7 @@ type Options struct {
 }
 
 type Client struct {
-	hosts        map[string]struct{} // lowercased entries
+	hosts        []string
 	creds        map[string]config.Credential
 	allowPrivate bool
 	http         *http.Client
@@ -88,15 +86,12 @@ type Client struct {
 
 func New(o Options) *Client {
 	c := &Client{
-		hosts:        make(map[string]struct{}, len(o.FetchHosts)),
+		hosts:        o.FetchHosts,
 		allowPrivate: o.AllowPrivateForTesting,
 	}
 	c.creds = make(map[string]config.Credential, len(o.Credentials))
 	for h, cr := range o.Credentials {
 		c.creds[strings.ToLower(h)] = cr
-	}
-	for _, h := range o.FetchHosts {
-		c.hosts[strings.ToLower(h)] = struct{}{}
 	}
 	timeout := o.Timeout
 	if timeout <= 0 {
@@ -189,18 +184,6 @@ var (
 	v4Compat       = netip.MustParsePrefix("::/96")
 )
 
-func (c *Client) hostAllowed(u *url.URL) bool {
-	host := strings.ToLower(u.Hostname())
-	if _, ok := c.hosts[host]; ok {
-		return true
-	}
-	if port := u.Port(); port != "" {
-		_, ok := c.hosts[net.JoinHostPort(host, port)]
-		return ok
-	}
-	return false
-}
-
 func (c *Client) checkURL(u *url.URL) error {
 	if u.Scheme != "https" && !(u.Scheme == "http" && c.allowPrivate) {
 		return fmt.Errorf("%w: %q", ErrSchemeNotAllowed, u.Scheme)
@@ -208,7 +191,7 @@ func (c *Client) checkURL(u *url.URL) error {
 	if u.User != nil {
 		return ErrUserinfo
 	}
-	if !c.hostAllowed(u) {
+	if !config.HostAllowed(c.hosts, u) {
 		return fmt.Errorf("%w: %s", ErrHostNotAllowed, u.Host)
 	}
 	return nil
@@ -305,9 +288,7 @@ func (c *Client) FetchVerified(ctx context.Context, rawURL string, want *Digest,
 	if int64(len(body)) > maxBytes {
 		return nil, "", "", ErrTooLarge
 	}
-	s1 := sha1.Sum(body)
-	s2 := sha256.Sum256(body)
-	sha1Hex, sha256Hex = hex.EncodeToString(s1[:]), hex.EncodeToString(s2[:])
+	sha1Hex, sha256Hex = digest.Of(body)
 	if want != nil {
 		got := sha256Hex
 		if want.Algo == "sha1" {

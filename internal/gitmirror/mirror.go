@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -83,7 +84,6 @@ const (
 )
 
 var (
-	commitRe  = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 	scpRe     = regexp.MustCompile(`^(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)
 	sshPathRe = regexp.MustCompile(`^/[A-Za-z0-9._/@+=,-]+$`)
 )
@@ -94,7 +94,7 @@ var (
 // BaseDir is created with mode 0700, and an existing BaseDir that is group- or
 // world-accessible is chmod-ed to 0700. It does not touch the network.
 func New(o Options) (*Mirror, error) {
-	kind, err := remoteKind(o.Remote, o.AllowFileRemotesForTesting)
+	kind, err := RemoteKind(o.Remote, o.AllowFileRemotesForTesting)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +135,15 @@ func New(o Options) (*Mirror, error) {
 	return &Mirror{opts: o, dir: filepath.Join(base, hex.EncodeToString(sum[:])[:16]+".git"), syncTimeout: syncTimeout, killDelay: killDelay}, nil
 }
 
-func remoteKind(r string, allowFile bool) (string, error) {
+// ErrRemoteCredentials is returned by RemoteKind for a remote URL that embeds
+// credentials.
+var ErrRemoteCredentials = errors.New("gitmirror: remote must not embed credentials; use the token option")
+
+// RemoteKind classifies a git remote as "https", "ssh" (ssh:// or scp-style
+// [user@]host:path) or, only with allowFile, "file" (file:// or any other
+// non-URL path). It returns ErrRemoteCredentials for an https remote with
+// userinfo or any remote with a password, and an error for anything else.
+func RemoteKind(r string, allowFile bool) (string, error) {
 	if r == "" || strings.HasPrefix(r, "-") || strings.ContainsAny(r, "\x00\r\n\t ") || strings.Contains(r, "::") {
 		return "", fmt.Errorf("gitmirror: unsupported remote %q", r)
 	}
@@ -147,7 +155,7 @@ func remoteKind(r string, allowFile bool) (string, error) {
 		}
 		if u.User != nil {
 			if _, hasPw := u.User.Password(); hasPw || u.Scheme == "https" {
-				return "", errors.New("gitmirror: remote must not embed credentials; use the token option")
+				return "", ErrRemoteCredentials
 			}
 		}
 		return u.Scheme, nil
@@ -354,7 +362,7 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 // path or commit wraps resolve.ErrNotFound; files over 1 MiB are an error
 // (this is for small manifests such as composer.json and go.mod).
 func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, error) {
-	if !commitRe.MatchString(commit) {
+	if !digest.IsHex(commit, 40, 64) {
 		return nil, fmt.Errorf("gitmirror: invalid commit %q", commit)
 	}
 	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00\n") {
@@ -399,7 +407,7 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 // must treat anything already written to w as invalid when an error is
 // returned (the stream can be cut off part-way).
 func (m *Mirror) ArchiveZip(ctx context.Context, commit string, w io.Writer) error {
-	if !commitRe.MatchString(commit) {
+	if !digest.IsHex(commit, 40, 64) {
 		return fmt.Errorf("gitmirror: invalid commit %q", commit)
 	}
 	_, err := m.git(ctx, m.dir, nil, w, "archive", "--format=zip", commit)

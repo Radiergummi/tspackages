@@ -58,6 +58,23 @@ type Storage struct {
 	Stores  map[string]StoreConfig `yaml:"stores"`
 }
 
+// NamedStore is one configured store.
+type NamedStore struct {
+	Path   string // "storage.cache", "storage.state" or "storage.stores.<Name>"
+	Name   string // key in Storage.Stores; "" for the cache and the state store
+	Config StoreConfig
+}
+
+// Named lists the cache, the state store and the hosted stores sorted by
+// name, in that order.
+func (s *Storage) Named() []NamedStore {
+	out := []NamedStore{{Path: "storage.cache", Config: s.Cache}, {Path: "storage.state", Config: s.State}}
+	for _, name := range slices.Sorted(maps.Keys(s.Stores)) {
+		out = append(out, NamedStore{Path: "storage.stores." + name, Name: name, Config: s.Stores[name]})
+	}
+	return out
+}
+
 type Limits struct {
 	MaxUploadBytes       ByteSize `yaml:"max_upload_bytes"`
 	MaxDecompressedBytes ByteSize `yaml:"max_decompressed_bytes"`

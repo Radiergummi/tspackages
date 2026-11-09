@@ -22,29 +22,13 @@ import (
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 var caller = identity.Caller{Login: "ci@example.com", Tags: []string{"tag:ci"}, NodeName: "runner", NodeStableID: "nstable1"}
 
-func zipOf(t *testing.T, files map[string]string) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for name, body := range files {
-		w, err := zw.Create(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.WriteString(w, body)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
 func pkgZip(t *testing.T, composerJSON string) []byte {
-	return zipOf(t, map[string]string{"composer.json": composerJSON, "src/a.php": "<?php"})
+	return testutil.ZipOf(t, map[string]string{"composer.json": composerJSON, "src/a.php": "<?php"})
 }
 
 func newSource(t *testing.T) (*StorageSource, storage.Driver) {
@@ -164,7 +148,7 @@ func TestUploadRejects(t *testing.T) {
 		{"invalid version", "matchory-internal/foo", "banana", pkgZip(t, fooJSON), true, false},
 		{"dev version", "matchory-internal/foo", "1.0.x-dev", pkgZip(t, fooJSON), true, false},
 		{"dev branch", "matchory-internal/foo", "dev-main", pkgZip(t, fooJSON), true, false},
-		{"no composer.json", "matchory-internal/foo", "1.0.0", zipOf(t, map[string]string{"a": "b"}), true, false},
+		{"no composer.json", "matchory-internal/foo", "1.0.0", testutil.ZipOf(t, map[string]string{"a": "b"}), true, false},
 		{"bad composer.json", "matchory-internal/foo", "1.0.0", pkgZip(t, `{`), true, false},
 		{"version mismatch", "matchory-internal/foo", "1.0.0", pkgZip(t, `{"name":"matchory-internal/foo","version":"2.0.0"}`), true, false},
 		{"not a zip", "matchory-internal/foo", "1.0.0", []byte("nope"), false, true},

@@ -8,19 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/storage"
 )
 
 // ErrCorrupt marks a pin file that cannot be decoded or holds an invalid SHA.
 var ErrCorrupt = errors.New("pins: corrupt pin")
-
-var shaRE = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // MovedTag is a tag whose upstream SHA differs from its pin. Seen is the
 // newly observed SHA.
@@ -52,7 +50,7 @@ func New(d storage.Driver) *Store {
 // the tag was pinned to a different SHA, it returns the pinned one with
 // moved=true and remembers the move.
 func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha string) (pinned string, moved bool, err error) {
-	if !shaRE.MatchString(sha) {
+	if !digest.IsHex(sha, 40, 64) {
 		return "", false, fmt.Errorf("pins: invalid sha %q", sha)
 	}
 	key := keyPrefix(ecosystem, source, remote) + storage.EscapeSegment(tag) + ".json"
@@ -120,7 +118,7 @@ func (s *Store) read(ctx context.Context, key string) (pinFile, error) {
 	if err := json.Unmarshal(raw, &pf); err != nil {
 		return pinFile{}, fmt.Errorf("%w %s: %v", ErrCorrupt, key, err)
 	}
-	if !shaRE.MatchString(pf.SHA) {
+	if !digest.IsHex(pf.SHA, 40, 64) {
 		return pinFile{}, fmt.Errorf("%w %s: invalid sha", ErrCorrupt, key)
 	}
 	s.mu.Lock()

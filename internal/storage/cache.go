@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -53,7 +53,7 @@ func NewCache(ctx context.Context, d Driver, maxSize int64, log *slog.Logger) (*
 		}
 		infos = append(infos, info)
 	}
-	sort.SliceStable(infos, func(i, j int) bool { return infos[i].ModTime.Before(infos[j].ModTime) })
+	slices.SortStableFunc(infos, func(a, b Info) int { return a.ModTime.Compare(b.ModTime) })
 
 	c := &Cache{
 		d: d, maxSize: maxSize,

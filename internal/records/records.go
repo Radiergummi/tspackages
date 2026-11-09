@@ -10,15 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"strconv"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/storage"
 )
-
-var sha256RE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Uploader identifies who published an artifact.
 type Uploader struct {
@@ -77,7 +75,7 @@ type Store struct{ d storage.Driver }
 func New(d storage.Driver) *Store { return &Store{d: d} }
 
 func provKey(ecosystem, pkg, version, sha256 string) (string, error) {
-	if !sha256RE.MatchString(sha256) {
+	if !digest.IsHex(sha256, 64) {
 		return "", fmt.Errorf("records: invalid sha256 %q", sha256)
 	}
 	return "provenance/" + ecosystem + "/" + storage.EscapeSegment(pkg) + "/" +
@@ -130,7 +128,7 @@ func (s *Store) PutAudit(ctx context.Context, a Audit) error {
 		return errors.New("records: audit action is empty")
 	}
 	if a.SHA256 != "" || a.Action == "publish" {
-		if !sha256RE.MatchString(a.SHA256) {
+		if !digest.IsHex(a.SHA256, 64) {
 			return fmt.Errorf("records: invalid sha256 %q", a.SHA256)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,35 +17,20 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/resolve"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
-
-func git(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	full := append([]string{"-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main"}, args...)
-	cmd := exec.Command("git", full...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com",
-		"GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@example.com",
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
-	return strings.TrimSpace(string(out))
-}
 
 // makeRepo builds a work tree with a commit and returns its path.
 func makeRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	git(t, dir, "init", "-q")
+	testutil.Git(t, dir, "init", "-q")
 	write(t, dir, "composer.json", `{"name":"a/b"}`)
 	write(t, dir, "src/a.php", "<?php")
 	write(t, dir, "tests/t.php", "<?php")
 	write(t, dir, ".gitattributes", "tests/ export-ignore\n")
-	git(t, dir, "add", ".")
-	git(t, dir, "commit", "-q", "-m", "one")
+	testutil.Git(t, dir, "add", ".")
+	testutil.Git(t, dir, "commit", "-q", "-m", "one")
 	return dir
 }
 
@@ -73,11 +59,11 @@ func newMirror(t *testing.T, remote string) *Mirror {
 
 func TestSyncAndRefs(t *testing.T) {
 	src := makeRepo(t)
-	commit := git(t, src, "rev-parse", "HEAD")
-	git(t, src, "tag", "-a", "v1.0.0", "-m", "rel")
-	git(t, src, "tag", "v1.1.0")
-	git(t, src, "tag", "-a", "treetag", "-m", "x", "HEAD^{tree}")
-	git(t, src, "-c", "advice.nestedTag=false", "tag", "-a", "nested", "-m", "n", "v1.0.0")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "tag", "-a", "v1.0.0", "-m", "rel")
+	testutil.Git(t, src, "tag", "v1.1.0")
+	testutil.Git(t, src, "tag", "-a", "treetag", "-m", "x", "HEAD^{tree}")
+	testutil.Git(t, src, "-c", "advice.nestedTag=false", "tag", "-a", "nested", "-m", "n", "v1.0.0")
 
 	m := newMirror(t, src)
 	if m.LastSync().IsZero() {
@@ -114,13 +100,13 @@ func TestSyncAndRefs(t *testing.T) {
 
 func TestResyncSeesMovedTag(t *testing.T) {
 	src := makeRepo(t)
-	git(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	m := newMirror(t, src)
 	write(t, src, "x", "x")
-	git(t, src, "add", ".")
-	git(t, src, "commit", "-q", "-m", "two")
-	git(t, src, "tag", "-f", "v1.0.0")
-	want := git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	testutil.Git(t, src, "tag", "-f", "v1.0.0")
+	want := testutil.Git(t, src, "rev-parse", "HEAD")
 	if err := m.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +120,7 @@ func TestResyncSeesMovedTag(t *testing.T) {
 
 func TestRefsWithSlashTag(t *testing.T) {
 	src := makeRepo(t)
-	git(t, src, "tag", "release/2026-01")
+	testutil.Git(t, src, "tag", "release/2026-01")
 	m := newMirror(t, src)
 	refs, _ := m.Refs(context.Background())
 	for _, r := range refs {
@@ -150,7 +136,7 @@ func TestRefsWithSlashTag(t *testing.T) {
 
 func TestReadFile(t *testing.T) {
 	src := makeRepo(t)
-	commit := git(t, src, "rev-parse", "HEAD")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
 	m := newMirror(t, src)
 	ctx := context.Background()
 	b, err := m.ReadFile(ctx, commit, "composer.json")
@@ -181,7 +167,7 @@ func TestReadFile(t *testing.T) {
 
 func TestArchiveExportIgnore(t *testing.T) {
 	src := makeRepo(t)
-	commit := git(t, src, "rev-parse", "HEAD")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
 	m := newMirror(t, src)
 	var buf bytes.Buffer
 	if err := m.ArchiveZip(context.Background(), commit, &buf); err != nil {
@@ -198,21 +184,12 @@ func TestArchiveExportIgnore(t *testing.T) {
 			t.Errorf("tests/ not ignored: %s", f.Name)
 		}
 	}
-	if !contains(names, "composer.json") || !contains(names, "src/a.php") {
+	if !slices.Contains(names, "composer.json") || !slices.Contains(names, "src/a.php") {
 		t.Errorf("entries: %v", names)
 	}
 	if err := m.ArchiveZip(context.Background(), "main", &buf); err == nil {
 		t.Error("non-sha commit accepted")
 	}
-}
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func TestNewRemoteValidation(t *testing.T) {
@@ -341,9 +318,9 @@ func TestReadFileSizeCap(t *testing.T) {
 	src := makeRepo(t)
 	write(t, src, "big", strings.Repeat("x", maxReadFile+1))
 	write(t, src, "ok", strings.Repeat("x", maxReadFile))
-	git(t, src, "add", ".")
-	git(t, src, "commit", "-q", "-m", "big")
-	commit := git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "big")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
 	m := newMirror(t, src)
 	if _, err := m.ReadFile(context.Background(), commit, "big"); err == nil || errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("big: %v", err)
@@ -355,25 +332,25 @@ func TestReadFileSizeCap(t *testing.T) {
 
 func TestOnlyHeadsAndTagsAndDefaultBranchFollows(t *testing.T) {
 	src := makeRepo(t)
-	git(t, src, "update-ref", "refs/pull/1/head", "HEAD")
-	git(t, src, "update-ref", "refs/merge-requests/1/head", "HEAD")
-	git(t, src, "checkout", "-q", "-b", "dev")
+	testutil.Git(t, src, "update-ref", "refs/pull/1/head", "HEAD")
+	testutil.Git(t, src, "update-ref", "refs/merge-requests/1/head", "HEAD")
+	testutil.Git(t, src, "checkout", "-q", "-b", "dev")
 	m := newMirror(t, src)
 	ctx := context.Background()
-	if out := git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
+	if out := testutil.Git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
 		t.Errorf("unexpected refs:\n%s", out)
 	}
 	if b, err := m.DefaultBranch(ctx); err != nil || b != "dev" {
 		t.Errorf("DefaultBranch = %q, %v", b, err)
 	}
-	git(t, src, "checkout", "-q", "main")
+	testutil.Git(t, src, "checkout", "-q", "main")
 	if err := m.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := m.DefaultBranch(ctx); b != "main" {
 		t.Errorf("after switch DefaultBranch = %q", b)
 	}
-	if out := git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
+	if out := testutil.Git(t, m.dir, "for-each-ref", "refs/pull", "refs/merge-requests", "refs/remotes"); out != "" {
 		t.Errorf("unexpected refs after resync:\n%s", out)
 	}
 }
@@ -382,8 +359,8 @@ func TestStaleLocksRemoved(t *testing.T) {
 	src := makeRepo(t)
 	m := newMirror(t, src)
 	write(t, src, "x", "x")
-	git(t, src, "add", ".")
-	git(t, src, "commit", "-q", "-m", "two")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
 	write(t, m.dir, "refs/heads/main.lock", "")
 	write(t, m.dir, "packed-refs.lock", "")
 	if err := m.Sync(context.Background()); err != nil {

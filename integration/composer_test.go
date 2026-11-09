@@ -4,7 +4,6 @@
 package integration
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha1"
@@ -25,39 +24,10 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/server"
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 const capName = "github.com/radiergummi/tspackages"
-
-type fakeWho struct{}
-
-func (fakeWho) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	return &apitype.WhoIsResponse{
-		Node: &tailcfg.Node{Name: "ci.ts.net.", StableID: "nid", Tags: []string{"tag:ci"}},
-		CapMap: tailcfg.PeerCapMap{capName: {
-			tailcfg.RawMessage(`{"read":["*"],"write":["composer:matchory-internal/*"]}`),
-		}},
-	}, nil
-}
-
-func zipOf(t *testing.T, files map[string]string) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for name, content := range files {
-		f, err := zw.Create(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.WriteString(f, content)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
 
 func sha1Hex(b []byte) string {
 	s := sha1.Sum(b)
@@ -105,11 +75,11 @@ func (f *fakePackagist) seen() []string {
 
 func newFakePackagist(t *testing.T) *fakePackagist {
 	t.Helper()
-	logZip := zipOf(t, map[string]string{
+	logZip := testutil.ZipOf(t, map[string]string{
 		"log-3.0.0/composer.json": `{"name":"psr/log"}`,
 		"log-3.0.0/src/Foo.php":   `<?php`,
 	})
-	decoyZip := zipOf(t, map[string]string{"a-9.9.9/composer.json": `{"name":"matchory/a"}`})
+	decoyZip := testutil.ZipOf(t, map[string]string{"a-9.9.9/composer.json": `{"name":"matchory/a"}`})
 	f := &fakePackagist{}
 	mux := http.NewServeMux()
 	meta := func(name, version string, zipBytes []byte, distPath string) string {
@@ -158,16 +128,15 @@ func TestComposerEndToEnd(t *testing.T) {
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gitEnv := []string{"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com", "GIT_CONFIG_GLOBAL=/dev/null"}
-	run(t, work, gitEnv, "git", "init", "-q", "-b", "main")
+	testutil.Git(t, work, "init", "-q")
 	if err := os.WriteFile(filepath.Join(work, "composer.json"), []byte(`{"name":"matchory/a","description":"a"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run(t, work, gitEnv, "git", "add", ".")
-	run(t, work, gitEnv, "git", "commit", "-q", "-m", "one")
-	run(t, work, gitEnv, "git", "tag", "v1.0.0")
-	commit := strings.TrimSpace(run(t, work, gitEnv, "git", "rev-parse", "v1.0.0^{commit}"))
-	run(t, root, gitEnv, "git", "clone", "-q", "--bare", work, bare)
+	testutil.Git(t, work, "add", ".")
+	testutil.Git(t, work, "commit", "-q", "-m", "one")
+	testutil.Git(t, work, "tag", "v1.0.0")
+	commit := testutil.Git(t, work, "rev-parse", "v1.0.0^{commit}")
+	testutil.Git(t, root, "clone", "-q", "--bare", work, bare)
 
 	packagist := newFakePackagist(t)
 	pu, _ := url.Parse(packagist.URL)
@@ -190,7 +159,7 @@ func TestComposerEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler, start, err := server.Build(ctx, cfg, fakeWho{}, log, server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
+	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, `{"read":["*"],"write":["composer:matchory-internal/*"]}`), log, server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +188,7 @@ func TestComposerEndToEnd(t *testing.T) {
 
 	// Upload matchory-internal/b 1.0.0.
 	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/composer/upload/matchory-internal/b/1.0.0",
-		bytes.NewReader(zipOf(t, map[string]string{"composer.json": `{"name":"matchory-internal/b","description":"b"}`})))
+		bytes.NewReader(testutil.ZipOf(t, map[string]string{"composer.json": `{"name":"matchory-internal/b","description":"b"}`})))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

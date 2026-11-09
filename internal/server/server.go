@@ -12,8 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,17 +38,8 @@ type Hooks struct {
 	AllowFileRemotes      bool // gitmirror.Options.AllowFileRemotesForTesting
 }
 
-// probeKey is read to check that a store is reachable; ErrNotFound counts as
-// reachable.
-const probeKey = ".tspackages-probe"
-
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
-
-type namedStore struct {
-	name string
-	d    storage.Driver
-}
 
 // Build validates cfg, opens and probes every store, builds the sources in
 // config order and returns the handler (identity → rate limits → routes) and a
@@ -76,28 +65,15 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	if err != nil {
 		return nil, nil, err
 	}
-	ready := func(ctx context.Context) error {
-		for _, s := range stores {
-			if _, err := s.d.Stat(ctx, probeKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return fmt.Errorf("%s: %w", s.name, err)
-			}
-		}
-		return nil
-	}
-	if err := ready(ctx); err != nil {
+	if err := stores.ready(ctx); err != nil {
 		return nil, nil, fmt.Errorf("store unreachable: %w", err)
 	}
-	cacheDriver, stateDriver := stores[0].d, stores[1].d
-	named := map[string]storage.Driver{}
-	for _, s := range stores[2:] {
-		named[strings.TrimPrefix(s.name, "storage.stores.")] = s.d
-	}
-	cache, err := storage.NewCache(ctx, cacheDriver, int64(cfg.Storage.Cache.MaxSize), log)
+	cache, err := storage.NewCache(ctx, stores.cache, int64(cfg.Storage.Cache.MaxSize), log)
 	if err != nil {
 		return nil, nil, fmt.Errorf("storage.cache: %w", err)
 	}
-	pinStore := pins.New(stateDriver)
-	rec := records.New(stateDriver)
+	pinStore := pins.New(stores.state)
+	rec := records.New(stores.state)
 
 	l := cfg.Limits
 	archiveLimits := archive.Limits{
@@ -117,7 +93,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	for _, s := range eco.Sources {
 		switch s.Type {
 		case "storage":
-			src := composer.NewStorageSource(s.Name, s.Claims, named[s.Store], rec, archiveLimits, log)
+			src := composer.NewStorageSource(s.Name, s.Claims, stores.hosted[s.Store], rec, archiveLimits, log)
 			sources, status = append(sources, src), append(status, src)
 		case "registry":
 			creds := maps.Clone(s.DownloadCredentials)
@@ -164,7 +140,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				}
 				ms = append(ms, m)
 			}
-			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stateDriver,
+			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stores.state,
 				s.PollInterval, log, int64(l.MaxArtifactBytes))
 			if err != nil {
 				return fail(err)
@@ -193,7 +169,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		}
 		return out
 	}
-	w := web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, conflicts, ready)
+	w := web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, conflicts, stores.ready)
 	w.SetRejected(limiter.Rejected)
 	w.SetMovedPackage(func(m pins.MovedTag) string {
 		for _, g := range gitSources {
@@ -218,27 +194,46 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	return handler, start, nil
 }
 
-// openStores opens cache, state and the named stores (sorted), in that order.
-func openStores(ctx context.Context, s config.Storage) ([]namedStore, error) {
-	all := []struct {
-		name string
-		sc   config.StoreConfig
-	}{{"storage.cache", s.Cache}, {"storage.state", s.State}}
-	for _, name := range slices.Sorted(maps.Keys(s.Stores)) {
-		all = append(all, struct {
-			name string
-			sc   config.StoreConfig
-		}{"storage.stores." + name, s.Stores[name]})
-	}
-	out := make([]namedStore, 0, len(all))
-	for _, a := range all {
-		d, err := storage.Open(ctx, a.sc)
+type openedStores struct {
+	cache, state storage.Driver
+	hosted       map[string]storage.Driver // by name in storage.stores
+	all          []openedStore             // in config.Storage.Named order
+}
+
+type openedStore struct {
+	path string
+	d    storage.Driver
+}
+
+// openStores opens every configured store.
+func openStores(ctx context.Context, s config.Storage) (*openedStores, error) {
+	out := &openedStores{hosted: map[string]storage.Driver{}}
+	for _, n := range s.Named() {
+		d, err := storage.Open(ctx, n.Config)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", a.name, err)
+			return nil, fmt.Errorf("%s: %w", n.Path, err)
 		}
-		out = append(out, namedStore{a.name, d})
+		switch n.Path {
+		case "storage.cache":
+			out.cache = d
+		case "storage.state":
+			out.state = d
+		default:
+			out.hosted[n.Name] = d
+		}
+		out.all = append(out.all, openedStore{n.Path, d})
 	}
 	return out, nil
+}
+
+// ready checks that every store is reachable.
+func (s *openedStores) ready(ctx context.Context) error {
+	for _, o := range s.all {
+		if err := storage.Reachable(ctx, o.d); err != nil {
+			return fmt.Errorf("%s: %w", o.path, err)
+		}
+	}
+	return nil
 }
 
 // mirrorSet shares one Mirror per mirror directory, which gitmirror derives

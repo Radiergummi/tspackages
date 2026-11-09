@@ -1,7 +1,6 @@
 package server
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"io"
@@ -16,24 +15,10 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 const testCap = "github.com/radiergummi/tspackages"
-
-type fakeWho struct{ rules []string }
-
-func (f fakeWho) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	var vals []tailcfg.RawMessage
-	for _, r := range f.rules {
-		vals = append(vals, tailcfg.RawMessage(r))
-	}
-	return &apitype.WhoIsResponse{
-		Node:   &tailcfg.Node{Name: "ci.ts.net.", StableID: "nid", Tags: []string{"tag:ci"}},
-		CapMap: tailcfg.PeerCapMap{testCap: vals},
-	}, nil
-}
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -69,14 +54,14 @@ func TestBuildRejectsInvalidConfig(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	_, _, err := Build(ctx, cfg, fakeWho{}, quiet, Hooks{})
+	_, _, err := Build(ctx, cfg, testutil.NewWho(testCap), quiet, Hooks{})
 	if err == nil || !strings.Contains(err.Error(), "storage.stores.remote") {
 		t.Fatalf("Build error = %v, want one naming storage.stores.remote", err)
 	}
 }
 
 func TestBuildServes(t *testing.T) {
-	h, _, err := Build(t.Context(), fsConfig(t), fakeWho{rules: []string{`{"read":["*"]}`}}, quiet, Hooks{})
+	h, _, err := Build(t.Context(), fsConfig(t), testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,21 +73,6 @@ func TestBuildServes(t *testing.T) {
 	}
 }
 
-func pkgZip(t *testing.T) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	f, err := zw.Create("composer.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.WriteString(f, `{"name":"acme/pkg","description":"x"}`)
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
 func TestBuildWiresComposer(t *testing.T) {
 	cfg := fsConfig(t)
 	cfg.Ecosystems["composer"] = config.Ecosystem{Sources: []config.Source{
@@ -110,12 +80,12 @@ func TestBuildWiresComposer(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	h, start, err := Build(ctx, cfg, fakeWho{rules: []string{`{"read":["*"],"write":["composer:acme/*"]}`}}, quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["composer:acme/*"]}`), quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	go start(ctx)
-	if w := do(h, "PUT", "/composer/upload/acme/pkg/1.0.0", bytes.NewReader(pkgZip(t))); w.Code != http.StatusCreated {
+	if w := do(h, "PUT", "/composer/upload/acme/pkg/1.0.0", bytes.NewReader(testutil.ZipOf(t, map[string]string{"composer.json": `{"name":"acme/pkg","description":"x"}`}))); w.Code != http.StatusCreated {
 		t.Fatalf("PUT upload = %d %s", w.Code, w.Body)
 	}
 	w := do(h, "GET", "/composer/p2/acme/pkg.json", nil)
@@ -157,7 +127,7 @@ func TestBuildWritesSSHKeyFiles(t *testing.T) {
 	if err := os.WriteFile(stray, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, d := range []string{cfg.Storage.WorkDir, keys, filepath.Join(cfg.Storage.WorkDir, "git")} {
@@ -198,7 +168,7 @@ func TestBuildMirrorDirStable(t *testing.T) {
 	got := captureMirrors(t)
 	cfg := gitConfig(t, sshSource)
 	for range 2 {
-		if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -218,7 +188,7 @@ func TestBuildSharesMirrors(t *testing.T) {
 		config.Source{Name: "b", Type: "git", Claims: []string{"acme/b"}, Remotes: remote},
 		config.Source{Name: "c", Type: "git", Claims: []string{"acme/c"}, Remotes: remote, Token: "t"},
 	)
-	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(*got) != 2 {
@@ -237,7 +207,7 @@ func TestBuildSharesMirrors(t *testing.T) {
 func TestBuildRejectsPathInSourceName(t *testing.T) {
 	src := sshSource
 	src.Name = "../escape"
-	_, _, err := Build(t.Context(), gitConfig(t, src), fakeWho{}, quiet, Hooks{})
+	_, _, err := Build(t.Context(), gitConfig(t, src), testutil.NewWho(testCap), quiet, Hooks{})
 	if err == nil || !strings.Contains(err.Error(), "invalid source name") {
 		t.Fatalf("err = %v", err)
 	}
@@ -246,7 +216,7 @@ func TestBuildRejectsPathInSourceName(t *testing.T) {
 func TestBuildPrunesUnknownMirrorDirs(t *testing.T) {
 	got := captureMirrors(t)
 	cfg := gitConfig(t, sshSource)
-	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	gitDir := filepath.Join(cfg.Storage.WorkDir, "git")
@@ -260,7 +230,7 @@ func TestBuildPrunesUnknownMirrorDirs(t *testing.T) {
 	if err := os.WriteFile(stray[2], nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(keep); err != nil {
@@ -280,7 +250,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 			t.Fatal(err)
 		}
 		os.Chmod(cfg.Storage.WorkDir, 0o755)
-		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
 			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
 		}
@@ -291,7 +261,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 		if err := os.Symlink(target, cfg.Storage.WorkDir); err != nil {
 			t.Fatal(err)
 		}
-		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
 			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
 		}
@@ -303,7 +273,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 			t.Fatal(err)
 		}
 		os.Chmod(keys, 0o750)
-		_, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), keys) {
 			t.Fatalf("err = %v, want one naming %s", err, keys)
 		}
@@ -314,7 +284,7 @@ func TestBuildAppliesDefaults(t *testing.T) {
 	cfg := fsConfig(t)
 	cfg.Limits = config.Limits{}
 	cfg.Tailscale = config.Tailscale{}
-	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 500<<20 || cfg.Tailscale.Capability != testCap {
@@ -358,7 +328,7 @@ func TestStartReturnsAfterLoopsStop(t *testing.T) {
 	cfg := gitConfig(t, config.Source{Name: "g", Type: "git", Claims: []string{"acme/*"}, Remotes: []string{t.TempDir()}, PollInterval: 10 * time.Millisecond})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, start, err := Build(ctx, cfg, fakeWho{}, quiet, Hooks{AllowFileRemotes: true})
+	_, start, err := Build(ctx, cfg, testutil.NewWho(testCap), quiet, Hooks{AllowFileRemotes: true})
 	if err != nil {
 		t.Fatal(err)
 	}

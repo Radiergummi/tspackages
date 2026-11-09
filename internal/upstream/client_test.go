@@ -43,7 +43,7 @@ func TestHostAllowlistPortAndCase(t *testing.T) {
 		"https://evil.test/x":       false,
 		"https://example.com.evil/": false,
 	} {
-		got := c.hostAllowed(mustParse(t, url))
+		got := config.HostAllowed(c.hosts, mustParse(t, url))
 		if got != want {
 			t.Errorf("%s: got %v want %v", url, got, want)
 		}

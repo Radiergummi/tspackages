@@ -3,10 +3,6 @@ package composer
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/base32"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,7 +132,8 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, name
 	if version != strings.TrimSpace(version) || strings.Contains(version, " as ") || strings.ContainsAny(version, "@+") {
 		return Version{}, rejectUpload("version %q is not a plain version string", version)
 	}
-	v, normalized, err := s.inspect(pkg, version, zipData, s.limits)
+	d := sumsOf(zipData)
+	v, normalized, err := s.inspect(pkg, version, zipData, s.limits, d)
 	if err != nil {
 		return Version{}, err
 	}
@@ -154,7 +151,7 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, name
 	if err := s.putSidecar(ctx, pkg, normalized, v); err != nil {
 		return Version{}, err
 	}
-	if err := s.record(ctx, caller, pkg, v, zipData); err != nil {
+	if err := s.record(ctx, caller, pkg, v, d.sha1); err != nil {
 		return Version{}, err
 	}
 	if _, err := s.addToIndex(ctx, pkg, v); err != nil {
@@ -169,14 +166,14 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	if err != nil {
 		return Version{}, err
 	}
-	sum := sha256.Sum256(data)
-	same := hex.EncodeToString(sum[:]) == v.Reference
+	d := sumsOf(data)
+	same := d.sha256 == v.Reference
 	if same {
 		if err := s.putSidecar(ctx, pkg, normalized, v); err != nil {
 			return Version{}, err
 		}
 	}
-	stored, err := s.entryFromZip(ctx, pkg, normalized, data)
+	stored, err := s.entryFromZip(ctx, pkg, normalized, data, d)
 	if err != nil {
 		// The version exists, it is just unreadable: a conflict for the client,
 		// with the reason for the server log.
@@ -191,7 +188,7 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	}
 	// Record the publish only if the interrupted original never got that far.
 	if _, err := s.rec.GetProvenance(ctx, "composer", pkg, stored.Version, stored.Reference); errors.Is(err, storage.ErrNotFound) {
-		if err := s.record(ctx, caller, pkg, stored, data); err != nil {
+		if err := s.record(ctx, caller, pkg, stored, d.sha1); err != nil {
 			return Version{}, err
 		}
 	} else if err != nil {
@@ -200,15 +197,14 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	return stored, nil
 }
 
-func (s *StorageSource) record(ctx context.Context, caller identity.Caller, pkg string, v Version, zipData []byte) error {
-	sha1sum := sha1.Sum(zipData)
+func (s *StorageSource) record(ctx context.Context, caller identity.Caller, pkg string, v Version, sha1Hex string) error {
 	if err := s.rec.PutProvenance(ctx, records.Provenance{
 		Ecosystem:  "composer",
 		Package:    pkg,
 		Version:    v.Version,
 		Source:     s.name,
 		SourceType: "storage",
-		SHA1:       hex.EncodeToString(sha1sum[:]),
+		SHA1:       sha1Hex,
 		SHA256:     v.Reference,
 		Uploader:   records.UploaderFrom(caller),
 	}); err != nil {
@@ -233,9 +229,9 @@ func (s *StorageSource) readZip(ctx context.Context, pkg, normalized string) ([]
 	return io.ReadAll(rc)
 }
 
-// inspect validates a zip under limits l and builds its index entry; it is
+// inspect validates a zip with digests d under limits l and builds its index entry; it is
 // shared by Upload and the rebuild so both derive identical entries.
-func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.Limits) (Version, string, error) {
+func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.Limits, d sums) (Version, string, error) {
 	normalized, err := NormalizeVersion(version)
 	if err != nil {
 		return Version{}, "", rejectUpload("%v", err)
@@ -263,11 +259,9 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 	if !utf8.Valid(raw) {
 		return Version{}, "", rejectUpload("composer.json is not valid UTF-8")
 	}
-	var meta map[string]any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber() // keep large integers exact
-	if err := dec.Decode(&meta); err != nil || meta == nil {
-		return Version{}, "", rejectUpload("composer.json is not a valid JSON object")
+	meta, err := parseComposerJSON(raw)
+	if err != nil {
+		return Version{}, "", rejectUpload("%v", err)
 	}
 	declared, _ := meta["name"].(string)
 	if dn, err := Normalize(declared); err != nil || dn != pkg {
@@ -280,11 +274,8 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 		}
 	}
 
-	sha256sum := sha256.Sum256(zipData)
-	sha1sum := sha1.Sum(zipData)
-	ref := hex.EncodeToString(sha256sum[:])
-	pkgMap := packageEntry(meta, pkg, version, normalized, ref, hex.EncodeToString(sha1sum[:]))
-	return Version{Package: pkgMap, Version: version, Reference: ref}, normalized, nil
+	pkgMap := packageEntry(meta, pkg, version, normalized, d.sha256, d.sha1)
+	return Version{Package: pkgMap, Version: version, Reference: d.sha256}, normalized, nil
 }
 
 // addToIndex adds v to the package index, retrying when a concurrent upload
@@ -368,8 +359,6 @@ func (s *StorageSource) writeIndex(ctx context.Context, pkg string, vs []Version
 	return err
 }
 
-var zipKeyEncoding = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv").WithPadding(base32.NoPadding)
-
 // scan rebuilds the version entries from the stored zips, skipping (and
 // returning) those that cannot be read so one bad archive does not hide the
 // rest. Archives are inspected under trustedLimits. The version spelling comes
@@ -388,18 +377,18 @@ func (s *StorageSource) scan(ctx context.Context, pkg string) (vs []Version, ski
 	}
 	for _, key := range keys {
 		seg := strings.TrimSuffix(key[strings.LastIndex(key, "/")+1:], ".zip")
-		dec, derr := zipKeyEncoding.DecodeString(seg)
+		normalized, derr := storage.UnescapeSegment(seg)
 		if derr != nil {
 			skipped = append(skipped, fmt.Errorf("composer: unexpected key %q", key))
 			continue
 		}
-		data, rerr := s.readZip(ctx, pkg, string(dec))
+		data, rerr := s.readZip(ctx, pkg, normalized)
 		if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) {
 			return nil, nil, rerr
 		}
 		var v Version
 		if rerr == nil {
-			v, rerr = s.entryFromZip(ctx, pkg, string(dec), data)
+			v, rerr = s.entryFromZip(ctx, pkg, normalized, data, sumsOf(data))
 		}
 		if rerr != nil {
 			skipped = append(skipped, fmt.Errorf("composer: stored archive %q skipped: %w", key, rerr))
@@ -410,20 +399,19 @@ func (s *StorageSource) scan(ctx context.Context, pkg string) (vs []Version, ski
 	return vs, skipped, nil
 }
 
-// entryFromZip builds the index entry of a stored zip.
-func (s *StorageSource) entryFromZip(ctx context.Context, pkg, normalized string, data []byte) (Version, error) {
+// entryFromZip builds the index entry of a stored zip with digests d.
+func (s *StorageSource) entryFromZip(ctx context.Context, pkg, normalized string, data []byte, d sums) (Version, error) {
 	version := prettyVersion(normalized)
-	sum := sha256.Sum256(data)
 	if rc, _, err := s.d.Get(ctx, metaKey(pkg, normalized)); err == nil {
 		var sc sidecar
-		if json.NewDecoder(io.LimitReader(rc, 1<<16)).Decode(&sc) == nil && sc.SHA256 == hex.EncodeToString(sum[:]) {
+		if json.NewDecoder(io.LimitReader(rc, 1<<16)).Decode(&sc) == nil && sc.SHA256 == d.sha256 {
 			if n, err := NormalizeVersion(sc.Version); err == nil && n == normalized {
 				version = sc.Version
 			}
 		}
 		rc.Close()
 	}
-	v, _, err := s.inspect(pkg, version, data, trustedLimits)
+	v, _, err := s.inspect(pkg, version, data, trustedLimits, d)
 	return v, err
 }
 
@@ -570,14 +558,10 @@ func (s *StorageSource) Dist(ctx context.Context, name, version, reference strin
 	return Artifact{Body: rc, Size: info.Size}, nil
 }
 
-// probeKey is stat-ed to check the store is reachable; it never exists.
-const probeKey = ".tspackages-probe"
-
 // Health is OK if the store answers a Stat (a miss counts as success).
 func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	h := metrics.Health{Name: s.name, OK: true, Detail: "store reachable"}
-	_, err := s.d.Stat(ctx, probeKey)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+	if err := storage.Reachable(ctx, s.d); err != nil {
 		h.OK, h.Detail = false, "unreachable"
 		if s.unhealthy.CompareAndSwap(false, true) {
 			s.log.Warn("composer storage source unreachable", "source", s.name, "error", err)

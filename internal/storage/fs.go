@@ -11,7 +11,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -433,7 +433,7 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 			yield(Info{}, err)
 			return
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		for _, key := range keys {
 			if err := ctx.Err(); err != nil {
 				yield(Info{}, err)

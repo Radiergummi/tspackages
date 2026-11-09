@@ -73,6 +73,24 @@ func EscapeSegment(s string) string {
 	return segmentEncoding.EncodeToString([]byte(s))
 }
 
+// UnescapeSegment reverses EscapeSegment.
+func UnescapeSegment(seg string) (string, error) {
+	b, err := segmentEncoding.DecodeString(seg)
+	return string(b), err
+}
+
+// ProbeKey is stat-ed by Reachable; it never exists.
+const ProbeKey = ".tspackages-probe"
+
+// Reachable checks that d answers a Stat of ProbeKey; a miss counts as
+// reachable.
+func Reachable(ctx context.Context, d Driver) error {
+	if _, err := d.Stat(ctx, ProbeKey); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
 // validPrefix accepts "" or a key prefix, optionally ending in "/".
 func validPrefix(prefix string) error {
 	if prefix == "" {

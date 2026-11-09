@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/radiergummi/tspackages/internal/gitmirror"
 )
 
 // ValidateOptions loosen validation for tests. Configuration never sets them.
@@ -45,7 +48,9 @@ func validateStores(s *Storage) []error {
 	var errs []error
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
-	check := func(name string, sc StoreConfig) {
+	all := s.Named()
+	for _, n := range all {
+		name, sc := n.Path, n.Config
 		switch sc.Driver {
 		case "fs":
 			if sc.Path == "" {
@@ -63,30 +68,15 @@ func validateStores(s *Storage) []error {
 			add("%s: driver must be fs or s3, got %q", name, sc.Driver)
 		}
 	}
-	check("storage.cache", s.Cache)
-	check("storage.state", s.State)
-	names := slices.Sorted(maps.Keys(s.Stores))
-	for _, name := range names {
-		check("storage.stores."+name, s.Stores[name])
-	}
-
-	type named struct {
-		name string
-		sc   StoreConfig
-	}
-	all := []named{{"storage.cache", s.Cache}, {"storage.state", s.State}}
-	for _, name := range names {
-		all = append(all, named{"storage.stores." + name, s.Stores[name]})
-	}
 	for _, n := range all {
-		if n.sc.MaxSize < 0 {
-			add("%s: max_size must not be negative", n.name)
+		if n.Config.MaxSize < 0 {
+			add("%s: max_size must not be negative", n.Path)
 		}
 	}
 	for i := range all {
 		for j := i + 1; j < len(all); j++ {
-			if overlaps(all[i].sc, all[j].sc) {
-				add("%s and %s must not share a location", all[i].name, all[j].name)
+			if overlaps(all[i].Config, all[j].Config) {
+				add("%s and %s must not share a location", all[i].Path, all[j].Path)
 			}
 		}
 	}
@@ -104,15 +94,9 @@ func validateWorkDir(c *Config) []error {
 	w = filepath.Clean(w)
 	type named struct{ name, path string }
 	others := []named{{"tailscale.state_dir", c.Tailscale.StateDir}}
-	if c.Storage.Cache.Driver == "fs" {
-		others = append(others, named{"storage.cache", c.Storage.Cache.Path})
-	}
-	if c.Storage.State.Driver == "fs" {
-		others = append(others, named{"storage.state", c.Storage.State.Path})
-	}
-	for _, name := range slices.Sorted(maps.Keys(c.Storage.Stores)) {
-		if sc := c.Storage.Stores[name]; sc.Driver == "fs" {
-			others = append(others, named{"storage.stores." + name, sc.Path})
+	for _, n := range c.Storage.Named() {
+		if n.Config.Driver == "fs" {
+			others = append(others, named{n.Path, n.Config.Path})
 		}
 	}
 	var errs []error
@@ -255,16 +239,14 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			}
 			ssh := false
 			for _, r := range s.Remotes {
-				switch kind := remoteKind(r, opts.AllowFileRemotes); kind {
-				case "ssh":
-					ssh = true
-				case "file":
-				case "https":
-					if u, err := url.Parse(r); err == nil && u.User != nil {
-						add("remote must not contain credentials; use token")
-					}
-				default:
+				kind, err := gitmirror.RemoteKind(r, opts.AllowFileRemotes)
+				switch {
+				case errors.Is(err, gitmirror.ErrRemoteCredentials):
+					add("remote must not contain credentials; use token")
+				case err != nil:
 					add("unsupported remote scheme in %q (use https:// or ssh)", r)
+				case kind == "ssh":
+					ssh = true
 				}
 			}
 			if ssh && s.KnownHosts == "" {
@@ -287,7 +269,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				if u.Scheme != "https" && !(u.Scheme == "http" && opts.AllowHTTPUpstreams) {
 					add("url %q must use https", s.URL)
 				}
-				if !hostAllowed(s.FetchHosts, u) {
+				if !HostAllowed(s.FetchHosts, u) {
 					add("url host %q is not in fetch_hosts", u.Host)
 				}
 				if s.Credentials != nil {
@@ -329,37 +311,17 @@ func credHost(h string) string {
 	return strings.TrimSuffix(strings.ToLower(h), ":443")
 }
 
-// hostAllowed mirrors the upstream allowlist: an entry matches the URL's
-// hostname case-insensitively, and an entry with a port also needs that port.
-func hostAllowed(hosts []string, u *url.URL) bool {
-	for _, h := range hosts {
-		if strings.EqualFold(h, u.Hostname()) || strings.EqualFold(h, u.Host) {
-			return true
-		}
+// HostAllowed reports whether u's host is on the allowlist hosts: an entry
+// matches the URL's hostname case-insensitively and exactly (no wildcards); an
+// entry written as host:port additionally requires that port.
+func HostAllowed(hosts []string, u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	hostPort := ""
+	if port := u.Port(); port != "" {
+		hostPort = net.JoinHostPort(host, port)
 	}
-	return false
+	return slices.ContainsFunc(hosts, func(h string) bool {
+		h = strings.ToLower(h)
+		return h == host || (hostPort != "" && h == hostPort)
+	})
 }
-
-// remoteKind classifies a git remote as "https", "ssh" (ssh:// or scp-style
-// user@host:path), "file" (only with allowFile: an absolute path or file://)
-// or "" for anything else.
-func remoteKind(r string, allowFile bool) string {
-	switch {
-	case strings.HasPrefix(r, "https://"):
-		return "https"
-	case strings.HasPrefix(r, "ssh://"):
-		return "ssh"
-	case allowFile && (strings.HasPrefix(r, "file://") || strings.HasPrefix(r, "/")):
-		return "file"
-	case strings.Contains(r, "://"):
-		return ""
-	}
-	if scpRe.MatchString(r) {
-		return "ssh"
-	}
-	return ""
-}
-
-// scpRe matches scp-style [user@]host:path; user and host are plain
-// characters, never starting with "-", and "::" (transport helpers) is out.
-var scpRe = regexp.MustCompile(`^(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)

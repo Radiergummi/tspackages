@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/radiergummi/tspackages/internal/gitmirror"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -223,7 +225,7 @@ func TestRemoteKinds(t *testing.T) {
 		})
 	}
 	for _, r := range []string{"git@github.com:a/b.git", "github.com:a/b.git", "ssh://git@github.com/a/b.git", "https://github.com/a/b.git"} {
-		if remoteKind(r, false) == "" {
+		if _, err := gitmirror.RemoteKind(r, false); err != nil {
 			t.Errorf("%q rejected", r)
 		}
 	}

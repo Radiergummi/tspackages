@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,29 +21,14 @@ import (
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
-
-func runGit(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	full := append([]string{"-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main"}, args...)
-	cmd := exec.Command("git", full...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com",
-		"GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@example.com",
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
-	return strings.TrimSpace(string(out))
-}
 
 // gitRepo builds a work tree whose main branch holds composer.json for name.
 func gitRepo(t *testing.T, name string) string {
 	t.Helper()
 	dir := t.TempDir()
-	runGit(t, dir, "init", "-q")
+	testutil.Git(t, dir, "init", "-q")
 	commitFile(t, dir, "composer.json", `{"name":"`+name+`","description":"d","scripts":{"x":"y"},"dist":{"url":"evil"}}`, "one")
 	return dir
 }
@@ -54,9 +38,9 @@ func commitFile(t *testing.T, dir, file, content, msg string) string {
 	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runGit(t, dir, "add", ".")
-	runGit(t, dir, "commit", "-q", "-m", msg)
-	return runGit(t, dir, "rev-parse", "HEAD")
+	testutil.Git(t, dir, "add", ".")
+	testutil.Git(t, dir, "commit", "-q", "-m", msg)
+	return testutil.Git(t, dir, "rev-parse", "HEAD")
 }
 
 func newGit(t *testing.T, d storage.Driver, branches []string, remotes ...string) (*GitSource, *pins.Store) {
@@ -103,9 +87,9 @@ func versionNames(vs []Version) []string {
 
 func TestIndexTagsAndDefaultBranch(t *testing.T) {
 	src := gitRepo(t, "Matchory/A")
-	runGit(t, src, "tag", "v1.0.0")
-	runGit(t, src, "tag", "latest")
-	runGit(t, src, "branch", "feature/x")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "latest")
+	testutil.Git(t, src, "branch", "feature/x")
 	g, _ := newGit(t, fsState(t), nil, src)
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
@@ -134,8 +118,8 @@ func TestIndexTagsAndDefaultBranch(t *testing.T) {
 
 func TestBranchAllowlist(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "branch", "release/1")
-	runGit(t, src, "branch", "other")
+	testutil.Git(t, src, "branch", "release/1")
+	testutil.Git(t, src, "branch", "other")
 	g, _ := newGit(t, fsState(t), []string{"release/*"}, src)
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
@@ -148,15 +132,15 @@ func TestBranchAllowlist(t *testing.T) {
 
 func TestTagPinnedAfterForcePush(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	old := runGit(t, src, "rev-parse", "HEAD")
-	runGit(t, src, "tag", "v1.0.0")
+	old := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	g, ps := newGit(t, fsState(t), nil, src)
 	ctx := context.Background()
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
 	commitFile(t, src, "a.txt", "x", "two")
-	runGit(t, src, "tag", "-f", "v1.0.0")
+	testutil.Git(t, src, "tag", "-f", "v1.0.0")
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +167,7 @@ func TestTagPinnedAfterForcePush(t *testing.T) {
 
 func TestArchiveStableAcrossRebuilds(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	shasum := func() string {
 		g, _ := newGit(t, d, nil, src)
@@ -204,7 +188,7 @@ func TestArchiveStableAcrossRebuilds(t *testing.T) {
 	if a == "" || a != b {
 		t.Fatalf("shasum changed: %q vs %q", a, b)
 	}
-	commit := runGit(t, src, "rev-parse", "HEAD")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
 	if _, err := d.Stat(context.Background(), "composer-git/git/"+commit+".zip"); err != nil {
 		t.Fatalf("archive not in state store: %v", err)
 	}
@@ -212,7 +196,7 @@ func TestArchiveStableAcrossRebuilds(t *testing.T) {
 
 func TestProvenanceRecorded(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	if err := g.Index(context.Background()); err != nil {
@@ -271,9 +255,9 @@ func TestDuplicatePackageName(t *testing.T) {
 
 func TestTagWithMismatchedName(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	commitFile(t, src, "composer.json", `{"name":"matchory/other"}`, "rename")
-	runGit(t, src, "tag", "v2.0.0")
+	testutil.Git(t, src, "tag", "v2.0.0")
 	commitFile(t, src, "composer.json", `{"name":"matchory/a"}`, "back")
 	g, _ := newGit(t, fsState(t), nil, src)
 	if err := g.Index(context.Background()); err != nil {
@@ -287,7 +271,7 @@ func TestTagWithMismatchedName(t *testing.T) {
 
 func TestDistUnknownReference(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	g, _ := newGit(t, fsState(t), nil, src)
 	ctx := context.Background()
 	if err := g.Index(ctx); err != nil {
@@ -309,7 +293,7 @@ func TestDistUnknownReference(t *testing.T) {
 
 func TestOversizeArchiveSkipped(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	g, _ := newGit(t, fsState(t), nil, src)
 	g.maxArchive = 10
 	if err := g.Index(context.Background()); err != nil {
@@ -362,7 +346,7 @@ func shasumOf(v Version) string { return v.Package["dist"].(map[string]any)["sha
 func TestDevLookingTagsSkipped(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
 	for _, tag := range []string{"dev-main", "master", "1.x-dev", "1.0.0-dev"} {
-		runGit(t, src, "tag", tag)
+		testutil.Git(t, src, "tag", tag)
 	}
 	g, _ := newGit(t, fsState(t), nil, src)
 	if err := g.Index(context.Background()); err != nil {
@@ -376,7 +360,7 @@ func TestDevLookingTagsSkipped(t *testing.T) {
 
 func TestTransientFailureKeepsPreviousIndex(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	g, _ := newGit(t, fsState(t), nil, src)
 	ctx := context.Background()
 	if err := g.Index(ctx); err != nil {
@@ -447,7 +431,7 @@ func TestUnavailableBeforeFirstPassAndForNeverIndexedRemote(t *testing.T) {
 
 func TestServedVersionSurvivesMirrorAndTagLoss(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	ctx := context.Background()
@@ -456,7 +440,7 @@ func TestServedVersionSurvivesMirrorAndTagLoss(t *testing.T) {
 	}
 	before := versionsOf(t, g, "matchory/a")["v1.0.0"]
 
-	runGit(t, src, "tag", "-d", "v1.0.0")
+	testutil.Git(t, src, "tag", "-d", "v1.0.0")
 	g2, _ := newGit(t, d, nil, src) // fresh mirror directory, tag gone upstream
 	if err := g2.Index(ctx); err != nil {
 		t.Fatal(err)
@@ -474,7 +458,7 @@ func TestServedVersionSurvivesMirrorAndTagLoss(t *testing.T) {
 
 func TestServedVersionSurvivesMissingCommit(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	if err := g.Index(context.Background()); err != nil {
@@ -482,8 +466,8 @@ func TestServedVersionSurvivesMissingCommit(t *testing.T) {
 	}
 	before := versionsOf(t, g, "matchory/a")["v1.0.0"]
 	// Rewrite history so the pinned commit is gone from the remote entirely.
-	runGit(t, src, "tag", "-d", "v1.0.0")
-	runGit(t, src, "commit", "-q", "--amend", "-m", "rewritten")
+	testutil.Git(t, src, "tag", "-d", "v1.0.0")
+	testutil.Git(t, src, "commit", "-q", "--amend", "-m", "rewritten")
 	g2, _ := newGit(t, d, nil, src)
 	if err := g2.Index(context.Background()); err != nil {
 		t.Fatal(err)
@@ -495,7 +479,7 @@ func TestServedVersionSurvivesMissingCommit(t *testing.T) {
 
 func TestStoredArchiveIsReadBackNotRebuilt(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	root := t.TempDir()
 	d, err := storage.NewFS(root)
 	if err != nil {
@@ -549,7 +533,7 @@ func TestStoredArchiveIsReadBackNotRebuilt(t *testing.T) {
 func TestTagPinnedOnlyOnceValid(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
 	commitFile(t, src, "composer.json", `{broken`, "broken")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	fixed := commitFile(t, src, "composer.json", `{"name":"matchory/a"}`, "fixed")
 	g, ps := newGit(t, fsState(t), nil, src)
 	ctx := context.Background()
@@ -559,7 +543,7 @@ func TestTagPinnedOnlyOnceValid(t *testing.T) {
 	if _, ok := versionsOf(t, g, "matchory/a")["v1.0.0"]; ok {
 		t.Fatal("broken tag served")
 	}
-	runGit(t, src, "tag", "-f", "v1.0.0")
+	testutil.Git(t, src, "tag", "-f", "v1.0.0")
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +586,7 @@ func (c *cancelOnPin) PutIfAbsent(ctx context.Context, key string, r io.Reader) 
 
 func TestCancelledPassDoesNotChangeIndex(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := &cancelOnPin{Driver: fsState(t)}
 	g, _ := newGit(t, d, nil, src)
 	var logs bytes.Buffer
@@ -610,7 +594,7 @@ func TestCancelledPassDoesNotChangeIndex(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	runGit(t, src, "tag", "v2.0.0") // first sight: pinned mid-pass, then the pass is cancelled
+	testutil.Git(t, src, "tag", "v2.0.0") // first sight: pinned mid-pass, then the pass is cancelled
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
 	logs.Reset()
@@ -661,7 +645,7 @@ func TestUnclaimedSourceNotFoundWhilePending(t *testing.T) {
 
 func TestDistFaultsAreNotNotFound(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	ctx := context.Background()
@@ -687,8 +671,8 @@ func TestDistFaultsAreNotNotFound(t *testing.T) {
 
 func TestCorruptPinDoesNotFreezeRemote(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
-	runGit(t, src, "tag", "v1.1.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.1.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	if err := g.Index(context.Background()); err != nil {
@@ -725,7 +709,7 @@ func TestNewGitSourceValidation(t *testing.T) {
 
 func TestDistMissingSidecarIsNotNotFound(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	g, _ := newGit(t, d, nil, src)
 	ctx := context.Background()
@@ -760,7 +744,7 @@ func (r *racePin) PutIfAbsent(ctx context.Context, key string, body io.Reader) (
 
 func TestFirstSightPinLostRaceLogsMove(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	g, ps := newGit(t, &racePin{Driver: fsState(t)}, nil, src)
 	var logs bytes.Buffer
 	g.log = slog.New(slog.NewTextHandler(&logs, nil))
@@ -784,8 +768,8 @@ func allVersions(ctx context.Context, g *GitSource, name string) ([]Version, err
 
 func TestVersionsSplitByDevAndDefaultBranchFlag(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
-	runGit(t, src, "branch", "feature")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "branch", "feature")
 	g, _ := newGit(t, fsState(t), []string{"main", "feature"}, src)
 	ctx := context.Background()
 	if err := g.Index(ctx); err != nil {
@@ -821,7 +805,7 @@ func moveAway(t *testing.T, dir string) {
 
 func TestServedVersionsSurviveUnreachableRemoteAtStartup(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	base, d := t.TempDir(), fsState(t)
 	g1, _ := newGitIn(t, base, d, nil, src)
 	ctx := context.Background()
@@ -866,7 +850,7 @@ func TestServedVersionsSurviveUnreachableRemoteAtStartup(t *testing.T) {
 
 func TestBrokenDefaultBranchFallsBackToPins(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	ctx := context.Background()
 	g1, _ := newGit(t, d, nil, src)
@@ -885,7 +869,7 @@ func TestBrokenDefaultBranchFallsBackToPins(t *testing.T) {
 
 func TestPinFallbackSkipsDisagreeingNames(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	runGit(t, src, "tag", "v1.0.0")
+	testutil.Git(t, src, "tag", "v1.0.0")
 	d := fsState(t)
 	ctx := context.Background()
 	g1, _ := newGit(t, d, nil, src)
@@ -894,7 +878,7 @@ func TestPinFallbackSkipsDisagreeingNames(t *testing.T) {
 	}
 	// The repository renames its package; v2.0.0 is pinned under the new name.
 	commitFile(t, src, "composer.json", `{"name":"matchory/b"}`, "rename")
-	runGit(t, src, "tag", "v2.0.0")
+	testutil.Git(t, src, "tag", "v2.0.0")
 	if err := g1.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -921,7 +905,7 @@ func mustVersions(t *testing.T, g *GitSource, name string) []Version {
 
 func TestLoadedAndProvenanceCachesPruned(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
-	old := runGit(t, src, "rev-parse", "HEAD")
+	old := testutil.Git(t, src, "rev-parse", "HEAD")
 	g, _ := newGit(t, fsState(t), nil, src)
 	ctx := context.Background()
 	if err := g.Index(ctx); err != nil {

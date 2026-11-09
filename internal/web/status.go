@@ -7,7 +7,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -140,7 +140,7 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 			d.Composer = true
 		}
 	}
-	sort.Strings(d.Ecosystems)
+	slices.Sort(d.Ecosystems)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	allowed := func(pkg string) bool {
