@@ -2,6 +2,7 @@ package pins
 
 import (
 	"context"
+	"errors"
 	"io"
 	"slices"
 	"strings"
@@ -213,5 +214,52 @@ func TestListSkipsCorruptPins(t *testing.T) {
 	got, corrupt, err := s.List(ctx, "composer", "src", "r")
 	if err != nil || len(got) != 1 || got[0].Tag != "v1" || len(corrupt) != 1 {
 		t.Fatalf("List = %+v corrupt=%v err=%v", got, corrupt, err)
+	}
+}
+
+func TestDeletedPinIsNotServedFromCache(t *testing.T) {
+	d, _ := storage.NewFS(t.TempDir())
+	s := New(d)
+	ctx := context.Background()
+	if _, _, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1a); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.List(ctx, "composer", "src", "r"); err != nil {
+		t.Fatal(err)
+	}
+	key := "pins/composer/src/" + storage.EscapeSegment("r") + "/" + storage.EscapeSegment("v1") + ".json"
+	if err := d.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	// Listing alone forgets the deleted pin.
+	if got, _, err := s.List(ctx, "composer", "src", "r"); err != nil || len(got) != 0 {
+		t.Fatalf("List after delete = %+v, %v", got, err)
+	}
+	if got, moved, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1b); err != nil || moved || got != sha1b {
+		t.Fatalf("Pin = %s %v %v", got, moved, err)
+	}
+	// And a Pin that wins after a delete replaces a stale cache entry.
+	if err := d.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Pin(ctx, "composer", "src", "r", "v1", sha1a); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.List(ctx, "composer", "src", "r")
+	if err != nil || len(got) != 1 || got[0].SHA != sha1a {
+		t.Fatalf("List = %+v, %v", got, err)
+	}
+}
+
+func TestListCorruptIsErrCorrupt(t *testing.T) {
+	d, _ := storage.NewFS(t.TempDir())
+	s := New(d)
+	key := "pins/composer/src/" + storage.EscapeSegment("r") + "/" + storage.EscapeSegment("v1") + ".json"
+	if _, err := d.Put(context.Background(), key, strings.NewReader("{garbage")); err != nil {
+		t.Fatal(err)
+	}
+	_, corrupt, err := s.List(context.Background(), "composer", "src", "r")
+	if err != nil || len(corrupt) != 1 || !errors.Is(corrupt[0], ErrCorrupt) {
+		t.Fatalf("corrupt = %v err = %v", corrupt, err)
 	}
 }

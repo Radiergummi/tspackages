@@ -725,3 +725,52 @@ func TestNewGitSourceValidation(t *testing.T) {
 		t.Fatalf("poll = %v, err = %v", g.poll, err)
 	}
 }
+
+func TestDistMissingSidecarIsNotNotFound(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	d := fsState(t)
+	g, _ := newGit(t, d, nil, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ref := versionsOf(t, g, "matchory/a")["v1.0.0"].Reference
+	if err := d.Delete(ctx, "composer-git/git/"+ref+".meta.json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Dist(ctx, "matchory/a", "v1.0.0", ref); err == nil || errors.Is(err, resolve.ErrNotFound) || errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// racePin makes another "instance" pin the first tag before this one can.
+type racePin struct {
+	storage.Driver
+	done bool
+}
+
+func (r *racePin) PutIfAbsent(ctx context.Context, key string, body io.Reader) (storage.Info, error) {
+	if !r.done && strings.HasPrefix(key, "pins/") {
+		r.done = true
+		other := `{"tag":"v1.0.0","sha":"` + strings.Repeat("b", 40) + `","first_seen":"2026-01-01T00:00:00Z"}`
+		if _, err := r.Driver.Put(ctx, key, strings.NewReader(other)); err != nil {
+			return storage.Info{}, err
+		}
+	}
+	return r.Driver.PutIfAbsent(ctx, key, body)
+}
+
+func TestFirstSightPinLostRaceLogsMove(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	g, ps := newGit(t, &racePin{Driver: fsState(t)}, nil, src)
+	var logs bytes.Buffer
+	g.log = slog.New(slog.NewTextHandler(&logs, nil))
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "tag moved upstream") || len(ps.Moved()) != 1 {
+		t.Fatalf("moved = %v, logs:\n%s", ps.Moved(), logs.String())
+	}
+}
