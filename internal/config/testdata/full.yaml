@@ -1,0 +1,30 @@
+tailscale:
+  state_dir: /var/lib/tspackages/tailscale
+
+storage:
+  cache: {driver: fs, path: /var/lib/tspackages/cache, max_size: 50GiB}
+  state: {driver: s3, bucket: matchory-registry, endpoint: "https://s3.example.com", prefix: state/}
+  stores:
+    main: {driver: s3, bucket: matchory-registry, endpoint: "https://s3.example.com", prefix: hosted/}
+
+ecosystems:
+  composer:
+    sources:
+      - name: matchory-git
+        type: git
+        claims: ["matchory/*"]
+        remotes:
+          - git@github.com:matchory/sdk-php.git
+          - git@github.com:matchory/laravel-helpers.git
+        ssh_key: ${env:DEPLOY_KEY}
+        known_hosts: ${env:KNOWN_HOSTS}
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["matchory-internal/*"]
+      - name: packagist
+        type: registry
+        url: https://repo.packagist.org
+        fetch_hosts: [repo.packagist.org, api.github.com, codeload.github.com]
+        download_credentials:
+          api.github.com: {bearer: "${env:GITHUB_TOKEN}"}
