@@ -3,6 +3,8 @@ package composer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,15 +29,13 @@ type fakeSource struct {
 	claims  []string
 	pkgs    map[string][]Version
 	err     error
-	enum    bool
 	calls   atomic.Int32
 	distHit atomic.Int32
 }
 
 func (f *fakeSource) Name() string     { return f.name }
 func (f *fakeSource) Claims() []string { return f.claims }
-func (f *fakeSource) Type() string     { return "fake" }
-func (f *fakeSource) Versions(_ context.Context, name string) ([]Version, error) {
+func (f *fakeSource) Versions(_ context.Context, name string, dev bool) ([]Version, error) {
 	f.calls.Add(1)
 	if f.err != nil {
 		return nil, f.err
@@ -44,7 +44,13 @@ func (f *fakeSource) Versions(_ context.Context, name string) ([]Version, error)
 	if !ok {
 		return nil, resolve.ErrNotFound
 	}
-	return vs, nil
+	out := []Version{}
+	for _, v := range vs {
+		if v.Dev == dev {
+			out = append(out, v)
+		}
+	}
+	return out, nil
 }
 func (f *fakeSource) Dist(_ context.Context, name, version, reference string) (Artifact, error) {
 	f.calls.Add(1)
@@ -53,13 +59,6 @@ func (f *fakeSource) Dist(_ context.Context, name, version, reference string) (A
 		return Artifact{}, f.err
 	}
 	return Artifact{Body: io.NopCloser(strings.NewReader("ZIP:" + version + ":" + reference)), Size: int64(len("ZIP:" + version + ":" + reference))}, nil
-}
-func (f *fakeSource) Packages(context.Context) ([]string, bool, error) {
-	var out []string
-	for n := range f.pkgs {
-		out = append(out, n)
-	}
-	return out, f.enum, nil
 }
 
 // shared is deliberately reused by every version, as real sources may.
@@ -110,9 +109,9 @@ func do(h http.Handler, method, path string, body io.Reader, hdr ...string) *htt
 }
 
 func gitAndReg() (*fakeSource, *fakeSource) {
-	g := &fakeSource{name: "git-fake", claims: []string{"matchory/*"}, enum: true,
+	g := &fakeSource{name: "git-fake", claims: []string{"matchory/*"},
 		pkgs: map[string][]Version{"matchory/a": {ver("matchory/a", "1.0.0", false), ver("matchory/a", "dev-main", true)}}}
-	r := &fakeSource{name: "registry-fake", enum: true,
+	r := &fakeSource{name: "registry-fake",
 		pkgs: map[string][]Version{"matchory/a": {ver("matchory/a", "9.9.9", false)}, "monolog/monolog": {ver("monolog/monolog", "3.0.0", false)}}}
 	return g, r
 }
@@ -552,5 +551,54 @@ func TestUploadOverRealServer(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestUploadShadowedByEarlierSourceIs409(t *testing.T) {
+	store, _ := newSource(t)
+	shadow := &fakeSource{name: "shadow", claims: []string{"matchory-internal/f*"}}
+	h := server(t, []Source{shadow, store}, `{"write":["composer:matchory-internal/*"]}`)
+	w := do(h, "PUT", "/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(pkgZip(t, fooJSON)))
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"matchory-internal/foo" is served by source "shadow"`) {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if _, err := store.Versions(context.Background(), "matchory-internal/foo", false); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("shadowed upload was stored: %v", err)
+	}
+}
+
+func TestUploadLogLine(t *testing.T) {
+	store, _ := newSource(t)
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	data := pkgZip(t, fooJSON)
+	w := do(serverLog(t, log, []Source{store}, `{"write":["composer:matchory-internal/*"]}`), "PUT", "/composer/upload/matchory-internal/foo/1.0.0", bytes.NewReader(data))
+	if w.Code != 201 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	sum := sha256.Sum256(data)
+	ls := captured(&buf)
+	if len(ls) != 1 {
+		t.Fatalf("%v", ls)
+	}
+	l := ls[0]
+	if l["level"] != "INFO" || l["caller"] != "tag:ci" || l["node"] != "nid" || l["node_name"] != "n.ts.net" ||
+		l["package"] != "matchory-internal/foo" || l["version"] != "1.0.0" || l["sha256"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("log line: %v", l)
+	}
+}
+
+func TestSecurityHeadersOnEarlyResponses(t *testing.T) {
+	g, _ := gitAndReg()
+	mux := http.NewServeMux()
+	New([]Source{g}, archive.Limits{MaxBytes: 1}, slog.New(slog.NewTextHandler(io.Discard, nil))).Mount(mux)
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"no caller": do(mux, "GET", "/composer/packages.json", nil),
+		"HEAD dist": do(server(t, []Source{g}, readAll), "HEAD", "/composer/dist/git-fake/matchory/a/1/r", nil),
+	} {
+		h := w.Header()
+		if h.Get("Cache-Control") != "private, no-store" || h.Get("Vary") != "Host" || h.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s (%d): headers %v", name, w.Code, h)
+		}
 	}
 }

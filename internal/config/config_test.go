@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestLoadExample(t *testing.T) {
 	}
 	if c.Limits.MaxUploadBytes != 100<<20 || c.Limits.MaxDecompressedBytes != 500<<20 ||
 		c.Limits.MaxArchiveEntries != 20000 || c.Limits.RequestsPerSecond != 50 ||
-		c.Limits.Burst != 100 || c.Limits.UpstreamFetchesPerSecond != 10 {
+		c.Limits.Burst != 100 || c.Limits.UpstreamFetchesPerSecond != 10 || c.Limits.MaxArtifactBytes != 500<<20 {
 		t.Errorf("limit defaults = %+v", c.Limits)
 	}
 	srcs := c.Ecosystems["composer"].Sources
@@ -138,6 +139,7 @@ func TestValidateErrors(t *testing.T) {
 `), "duplicate source name"},
 		{"cache and state overlap", strings.Replace(base, "state: {driver: fs, path: /state}", "state: {driver: fs, path: /cache/}", 1), "must not share a location"},
 		{"hosted store overlaps cache", strings.Replace(base, "main: {driver: s3, bucket: b, prefix: hosted/,", "main: {driver: fs, path: /cache,", 1), "must not share a location"},
+		{"uppercase s3 prefix", strings.Replace(base, "prefix: hosted/", "prefix: Hosted/", 1), `storage.stores.main: prefix "Hosted/" must be lowercase`},
 		{"unset env", strings.Replace(base, "SECRET", "${env:UNSET}", 1), "environment variable UNSET is not set"},
 		{"missing work_dir", strings.Replace(base, "  work_dir: /work\n", "", 1), "storage.work_dir is required"},
 		{"relative work_dir", strings.Replace(base, "work_dir: /work", "work_dir: work", 1), "storage.work_dir must be absolute"},
@@ -210,7 +212,7 @@ func TestStoreOverlap(t *testing.T) {
 }
 
 func TestRemoteKinds(t *testing.T) {
-	for _, r := range []string{"ext::sh -c 'touch /tmp/x'", "fd::3", "-oProxyCommand=a:b", "git@-evil.com:a/b.git", "host:", "/local/path"} {
+	for _, r := range []string{"ext::sh -c 'touch /tmp/x'", "fd::3", "-oProxyCommand=a:b", "git@-evil.com:a/b.git", "host:", "/local/path", "-u@github.com:a/b.git"} {
 		t.Run(r, func(t *testing.T) {
 			body := strings.Replace(base, "SECRET", "x", 1) +
 				"      - {name: g, type: git, known_hosts: k, claims: [\"a/*\"], remotes: [\"" + strings.ReplaceAll(r, `"`, `\"`) + "\"]}\n"
@@ -221,14 +223,14 @@ func TestRemoteKinds(t *testing.T) {
 		})
 	}
 	for _, r := range []string{"git@github.com:a/b.git", "github.com:a/b.git", "ssh://git@github.com/a/b.git", "https://github.com/a/b.git"} {
-		if remoteKind(r) == "" {
+		if remoteKind(r, false) == "" {
 			t.Errorf("%q rejected", r)
 		}
 	}
 }
 
 func TestNegativeNumbers(t *testing.T) {
-	for _, field := range []string{"burst", "requests_per_second", "upstream_fetches_per_second", "max_archive_entries"} {
+	for _, field := range []string{"burst", "max_archive_entries"} {
 		t.Run(field, func(t *testing.T) {
 			body := strings.Replace(base, "SECRET", "x", 1) + "limits: {" + field + ": -1}\n"
 			_, err := Load(writeConfig(t, body))
@@ -371,5 +373,135 @@ func TestClaimValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestStorageClaimShadowedByEarlierSource(t *testing.T) {
+	ecoc := func(sources string) string {
+		return strings.Replace(strings.Split(base, "ecosystems:")[0], "SECRET", "x", 1) + "ecosystems:\n  composer:\n    sources:\n" + sources
+	}
+	_, err := Load(writeConfig(t, ecoc(`      - {name: g, type: git, claims: ["acme/*"], remotes: ["https://h/a.git"]}
+      - {name: hosted, type: storage, store: main, claims: ["other/*", "acme/*"]}
+`)))
+	if err == nil || !strings.Contains(err.Error(), `source "hosted": claim "acme/*" is already claimed by source "g"`) {
+		t.Fatalf("err = %v", err)
+	}
+	// A later source with the same claim is fine for the storage source; only
+	// exact strings count.
+	if _, err := Load(writeConfig(t, ecoc(`      - {name: hosted, type: storage, store: main, claims: ["acme/*"]}
+      - {name: g, type: git, claims: ["acme/*", "acme/x*"], remotes: ["https://h/a.git"]}
+      - {name: h2, type: storage, store: main, claims: ["acme/x"]}
+`))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRatesMustBePositiveAndFinite(t *testing.T) {
+	for _, v := range []string{".nan", ".inf", "-.inf"} {
+		for _, field := range []string{"requests_per_second", "upstream_fetches_per_second"} {
+			body := strings.Replace(base, "SECRET", "x", 1) + "limits: {" + field + ": " + v + "}\n"
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), "limits."+field+" must be a positive number") {
+				t.Errorf("%s=%s: err = %v", field, v, err)
+			}
+		}
+	}
+	// Without defaults applied, a zero rate is rejected, not unlimited.
+	c, err := Load(writeConfig(t, strings.Replace(base, "SECRET", "x", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Limits.RequestsPerSecond, c.Limits.UpstreamFetchesPerSecond = 0, 0
+	err = Validate(c)
+	for _, want := range []string{"limits.requests_per_second must be a positive number", "limits.upstream_fetches_per_second must be a positive number"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestMaxArtifactBytesNegative(t *testing.T) {
+	c := &Config{Limits: Limits{MaxArtifactBytes: -1}}
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "limits.max_artifact_bytes must not be negative") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSourceNames(t *testing.T) {
+	src := func(name string) string {
+		return strings.Replace(base, "SECRET", "x", 1) +
+			"      - {name: '" + name + "', type: registry, url: 'https://a', fetch_hosts: [a]}\n"
+	}
+	for _, bad := range []string{"../x", "a/b", ".hidden", "-x", "_x", "Upper", "a b", "a#b"} {
+		if _, err := Load(writeConfig(t, src(bad))); err == nil || !strings.Contains(err.Error(), "invalid source name") {
+			t.Errorf("%q: err = %v", bad, err)
+		}
+	}
+	for _, good := range []string{"packagist", "a.b_c-d", "0x"} {
+		if _, err := Load(writeConfig(t, src(good))); err != nil {
+			t.Errorf("%q: %v", good, err)
+		}
+	}
+}
+
+func TestValidateWithTestingOptions(t *testing.T) {
+	c, err := Load(writeConfig(t, strings.Replace(base, "SECRET", "x", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eco := c.Ecosystems["composer"]
+	eco.Sources = append(eco.Sources,
+		Source{Name: "r", Type: "registry", URL: "http://127.0.0.1:8080", FetchHosts: []string{"127.0.0.1"}},
+		Source{Name: "g", Type: "git", Claims: []string{"g/*"}, Remotes: []string{"/srv/repo", "file:///srv/other"}},
+	)
+	c.Ecosystems["composer"] = eco
+	err = Validate(c)
+	for _, want := range []string{`url "http://127.0.0.1:8080" must use https`, `unsupported remote scheme in "/srv/repo"`, `unsupported remote scheme in "file:///srv/other"`} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate: err = %v, want %q", err, want)
+		}
+	}
+	if err := ValidateWith(c, ValidateOptions{AllowHTTPUpstreams: true, AllowFileRemotes: true}); err != nil {
+		t.Fatalf("ValidateWith: %v", err)
+	}
+	// The options do not loosen anything else.
+	eco.Sources[1].URL = "ftp://x"
+	if err := ValidateWith(c, ValidateOptions{AllowHTTPUpstreams: true, AllowFileRemotes: true}); err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("ftp accepted: %v", err)
+	}
+}
+
+func TestCredentialsHostDuplicateNormalised(t *testing.T) {
+	for _, tc := range []struct{ url, dl string }{
+		{"https://A.example", "a.example"},
+		{"https://a.example:443", "a.example"},
+		{"https://a.example:443", "A.Example"},
+	} {
+		body := strings.Replace(base, "SECRET", "x", 1) + `      - name: r
+        type: registry
+        url: ` + tc.url + `
+        fetch_hosts: [a.example, A.Example, "a.example:443"]
+        credentials: {bearer: x}
+        download_credentials: {"` + tc.dl + `": {bearer: y}}
+`
+		_, err := Load(writeConfig(t, body))
+		if err == nil || !strings.Contains(err.Error(), "has both credentials and download_credentials") {
+			t.Errorf("%s / %s: err = %v", tc.url, tc.dl, err)
+		}
+	}
+}
+
+func TestExpandSkipsUnexportedFields(t *testing.T) {
+	t.Setenv("TSP_X", "expanded")
+	v := struct {
+		A string
+		b string
+	}{A: "${env:TSP_X}", b: "${env:TSP_X}"}
+	refs := map[string]bool{}
+	if err := expand(reflect.ValueOf(&v).Elem(), refs); err != nil {
+		t.Fatal(err)
+	}
+	if v.A != "expanded" || v.b != "${env:TSP_X}" {
+		t.Fatalf("%+v", v)
 	}
 }

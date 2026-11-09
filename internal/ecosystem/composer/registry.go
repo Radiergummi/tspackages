@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -60,10 +61,14 @@ var _ Source = (*RegistrySource)(nil)
 // NewRegistrySource builds a pass-through source for the repository at
 // baseURL (the directory holding p2/). fetchTimeout bounds every upstream
 // request including the body read (default 5 minutes). wait, if non-nil, is
-// called before every upstream request (rate limiting).
-func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rec *records.Store, ttl time.Duration, maxArtifact int64, fetchTimeout time.Duration, wait func(context.Context) error) *RegistrySource {
+// called before every upstream request (rate limiting). log nil means
+// slog.Default().
+func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rec *records.Store, ttl time.Duration, maxArtifact int64, fetchTimeout time.Duration, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
 	if fetchTimeout <= 0 {
 		fetchTimeout = defaultFetchTimeout
+	}
+	if log == nil {
+		log = slog.Default()
 	}
 	if wait == nil {
 		wait = func(context.Context) error { return nil }
@@ -71,16 +76,12 @@ func NewRegistrySource(name string, claims []string, baseURL string, c *upstream
 	return &RegistrySource{
 		name: name, claims: claims, base: strings.TrimRight(baseURL, "/"), c: c, cache: cache, rec: rec,
 		ttl: ttl, maxArtifact: maxArtifact, fetchTimeout: fetchTimeout, wait: wait,
-		log: slog.Default(), now: time.Now,
+		log: log, now: time.Now,
 	}
 }
 
 func (s *RegistrySource) Name() string     { return s.name }
 func (s *RegistrySource) Claims() []string { return s.claims }
-func (s *RegistrySource) Type() string     { return "registry" }
-
-// Packages is not enumerable for a pass-through source.
-func (s *RegistrySource) Packages(context.Context) ([]string, bool, error) { return nil, false, nil }
 
 func (s *RegistrySource) metaKey(pkg string, dev bool) string {
 	suffix := ".json"
@@ -177,8 +178,10 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 	return body, found, nil
 }
 
-// parseMetadata decodes a p2 document for pkg. Foreign package names are an
-// error; other top-level keys are ignored; fields stay exactly as sent.
+// parseMetadata decodes a p2 document for pkg; versions is nil when the
+// document does not list pkg. Foreign package names, as keys or as a version's
+// "name", are an error; other top-level keys are ignored; fields stay exactly
+// as sent.
 func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 	var doc struct {
 		Minified string                     `json:"minified"`
@@ -218,6 +221,12 @@ func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 	}
 	out := make([]Version, 0, len(entries))
 	for _, e := range entries {
+		if n, ok := e["name"]; ok {
+			ns, _ := n.(string)
+			if nn, err := Normalize(ns); err != nil || nn != pkg {
+				return nil, fmt.Errorf("upstream metadata for %s has a version named %v", pkg, n)
+			}
+		}
 		ver, _ := e["version"].(string)
 		if ver == "" {
 			continue
@@ -229,40 +238,25 @@ func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 	return out, nil
 }
 
-// Versions returns the stable and dev versions of name as upstream lists them.
-// Only a 404 on the stable file together with a 404 on ~dev is a definite miss.
-func (s *RegistrySource) Versions(ctx context.Context, name string) ([]Version, error) {
+// Versions returns the stable or dev versions of name as upstream lists them,
+// fetching only that file. A 404 on it is a definite miss.
+func (s *RegistrySource) Versions(ctx context.Context, name string, dev bool) ([]Version, error) {
 	pkg, err := Normalize(name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	stable, okStable, err := s.metadata(ctx, pkg, false)
+	body, found, err := s.metadata(ctx, pkg, dev)
 	if err != nil {
 		return nil, err
 	}
-	devBody, okDev, err := s.metadata(ctx, pkg, true)
-	if err != nil {
-		return nil, err
-	}
-	var out []Version
-	if okStable {
-		vs, err := parseMetadata(stable, pkg, false)
-		if err != nil {
-			return nil, err
-		}
-		out = vs
-	}
-	if okDev {
-		vs, err := parseMetadata(devBody, pkg, true)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, vs...)
-	}
-	if len(out) == 0 {
+	if !found {
 		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
 	}
-	return out, nil
+	vs, err := parseMetadata(body, pkg, dev)
+	if err == nil && vs == nil { // the document does not list the package
+		err = fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
+	}
+	return vs, err
 }
 
 func (s *RegistrySource) distKey(sha256 string) string {
@@ -274,8 +268,7 @@ func (s *RegistrySource) distRefKey(pkg, version, reference string) string {
 }
 
 // cachedDist serves a previously verified archive if the cache still has it
-// and its bytes still satisfy the currently declared shasum. Artifact.SHA1 is
-// always the sha1 of the bytes returned.
+// and its bytes still satisfy the currently declared shasum.
 func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string) (Artifact, bool) {
 	rc, _, err := s.cache.Get(ctx, refKey)
 	if err != nil {
@@ -301,7 +294,7 @@ func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string
 	if declared != "" && !strings.EqualFold(declared, sha1Hex) {
 		return Artifact{}, false
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b)), SHA1: sha1Hex}, true
+	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b))}, true
 }
 
 // Dist serves the archive of the version whose number and dist.reference
@@ -311,9 +304,18 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	if err != nil {
 		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	vs, err := s.Versions(ctx, pkg)
-	if err != nil {
-		return Artifact{}, err
+	// The route does not say whether version is a dev version: look in the
+	// stable file first, then in ~dev.
+	var vs []Version
+	for _, dev := range []bool{false, true} {
+		dvs, err := s.Versions(ctx, pkg, dev)
+		if err != nil && !errors.Is(err, resolve.ErrNotFound) {
+			return Artifact{}, err
+		}
+		vs = append(vs, dvs...)
+		if slices.ContainsFunc(dvs, func(v Version) bool { return v.Version == version && v.Reference == reference }) {
+			break
+		}
 	}
 	var dist map[string]any
 	for _, v := range vs {
@@ -362,7 +364,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	} else if err := s.cache.Put(ctx, refKey, strings.NewReader(sha256Hex+" "+sha1Hex)); err != nil {
 		s.log.Warn("caching composer distref failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body)), SHA1: sha1Hex}, nil
+	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body))}, nil
 }
 
 func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstream.Digest) (body []byte, sha1Hex, sha256Hex string, err error) {
@@ -388,7 +390,7 @@ func (s *RegistrySource) noteFetch(ctx context.Context, err error, haveCache boo
 		s.fetchErr, s.stale = nil, false
 		return
 	}
-	if s.fetchErr == nil {
+	if s.fetchErr == nil || s.fetchErr.Error() != err.Error() { // log changes, not repeats
 		s.log.Warn("composer upstream unhealthy", "source", s.name, "stale", haveCache, "error", err)
 	}
 	s.fetchErr, s.stale = err, haveCache
@@ -400,7 +402,7 @@ func (s *RegistrySource) Health(context.Context) []metrics.Health {
 	defer s.hmu.Unlock()
 	h := metrics.Health{Name: s.name, OK: s.fetchErr == nil, Detail: "no upstream fetch has failed"}
 	if s.fetchErr != nil {
-		// Category only; the error itself was logged when it first occurred.
+		// Category only; the error itself was logged when it occurred or changed.
 		h.Detail = "upstream error"
 		if s.stale {
 			h.Detail = "serving stale"

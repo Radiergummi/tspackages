@@ -15,6 +15,10 @@ tailnet. Read this before you deploy.
   registry capabilities. Requests whose `WhoIs` fails are denied.
 - Being on the tailnet is not enough: no matching capability means `403`.
 - Client `Authorization` headers are stripped and never forwarded.
+- `/`, `/readyz` and `/metrics` need at least one capability rule; only
+  `/healthz` answers any tailnet identity. Metrics carry source names, never
+  remote URLs, and the status page shows a git remote only to callers allowed
+  to read the package that remote declares.
 - tspackages must see the original connection, so it cannot sit behind
   Tailscale Serve or a reverse proxy.
 
@@ -27,9 +31,15 @@ tailnet. Read this before you deploy.
 - tsnet uploads its logs to Tailscale's log service by default. Set
   `TS_NO_LOGS_NO_SUPPORT=1` to disable that.
 - `storage.work_dir` holds git mirrors and SSH key material, mode 0700, and is
-  cleared of key files at every start. Run **one instance per work_dir and per
-  state dir**; there is no high availability, and two instances overlapping
-  beyond a brief restart will fight over mirrors and indexes.
+  cleared of key files and of mirrors no longer configured at every start.
+  Run **one instance per work_dir and per state dir**; there is no high
+  availability. A second instance on the same work_dir waits up to 60 seconds
+  for its lock (`<work_dir>/.lock`) and then exits; two instances sharing only
+  a state dir are not detected and will fight over indexes.
+- Tailscale credentials (`TS_AUTHKEY`, `TS_AUTH_KEY`, `TS_CLIENT_SECRET`,
+  `TS_ID_TOKEN`) and every variable the config references via `${env:}` are
+  removed from the environment once read, so git and ssh never inherit them
+  (`PATH`, `HOME`, `USER`, `TMPDIR`, `LANG` and `LC_*` are kept).
 - Turn on **S3 versioning or Object Lock on the state bucket**. The state
   store holds tag pins, git-built archives and the audit records (one JSON
   record per publish: caller, node, time, package, version, digest). Without
@@ -55,7 +65,10 @@ tailnet. Read this before you deploy.
   To accept a moved tag, delete its pin; a deleted pin is **re-pinned on next
   sight** to whatever the tag points at then.
 - Versions that were served stay served (and byte-identical, so Composer's
-  `shasum` stays valid) even if the tag is deleted upstream.
+  `shasum` stays valid) even if the tag is deleted upstream. A remote that is
+  unreachable at startup is indexed from its local mirror, or, without one (or
+  with a broken `composer.json` on the default branch), its pinned tags are
+  served from the stored archives; it shows as failing on the status page.
 - Only branches matching the source's `branches` allowlist (default: the
   default branch) become `dev-*` versions; any branch push would otherwise
   publish to every reader. Archives built for dev branch heads accumulate in

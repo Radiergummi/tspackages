@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -42,7 +43,9 @@ type keyLock struct {
 
 // NewCache builds the LRU index from the objects already in d, treating older
 // ModTimes as less recently used, and evicts the oldest until it fits maxSize.
-func NewCache(ctx context.Context, d Driver, maxSize int64) (*Cache, error) {
+// Failed eviction deletes are logged to log (nil: slog.Default()) and do not
+// fail it: the cache then starts over its cap and later Puts keep evicting.
+func NewCache(ctx context.Context, d Driver, maxSize int64, log *slog.Logger) (*Cache, error) {
 	var infos []Info
 	for info, err := range d.List(ctx, "") {
 		if err != nil {
@@ -62,7 +65,10 @@ func NewCache(ctx context.Context, d Driver, maxSize int64) (*Cache, error) {
 		c.total += info.Size
 	}
 	if err := c.evict(ctx); err != nil {
-		return nil, err
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("cache: trimming to max_size failed; starting over the cap", "error", err)
 	}
 	return c, nil
 }

@@ -19,15 +19,14 @@ type Version struct {
 type Artifact struct {
 	Body io.ReadCloser
 	Size int64
-	SHA1 string
 }
 
 // Source provides Composer packages. Methods return an error wrapping
 // resolve.ErrNotFound only for a definite miss.
 type Source interface {
 	resolve.Claimed
-	Type() string
-	Versions(ctx context.Context, name string) ([]Version, error) // resolve.ErrNotFound if unknown
+	// Versions returns the stable (dev=false) or dev (dev=true) versions of
+	// name; resolve.ErrNotFound if the name is unknown.
+	Versions(ctx context.Context, name string, dev bool) ([]Version, error)
 	Dist(ctx context.Context, name, version, reference string) (Artifact, error)
-	Packages(ctx context.Context) (names []string, enumerable bool, err error)
 }

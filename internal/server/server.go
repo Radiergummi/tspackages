@@ -13,9 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/config"
@@ -29,6 +30,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
 	"github.com/radiergummi/tspackages/internal/web"
+	"golang.org/x/sys/unix"
 	"tailscale.com/tailcfg"
 )
 
@@ -45,30 +47,6 @@ const probeKey = ".tspackages-probe"
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
 
-// validationView returns cfg, except that with Hooks.AllowFileRemotes local
-// git remotes (which config validation rejects) are swapped for a placeholder
-// https URL in a copy; gitmirror still checks the real remote.
-func validationView(cfg *config.Config, h Hooks) *config.Config {
-	if !h.AllowFileRemotes {
-		return cfg
-	}
-	view := *cfg
-	view.Ecosystems = map[string]config.Ecosystem{}
-	for name, eco := range cfg.Ecosystems {
-		sources := slices.Clone(eco.Sources)
-		for i := range sources {
-			sources[i].Remotes = slices.Clone(sources[i].Remotes)
-			for j, r := range sources[i].Remotes {
-				if strings.HasPrefix(r, "/") || strings.HasPrefix(r, "file://") {
-					sources[i].Remotes[j] = "https://file-remote.invalid/" + strconv.Itoa(j) + ".git"
-				}
-			}
-		}
-		view.Ecosystems[name] = config.Ecosystem{Sources: sources}
-	}
-	return &view
-}
-
 type namedStore struct {
 	name string
 	d    storage.Driver
@@ -76,12 +54,17 @@ type namedStore struct {
 
 // Build validates cfg, opens and probes every store, builds the sources in
 // config order and returns the handler (identity → rate limits → routes) and a
-// function that starts the background loops. Git mirrors live in
-// <work_dir>/git; SSH key material is rewritten to <work_dir>/keys at every
-// start.
+// function that runs the background loops until its ctx ends and returns once
+// they have stopped (run it in a goroutine). Git mirrors live in
+// <work_dir>/git, and directories there that belong to no configured mirror
+// are removed; SSH key material is rewritten to <work_dir>/keys
+// (<source>.key, <source>.known_hosts) at every start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
-	if err := config.Validate(validationView(cfg, h)); err != nil {
+	if err := config.ValidateWith(cfg, config.ValidateOptions{
+		AllowFileRemotes:   h.AllowFileRemotes,
+		AllowHTTPUpstreams: h.AllowPrivateUpstreams,
+	}); err != nil {
 		return nil, nil, err
 	}
 	gitDir, keyDir, err := prepareWorkDir(cfg.Storage.WorkDir)
@@ -109,7 +92,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	for _, s := range stores[2:] {
 		named[strings.TrimPrefix(s.name, "storage.stores.")] = s.d
 	}
-	cache, err := storage.NewCache(ctx, cacheDriver, int64(cfg.Storage.Cache.MaxSize))
+	cache, err := storage.NewCache(ctx, cacheDriver, int64(cfg.Storage.Cache.MaxSize), log)
 	if err != nil {
 		return nil, nil, fmt.Errorf("storage.cache: %w", err)
 	}
@@ -131,10 +114,10 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	)
 	fail := func(err error) (http.Handler, func(context.Context), error) { return nil, nil, err }
 	eco, hasComposer := cfg.Ecosystems["composer"]
-	for i, s := range eco.Sources {
+	for _, s := range eco.Sources {
 		switch s.Type {
 		case "storage":
-			src := composer.NewStorageSource(s.Name, s.Claims, named[s.Store], rec, archiveLimits)
+			src := composer.NewStorageSource(s.Name, s.Claims, named[s.Store], rec, archiveLimits, log)
 			sources, status = append(sources, src), append(status, src)
 		case "registry":
 			creds := maps.Clone(s.DownloadCredentials)
@@ -154,19 +137,18 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				AllowPrivateForTesting: h.AllowPrivateUpstreams,
 			})
 			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rec,
-				s.MetadataTTL, int64(l.MaxDecompressedBytes), 0, limits.UpstreamWait)
+				s.MetadataTTL, int64(l.MaxArtifactBytes), 0, limits.UpstreamWait, log)
 			sources, status = append(sources, src), append(status, src)
 		case "git":
 			opts := gitmirror.Options{
 				BaseDir:                    gitDir,
 				Token:                      s.Token,
+				Logger:                     log,
 				AllowFileRemotesForTesting: h.AllowFileRemotes,
 			}
-			if filepath.Base(s.Name) != s.Name || strings.HasPrefix(s.Name, ".") {
-				return fail(fmt.Errorf("composer source %q: name must not contain a path separator or start with a dot", s.Name))
-			}
-			// Fixed names keep the mirror directory (derived from the key path) stable across restarts.
-			prefix := filepath.Join(keyDir, s.Name+"-"+strconv.Itoa(i))
+			// One key per source, under a fixed name, so the mirror directory
+			// (derived from the key path) is stable across restarts.
+			prefix := filepath.Join(keyDir, s.Name)
 			if opts.SSHKeyPath, err = writeSecret(prefix+".key", s.SSHKey); err != nil {
 				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
 			}
@@ -183,13 +165,17 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				ms = append(ms, m)
 			}
 			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stateDriver,
-				s.PollInterval, log, int64(l.MaxDecompressedBytes))
+				s.PollInterval, log, int64(l.MaxArtifactBytes))
 			if err != nil {
 				return fail(err)
 			}
 			sources, status = append(sources, src), append(status, src)
 			gitSources = append(gitSources, src)
 		}
+	}
+
+	if err := pruneMirrorDirs(gitDir, mirrors); err != nil {
+		return fail(err)
 	}
 
 	limiter := limits.New(cfg.Limits)
@@ -221,13 +207,13 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 
 	handler := identity.Middleware(who, tailcfg.PeerCapability(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {
+		var wg sync.WaitGroup
 		for _, g := range gitSources {
-			go g.Run(ctx)
+			wg.Go(func() { g.Run(ctx) })
 		}
-		go func() {
-			<-ctx.Done()
-			limiter.Close()
-		}()
+		<-ctx.Done()
+		wg.Wait()
+		limiter.Close()
 	}
 	return handler, start, nil
 }
@@ -271,6 +257,29 @@ func (s mirrorSet) get(o gitmirror.Options) (*gitmirror.Mirror, error) {
 	onMirror(m)
 	s[k] = m
 	return m, nil
+}
+
+// pruneMirrorDirs removes everything in gitDir that is not the directory of a
+// configured mirror (old remotes, credentials or scratch dirs). It runs before
+// any Sync.
+func pruneMirrorDirs(gitDir string, mirrors mirrorSet) error {
+	keep := map[string]bool{}
+	for _, m := range mirrors {
+		keep[filepath.Base(m.Dir())] = true
+	}
+	entries, err := os.ReadDir(gitDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if keep[e.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(gitDir, e.Name())); err != nil {
+			return fmt.Errorf("prune %s: %w", gitDir, err)
+		}
+	}
+	return nil
 }
 
 // prepareWorkDir makes work_dir and its git/ and keys/ subdirectories
@@ -329,4 +338,44 @@ func writeSecret(p, content string) (string, error) {
 		return "", fmt.Errorf("write %s: %w", p, err)
 	}
 	return p, nil
+}
+
+// LockWorkDir takes an exclusive flock on <dir>/.lock so only one instance
+// uses a work_dir. If another holds it, it logs once and waits up to wait
+// before failing. dir is created (mode 0700) if missing. The returned
+// function releases the lock; the process exiting releases it too.
+func LockWorkDir(ctx context.Context, dir string, wait time.Duration, log *slog.Logger) (func(), error) {
+	if err := EnsurePrivateDir(dir); err != nil {
+		return nil, err
+	}
+	p := filepath.Join(dir, ".lock")
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(wait)
+	for logged := false; ; {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() { f.Close() }, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			f.Close()
+			return nil, fmt.Errorf("lock %s: %w", p, err)
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("%s is locked by another instance (waited %s)", p, wait)
+		}
+		if !logged {
+			log.Warn("work_dir is locked by another instance; waiting", "path", p, "timeout", wait)
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }

@@ -54,6 +54,7 @@ func (c *Composer) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /composer/dist/{source}/{vendor}/{name}/{version}/{reference}", c.wrap(c.dist))
 	// HEAD would otherwise be served by the GET route and fetch the artifact.
 	mux.HandleFunc("HEAD /composer/dist/{source}/{vendor}/{name}/{version}/{reference}", func(w http.ResponseWriter, _ *http.Request) {
+		setSecurityHeaders(w.Header())
 		w.Header().Set("Allow", "GET")
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 	})
@@ -65,6 +66,8 @@ type entry struct {
 	pkg, source string
 	claimed     bool
 	write       bool
+	version     string // writes only
+	sha256      string // writes only, once stored
 }
 
 type statusWriter struct {
@@ -88,9 +91,17 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// setSecurityHeaders sets the headers every Composer response carries.
+func setSecurityHeaders(h http.Header) {
+	h.Set("Cache-Control", "private, no-store")
+	h.Set("Vary", "Host")
+	h.Set("X-Content-Type-Options", "nosniff")
+}
+
 // wrap requires a Caller in the context and logs the request when it is done.
 func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Caller, *entry)) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
+		setSecurityHeaders(rw.Header())
 		caller, ok := identity.FromContext(r.Context())
 		if !ok {
 			c.log.Warn("composer request without caller", "path", r.URL.Path, "status", http.StatusForbidden)
@@ -98,10 +109,6 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 			http.Error(rw, "forbidden", http.StatusForbidden)
 			return
 		}
-		hd := rw.Header()
-		hd.Set("Cache-Control", "private, no-store")
-		hd.Set("Vary", "Host")
-		hd.Set("X-Content-Type-Options", "nosniff")
 		w := &statusWriter{ResponseWriter: rw}
 		e := &entry{}
 		h(w, r, caller, e)
@@ -118,13 +125,17 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 		if e.write || e.claimed {
 			level = slog.LevelInfo
 		}
-		c.log.Log(r.Context(), level, "composer request",
+		attrs := []any{
 			"caller", caller.String(),
 			"node", caller.NodeStableID,
 			"package", e.pkg,
 			"source", e.source,
 			"status", status,
-		)
+		}
+		if e.write {
+			attrs = append(attrs, "node_name", caller.NodeName, "version", e.version, "sha256", e.sha256)
+		}
+		c.log.Log(r.Context(), level, "composer request", attrs...)
 	}
 }
 
@@ -195,7 +206,7 @@ func (c *Composer) p2(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		return
 	}
 	vs, src, err := resolve.First(r.Context(), cands, func(ctx context.Context, s Source) ([]Version, error) {
-		return s.Versions(ctx, name)
+		return s.Versions(ctx, name, dev)
 	})
 	if err != nil {
 		c.fail(w, r, err)
@@ -204,9 +215,6 @@ func (c *Composer) p2(w http.ResponseWriter, r *http.Request, caller identity.Ca
 	e.source = src.Name()
 	out := []map[string]any{}
 	for _, v := range vs {
-		if v.Dev != dev {
-			continue
-		}
 		out = append(out, c.withDistURL(r, src.Name(), name, v))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"packages": map[string]any{name: out}})
@@ -255,6 +263,7 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 
 func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identity.Caller, e *entry) {
 	e.write = true
+	e.version = r.PathValue("version")
 	name, err := Normalize(r.PathValue("vendor") + "/" + r.PathValue("name"))
 	if err != nil {
 		http.Error(w, "invalid package name", http.StatusBadRequest)
@@ -277,6 +286,12 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 	}
 	if store == nil {
 		http.Error(w, fmt.Sprintf("no storage source claims %q", name), http.StatusForbidden)
+		return
+	}
+	// Reads resolve from the first claiming source; an upload anywhere else
+	// would be stored but never served.
+	if Source(store) != cands[0] {
+		http.Error(w, fmt.Sprintf("%q is served by source %q", name, cands[0].Name()), http.StatusConflict)
 		return
 	}
 	e.source = store.Name()
@@ -306,6 +321,7 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 		c.log.Error("composer upload failed", "package", name, "source", store.Name(), "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	default:
+		e.sha256 = v.Reference
 		writeJSON(w, http.StatusCreated, c.withDistURL(r, store.Name(), name, v))
 	}
 }

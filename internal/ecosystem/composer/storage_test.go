@@ -58,7 +58,7 @@ func newSource(t *testing.T) (*StorageSource, storage.Driver) {
 
 func newSourceOn(d storage.Driver) *StorageSource {
 	l := archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}
-	return NewStorageSource("internal", []string{"matchory-internal/*"}, d, records.New(d), l)
+	return NewStorageSource("internal", []string{"matchory-internal/*"}, d, records.New(d), l, nil)
 }
 
 func keys(t *testing.T, d storage.Driver, prefix string) []string {
@@ -90,7 +90,7 @@ func TestUploadAndVersions(t *testing.T) {
 		t.Fatalf("bad version %+v", v)
 	}
 
-	vs, err := s.Versions(ctx, "Matchory-Internal/Foo")
+	vs, err := s.Versions(ctx, "Matchory-Internal/Foo", false)
 	if err != nil || len(vs) != 1 {
 		t.Fatalf("Versions: %v %v", vs, err)
 	}
@@ -125,8 +125,8 @@ func TestUploadAndVersions(t *testing.T) {
 	}
 	defer art.Body.Close()
 	got, _ := io.ReadAll(art.Body)
-	if !bytes.Equal(got, data) || art.Size != int64(len(data)) || art.SHA1 != hex.EncodeToString(sha1sum[:]) {
-		t.Fatal("dist bytes/size/sha1 mismatch")
+	if !bytes.Equal(got, data) || art.Size != int64(len(data)) {
+		t.Fatal("dist bytes/size mismatch")
 	}
 	// the spelling of the version does not matter, the reference does
 	if a, err := s.Dist(ctx, "matchory-internal/foo", "v1.2.0", wantRef); err != nil {
@@ -145,7 +145,7 @@ func TestUploadAndVersions(t *testing.T) {
 func TestVersionsUnknown(t *testing.T) {
 	s, _ := newSource(t)
 	for _, n := range []string{"matchory-internal/nope", "not a name"} {
-		if _, err := s.Versions(context.Background(), n); !errors.Is(err, resolve.ErrNotFound) {
+		if _, err := s.Versions(context.Background(), n, false); !errors.Is(err, resolve.ErrNotFound) {
 			t.Errorf("%q: %v", n, err)
 		}
 	}
@@ -256,7 +256,7 @@ func TestUploadConcurrentSameVersion(t *testing.T) {
 	if ok != 1 || exists != 1 {
 		t.Fatalf("ok=%d exists=%d", ok, exists)
 	}
-	vs, err := s.Versions(ctx, "matchory-internal/foo")
+	vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(vs) != 1 {
 		t.Fatalf("%v %v", vs, err)
 	}
@@ -281,7 +281,7 @@ func TestUploadConcurrentDifferentVersions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	vs, err := s.Versions(ctx, "matchory-internal/foo")
+	vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(vs) != n {
 		t.Fatalf("want %d versions, got %d (%v)", n, len(vs), err)
 	}
@@ -298,7 +298,7 @@ func TestVersionsSortOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	vs, _ := s.Versions(ctx, "matchory-internal/foo")
+	vs, _ := s.Versions(ctx, "matchory-internal/foo", false)
 	var got []string
 	for _, v := range vs {
 		got = append(got, v.Version)
@@ -317,11 +317,11 @@ func TestRebuildIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before, _ := s.Versions(ctx, "matchory-internal/foo")
+	before, _ := s.Versions(ctx, "matchory-internal/foo", false)
 	if err := d.Delete(ctx, "composer/matchory-internal/foo/index.json"); err != nil {
 		t.Fatal(err)
 	}
-	after, err := s.Versions(ctx, "matchory-internal/foo")
+	after, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(after) != 2 {
 		t.Fatalf("%v %v", after, err)
 	}
@@ -335,7 +335,7 @@ func TestRebuildIndex(t *testing.T) {
 	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "3.0.0", pkgZip(t, fooJSON)); err != nil {
 		t.Fatal(err)
 	}
-	if vs, _ := s.Versions(ctx, "matchory-internal/foo"); len(vs) != 3 {
+	if vs, _ := s.Versions(ctx, "matchory-internal/foo", false); len(vs) != 3 {
 		t.Fatalf("got %d", len(vs))
 	}
 }
@@ -348,21 +348,14 @@ func TestUploadAfterIndexLoss(t *testing.T) {
 	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.1.0", pkgZip(t, fooJSON)); err != nil {
 		t.Fatal(err)
 	}
-	if vs, _ := s.Versions(ctx, "matchory-internal/foo"); len(vs) != 2 {
+	if vs, _ := s.Versions(ctx, "matchory-internal/foo", false); len(vs) != 2 {
 		t.Fatalf("index must keep the earlier version, got %d", len(vs))
 	}
 }
 
-func TestPackages(t *testing.T) {
+func TestStorageSourceIdentity(t *testing.T) {
 	s, _ := newSource(t)
-	ctx := context.Background()
-	s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON))
-	s.Upload(ctx, caller, "matchory-internal/bar", "1.0.0", pkgZip(t, `{"name":"matchory-internal/bar"}`))
-	names, enumerable, err := s.Packages(ctx)
-	if err != nil || !enumerable || fmt.Sprint(names) != "[matchory-internal/bar matchory-internal/foo]" {
-		t.Fatalf("%v %v %v", names, enumerable, err)
-	}
-	if s.Type() != "storage" || s.Name() != "internal" || fmt.Sprint(s.Claims()) != "[matchory-internal/*]" {
+	if s.Name() != "internal" || fmt.Sprint(s.Claims()) != "[matchory-internal/*]" {
 		t.Fatal("identity")
 	}
 }
@@ -416,7 +409,7 @@ func TestUploadRepairsInvisibleVersion(t *testing.T) {
 		if err != nil || v.Version != "v1.2.0" {
 			t.Fatalf("retry: %+v %v", v, err)
 		}
-		vs, err := s.Versions(ctx, "matchory-internal/foo")
+		vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 		if err != nil || len(vs) != 1 || vs[0].Version != "v1.2.0" {
 			t.Fatalf("%v %v", vs, err)
 		}
@@ -434,7 +427,7 @@ func TestUploadRepairsInvisibleVersion(t *testing.T) {
 		if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", other); !errors.Is(err, ErrVersionExists) {
 			t.Fatalf("got %v", err)
 		}
-		vs, err := s.Versions(ctx, "matchory-internal/foo")
+		vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 		sum := sha256.Sum256(data)
 		if err != nil || len(vs) != 1 || vs[0].Reference != hex.EncodeToString(sum[:]) {
 			t.Fatalf("original bytes must be listed: %v %v", vs, err)
@@ -449,7 +442,7 @@ func TestCorruptIndexIsRebuilt(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Put(ctx, "composer/matchory-internal/foo/index.json", strings.NewReader("{not json"))
-	vs, err := s.Versions(ctx, "matchory-internal/foo")
+	vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(vs) != 1 {
 		t.Fatalf("Versions: %v %v", vs, err)
 	}
@@ -457,7 +450,7 @@ func TestCorruptIndexIsRebuilt(t *testing.T) {
 	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.1.0", pkgZip(t, fooJSON)); err != nil {
 		t.Fatal(err)
 	}
-	if vs, _ := s.Versions(ctx, "matchory-internal/foo"); len(vs) != 2 {
+	if vs, _ := s.Versions(ctx, "matchory-internal/foo", false); len(vs) != 2 {
 		t.Fatalf("got %d", len(vs))
 	}
 }
@@ -472,7 +465,7 @@ func TestServedPackageIsAllowlisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := s.Versions(context.Background(), "matchory-internal/foo")
+	vs, _ := s.Versions(context.Background(), "matchory-internal/foo", false)
 	for _, p := range []map[string]any{v.Package, vs[0].Package} {
 		for _, k := range []string{"notification-url", "source", "transport-options", "installation-source", "scripts"} {
 			if _, ok := p[k]; ok {
@@ -494,7 +487,7 @@ func TestLargeIntegersSurvive(t *testing.T) {
 	if _, err := s.Upload(context.Background(), caller, "matchory-internal/foo", "1.0.0", pkgZip(t, j)); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := s.Versions(context.Background(), "matchory-internal/foo")
+	vs, _ := s.Versions(context.Background(), "matchory-internal/foo", false)
 	out, _ := json.Marshal(vs[0].Package["extra"])
 	if string(out) != `{"big":12345678901234567890}` {
 		t.Fatalf("got %s", out)
@@ -513,12 +506,12 @@ func TestRebuildIgnoresCurrentLimitsAndSkipsBadArchives(t *testing.T) {
 	d.Delete(ctx, "composer/matchory-internal/foo/index.json")
 	// a corrupt archive next to the good ones
 	d.Put(ctx, zipKey("matchory-internal/foo", "9.9.9.0"), strings.NewReader("junk"))
-	vs, err := s.Versions(ctx, "matchory-internal/foo")
+	vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(vs) != 2 {
 		t.Fatalf("Versions: %d %v", len(vs), err)
 	}
 	d.Delete(ctx, "composer/matchory-internal/foo/index.json")
-	err = s.Rebuild(ctx, "matchory-internal/foo")
+	err = rebuildIndex(ctx, s, "matchory-internal/foo")
 	if err == nil || !strings.Contains(err.Error(), "skipped") {
 		t.Fatalf("Rebuild should report the skipped archive: %v", err)
 	}
@@ -534,14 +527,14 @@ func TestRebuildRestoresSpelling(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Delete(ctx, "composer/matchory-internal/foo/index.json")
-	vs, err := s.Versions(ctx, "matchory-internal/foo")
+	vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 	if err != nil || len(vs) != 1 || vs[0].Version != "v1.2.0" || vs[0].Package["version"] != "v1.2.0" {
 		t.Fatalf("%+v %v", vs, err)
 	}
 	// without the sidecar the trimmed normalised form is used
 	d.Delete(ctx, metaKey("matchory-internal/foo", "1.2.0.0"))
 	d.Delete(ctx, "composer/matchory-internal/foo/index.json")
-	vs, _ = s.Versions(ctx, "matchory-internal/foo")
+	vs, _ = s.Versions(ctx, "matchory-internal/foo", false)
 	if len(vs) != 1 || vs[0].Version != "1.2.0" {
 		t.Fatalf("%+v", vs)
 	}
@@ -597,7 +590,7 @@ func TestRebuildDoesNotDropConcurrentUpload(t *testing.T) {
 		}
 	}
 	h.after.Store(&hook)
-	if err := s.Rebuild(ctx, "matchory-internal/foo"); err != nil {
+	if err := rebuildIndex(ctx, s, "matchory-internal/foo"); err != nil {
 		t.Fatal(err)
 	}
 	idx, _, err := s.loadIndex(ctx, "matchory-internal/foo")
@@ -617,7 +610,7 @@ func TestRebuildSurvivesFirstCallerCancel(t *testing.T) {
 
 	ctx1, cancel1 := context.WithCancel(ctx)
 	first := make(chan error, 1)
-	go func() { _, err := s.Versions(ctx1, "matchory-internal/foo"); first <- err }()
+	go func() { _, err := s.Versions(ctx1, "matchory-internal/foo", false); first <- err }()
 	<-entered
 	cancel1()
 	if err := <-first; !errors.Is(err, context.Canceled) {
@@ -625,7 +618,7 @@ func TestRebuildSurvivesFirstCallerCancel(t *testing.T) {
 	}
 	second := make(chan error, 1)
 	go func() {
-		vs, err := s.Versions(ctx, "matchory-internal/foo")
+		vs, err := s.Versions(ctx, "matchory-internal/foo", false)
 		if err == nil && len(vs) != 1 {
 			err = fmt.Errorf("got %d versions", len(vs))
 		}
@@ -674,7 +667,7 @@ func TestConcurrentReadersShareRebuild(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if vs, err := s.Versions(ctx, "matchory-internal/foo"); err != nil || len(vs) != 1 {
+			if vs, err := s.Versions(ctx, "matchory-internal/foo", false); err != nil || len(vs) != 1 {
 				t.Errorf("%v %v", vs, err)
 			}
 		}()
@@ -683,4 +676,24 @@ func TestConcurrentReadersShareRebuild(t *testing.T) {
 	if n := h.lists.Load(); n != 1 {
 		t.Fatalf("rebuild ran %d times, want 1", n)
 	}
+}
+
+func TestStorageVersionsDevIsEmpty(t *testing.T) {
+	s, _ := newSource(t)
+	ctx := context.Background()
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON)); err != nil {
+		t.Fatal(err)
+	}
+	if vs, err := s.Versions(ctx, "matchory-internal/foo", true); err != nil || vs == nil || len(vs) != 0 {
+		t.Fatalf("dev = %v, %v", vs, err)
+	}
+	if _, err := s.Versions(ctx, "matchory-internal/nope", true); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("unknown dev err = %v", err)
+	}
+}
+
+// rebuildIndex rebuilds the index of pkg (which must be missing) from its zips.
+func rebuildIndex(ctx context.Context, s *StorageSource, pkg string) error {
+	_, err := s.rebuild(ctx, pkg)
+	return err
 }

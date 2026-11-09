@@ -59,8 +59,11 @@ type Storage struct {
 }
 
 type Limits struct {
-	MaxUploadBytes           ByteSize `yaml:"max_upload_bytes"`
-	MaxDecompressedBytes     ByteSize `yaml:"max_decompressed_bytes"`
+	MaxUploadBytes       ByteSize `yaml:"max_upload_bytes"`
+	MaxDecompressedBytes ByteSize `yaml:"max_decompressed_bytes"`
+	// MaxArtifactBytes caps a registry dist download or a git-built archive;
+	// both are held in memory up to this size.
+	MaxArtifactBytes         ByteSize `yaml:"max_artifact_bytes"`
 	MaxArchiveEntries        int      `yaml:"max_archive_entries"`
 	RequestsPerSecond        float64  `yaml:"requests_per_second"`
 	Burst                    int      `yaml:"burst"`
@@ -148,6 +151,7 @@ func ApplyDefaults(c *Config) {
 	l := &c.Limits
 	setNum(&l.MaxUploadBytes, 100<<20)
 	setNum(&l.MaxDecompressedBytes, 500<<20)
+	setNum(&l.MaxArtifactBytes, 500<<20)
 	setNum(&l.MaxArchiveEntries, 20000)
 	setNum(&l.RequestsPerSecond, 50)
 	setNum(&l.Burst, 100)
@@ -192,7 +196,9 @@ func expand(v reflect.Value, refs map[string]bool) error {
 		}
 	case reflect.Struct:
 		for i := range v.NumField() {
-			errs = append(errs, expand(v.Field(i), refs))
+			if v.Type().Field(i).IsExported() {
+				errs = append(errs, expand(v.Field(i), refs))
+			}
 		}
 	case reflect.Slice:
 		for i := range v.Len() {

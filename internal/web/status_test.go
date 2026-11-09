@@ -94,18 +94,46 @@ func TestStatusForbiddenWithoutRules(t *testing.T) {
 	}
 }
 
-func TestHealthEndpointsNeedCallerNotCapability(t *testing.T) {
+func TestProbeAccess(t *testing.T) {
 	bare := &identity.Caller{Login: "a@b"}
-	for _, p := range []string{"/healthz", "/readyz", "/metrics"} {
-		if rec := serve(t, newWeb(nil), p, bare); rec.Code != 200 {
+	// /healthz needs only an identity.
+	if rec := serve(t, newWeb(nil), "/healthz", bare); rec.Code != 200 || rec.Body.String() != "ok" {
+		t.Errorf("/healthz with bare caller: %d %q", rec.Code, rec.Body.String())
+	}
+	// /readyz and /metrics need at least one rule, like /.
+	for _, p := range []string{"/readyz", "/metrics"} {
+		if rec := serve(t, newWeb(nil), p, bare); rec.Code != 403 {
 			t.Errorf("%s with bare caller: %d", p, rec.Code)
 		}
+		if rec := serve(t, newWeb(nil), p, reader()); rec.Code != 200 {
+			t.Errorf("%s with reader: %d", p, rec.Code)
+		}
+	}
+	for _, p := range []string{"/healthz", "/readyz", "/metrics"} {
 		if rec := serve(t, newWeb(nil), p, nil); rec.Code != 403 {
 			t.Errorf("%s without caller: %d", p, rec.Code)
 		}
 	}
-	if rec := serve(t, newWeb(nil), "/healthz", bare); rec.Body.String() != "ok" {
-		t.Error("healthz body")
+}
+
+func TestStatusFiltersScopedHealthRows(t *testing.T) {
+	w := New("h", []ecosystem.Ecosystem{fakeEco{}}, []StatusSource{fakeSource{
+		{Name: "store", OK: true, Detail: "fine"},
+		{Name: "git https://h/a.git", Scoped: true, Package: "a/x", OK: true, Detail: "x"},
+		{Name: "git https://h/b.git", Scoped: true, Package: "b/x", OK: true, Detail: "x"},
+		{Name: "git https://h/unknown.git", Scoped: true, OK: false, Detail: "never indexed"},
+	}}, nil, nil, nil)
+	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
+	body := serve(t, w, "/", c).Body.String()
+	for _, want := range []string{"store", "h/a.git"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"h/b.git", "unknown.git"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("body leaks %q", bad)
+		}
 	}
 }
 
@@ -130,6 +158,20 @@ func TestReadyzTimesOut(t *testing.T) {
 	w.readyTimeout = 20 * time.Millisecond
 	rec := serve(t, w, "/readyz", reader())
 	if rec.Code != 503 || rec.Body.String() != "not ready: timeout" {
+		t.Fatalf("%d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadyzClientCancelled(t *testing.T) {
+	w := newWeb(func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
+	mux := http.NewServeMux()
+	w.Mount(mux)
+	ctx, cancel := context.WithCancel(identity.WithCaller(context.Background(), *reader()))
+	r := httptest.NewRequest("GET", "/readyz", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	time.AfterFunc(20*time.Millisecond, cancel)
+	mux.ServeHTTP(rec, r)
+	if rec.Code != 503 || rec.Body.String() != "not ready: cancelled" {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
 	}
 }
@@ -174,7 +216,7 @@ func TestMetricsExposed(t *testing.T) {
 	metrics.ObserveRequest("composer", "main", 200)
 	metrics.ObserveCacheHit("composer", "main")
 	metrics.ObserveUpstream("main", time.Second)
-	metrics.SetGitLastSync("git", "https://x/y.git", time.Unix(1700000000, 0))
+	metrics.SetGitLastSync("git", time.Unix(1700000000, 0))
 	w := newWeb(nil)
 	w.SetRejected(func() uint64 { return 7 })
 	rec := serve(t, w, "/metrics", reader())
@@ -183,7 +225,7 @@ func TestMetricsExposed(t *testing.T) {
 		`tspackages_requests_total{code="200",ecosystem="composer",source="main"}`,
 		"tspackages_cache_hits_total",
 		"tspackages_upstream_request_duration_seconds_bucket",
-		`tspackages_git_last_sync_timestamp_seconds{remote="https://x/y.git",source="git"} 1.7e+09`,
+		`tspackages_git_last_sync_timestamp_seconds{source="git"} 1.7e+09`,
 		"tspackages_rate_limited_total 7",
 		"go_goroutines",
 	} {

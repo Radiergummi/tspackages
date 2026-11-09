@@ -1,16 +1,21 @@
 package composer
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"github.com/radiergummi/tspackages/internal/archive"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
+	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"github.com/radiergummi/tspackages/internal/upstream"
 )
 
 // counter returns the value of the named counter series with exactly the given labels.
@@ -68,14 +73,14 @@ func TestRegistryObservesCacheHitAndUpstream(t *testing.T) {
 	up := map[string]string{"source": "packagist"}
 	h0, u0 := counter(t, "tspackages_cache_hits_total", hit), counter(t, "tspackages_upstream_request_duration_seconds", up)
 	for range 3 {
-		if _, err := e.src.Versions(context.Background(), "acme/pkg"); err != nil {
+		if _, err := e.src.Versions(context.Background(), "acme/pkg", false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if d := counter(t, "tspackages_cache_hits_total", hit) - h0; d != 4 {
+	if d := counter(t, "tspackages_cache_hits_total", hit) - h0; d != 2 {
 		t.Errorf("cache hits delta = %v", d)
 	}
-	if d := counter(t, "tspackages_upstream_request_duration_seconds", up) - u0; d != 2 {
+	if d := counter(t, "tspackages_upstream_request_duration_seconds", up) - u0; d != 1 {
 		t.Errorf("upstream observations delta = %v", d)
 	}
 }
@@ -87,12 +92,12 @@ func TestRegistryHealth(t *testing.T) {
 		t.Fatalf("fresh: %+v", h)
 	}
 	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
-	if _, err := e.src.Versions(ctx, "acme/pkg"); err != nil {
+	if _, err := e.src.Versions(ctx, "acme/pkg", false); err != nil {
 		t.Fatal(err)
 	}
 	e.f.setStatus(500)
 	e.clock = e.clock.Add(time.Hour)
-	if _, err := e.src.Versions(ctx, "acme/pkg"); err != nil { // stale served
+	if _, err := e.src.Versions(ctx, "acme/pkg", false); err != nil { // stale served
 		t.Fatal(err)
 	}
 	h := e.src.Health(ctx)
@@ -101,7 +106,7 @@ func TestRegistryHealth(t *testing.T) {
 	}
 	e.f.setStatus(0)
 	e.clock = e.clock.Add(time.Hour)
-	if _, err := e.src.Versions(ctx, "acme/pkg"); err != nil {
+	if _, err := e.src.Versions(ctx, "acme/pkg", false); err != nil {
 		t.Fatal(err)
 	}
 	if h := e.src.Health(ctx); !h[0].OK {
@@ -110,7 +115,7 @@ func TestRegistryHealth(t *testing.T) {
 	// Without a cache the failure is not "stale".
 	e2 := newRegEnv(t)
 	e2.f.setStatus(500)
-	_, _ = e2.src.Versions(ctx, "acme/pkg")
+	_, _ = e2.src.Versions(ctx, "acme/pkg", false)
 	if h := e2.src.Health(ctx); h[0].OK || h[0].Detail != "upstream error" {
 		t.Fatalf("no cache: %+v", h)
 	}
@@ -118,13 +123,36 @@ func TestRegistryHealth(t *testing.T) {
 
 func TestRegistryCancelledFetchNotRecorded(t *testing.T) {
 	e := newRegEnv(t)
+	reached := false
+	e.src.wait = func(context.Context) error { reached = true; return nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := e.src.Versions(ctx, "acme/pkg"); err == nil {
+	if _, err := e.src.Versions(ctx, "acme/pkg", false); err == nil {
 		t.Fatal("expected error")
+	}
+	if !reached {
+		t.Fatal("the upstream fetch (and so noteFetch) was never reached")
 	}
 	if h := e.src.Health(context.Background()); !h[0].OK {
 		t.Fatalf("client cancellation marked source unhealthy: %+v", h)
+	}
+}
+
+func TestRegistryLogsErrorChanges(t *testing.T) {
+	var buf bytes.Buffer
+	e := newRegEnv(t)
+	e.src.log = slog.New(slog.NewTextHandler(&buf, nil))
+	unhealthy := func() int { return strings.Count(buf.String(), "composer upstream unhealthy") }
+	e.f.setStatus(500)
+	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
+	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
+	if n := unhealthy(); n != 1 {
+		t.Fatalf("same error logged %d times", n)
+	}
+	e.f.setStatus(503)
+	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
+	if n := unhealthy(); n != 2 {
+		t.Fatalf("changed error logged %d times in total, want 2", n)
 	}
 }
 
@@ -141,6 +169,10 @@ func TestGitHealth(t *testing.T) {
 	if len(h) != 2 || !h[0].OK || h[1].OK || h[1].Detail != "never indexed" {
 		t.Fatalf("%+v", h)
 	}
+	// Remote rows are scoped to the package the remote declares; unknown is "".
+	if !h[0].Scoped || h[0].Package != "matchory/a" || !h[1].Scoped || h[1].Package != "" {
+		t.Fatalf("scoping: %+v", h)
+	}
 	g.now = func() time.Time { return time.Now().Add(10 * time.Minute) } // poll is 1m
 	if h := g.Health(ctx); h[0].OK || h[0].Detail != "sync stale" {
 		t.Fatalf("stale: %+v", h[0])
@@ -153,13 +185,13 @@ func TestGitHealth(t *testing.T) {
 	if h := g.Health(ctx); h[0].OK || h[0].Detail != "index failing" {
 		t.Fatalf("failing index: %+v", h[0])
 	}
-	lbl := map[string]string{"source": "git", "remote": good}
 	fams, _ := metrics.Registry().Gather()
 	found := false
 	for _, f := range fams {
 		if f.GetName() == "tspackages_git_last_sync_timestamp_seconds" {
 			for _, m := range f.GetMetric() {
-				if m.GetLabel()[0].GetValue() == lbl["remote"] && m.GetGauge().GetValue() > 0 {
+				// The only label is the source; remotes never become label values.
+				if len(m.GetLabel()) == 1 && m.GetLabel()[0].GetName() == "source" && m.GetLabel()[0].GetValue() == "git" && m.GetGauge().GetValue() > 0 {
 					found = true
 				}
 			}
@@ -223,5 +255,26 @@ func TestNoCallerRequestObserved(t *testing.T) {
 	do(mux, "GET", "/composer/packages.json", nil)
 	if got := counter(t, "tspackages_requests_total", lbl) - before; got != 1 {
 		t.Fatalf("delta = %v", got)
+	}
+}
+
+func TestSourcesLogToInjectedLogger(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	_, d := newSource(t)
+	l := archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 16 << 20, MaxEntries: 1000}
+	s := NewStorageSource("internal", []string{"matchory-internal/*"}, failStat{Driver: d, err: errors.New("boom")}, records.New(d), l, log)
+	s.Health(context.Background())
+	if !strings.Contains(buf.String(), "composer storage source unreachable") {
+		t.Errorf("storage source: %q", buf.String())
+	}
+	buf.Reset()
+	e := newRegEnv(t)
+	src := NewRegistrySource("packagist", nil, e.f.srv.URL, upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1"}, AllowPrivateForTesting: true}),
+		e.cache, e.rec, time.Minute, 1<<20, 0, nil, log)
+	e.f.setStatus(500)
+	_, _ = src.Versions(context.Background(), "acme/pkg", false)
+	if !strings.Contains(buf.String(), "composer upstream unhealthy") {
+		t.Errorf("registry source: %q", buf.String())
 	}
 }

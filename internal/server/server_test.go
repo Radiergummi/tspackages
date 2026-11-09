@@ -76,7 +76,7 @@ func TestBuildRejectsInvalidConfig(t *testing.T) {
 }
 
 func TestBuildServes(t *testing.T) {
-	h, _, err := Build(t.Context(), fsConfig(t), fakeWho{}, quiet, Hooks{})
+	h, _, err := Build(t.Context(), fsConfig(t), fakeWho{rules: []string{`{"read":["*"]}`}}, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestBuildWiresComposer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start(ctx)
+	go start(ctx)
 	if w := do(h, "PUT", "/composer/upload/acme/pkg/1.0.0", bytes.NewReader(pkgZip(t))); w.Code != http.StatusCreated {
 		t.Fatalf("PUT upload = %d %s", w.Code, w.Body)
 	}
@@ -166,8 +166,8 @@ func TestBuildWritesSSHKeyFiles(t *testing.T) {
 		}
 	}
 	want := map[string]string{
-		"internal-0.key":         "PRIVATE KEY MATERIAL\n",
-		"internal-0.known_hosts": "git.example.com ssh-ed25519 AAAA\n",
+		"internal.key":         "PRIVATE KEY MATERIAL\n",
+		"internal.known_hosts": "git.example.com ssh-ed25519 AAAA\n",
 	}
 	files, _ := os.ReadDir(keys)
 	if len(files) != len(want) {
@@ -238,8 +238,38 @@ func TestBuildRejectsPathInSourceName(t *testing.T) {
 	src := sshSource
 	src.Name = "../escape"
 	_, _, err := Build(t.Context(), gitConfig(t, src), fakeWho{}, quiet, Hooks{})
-	if err == nil || !strings.Contains(err.Error(), "path separator") {
+	if err == nil || !strings.Contains(err.Error(), "invalid source name") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestBuildPrunesUnknownMirrorDirs(t *testing.T) {
+	got := captureMirrors(t)
+	cfg := gitConfig(t, sshSource)
+	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(cfg.Storage.WorkDir, "git")
+	keep := (*got)[0].Dir()
+	stray := []string{filepath.Join(gitDir, "0123456789abcdef.git"), keep + ".tmp", filepath.Join(gitDir, "file")}
+	for _, d := range append([]string{keep}, stray[:2]...) {
+		if err := os.MkdirAll(filepath.Join(d, "objects"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(stray[2], nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("configured mirror removed: %v", err)
+	}
+	for _, p := range stray {
+		if _, err := os.Lstat(p); err == nil {
+			t.Errorf("%s not pruned", p)
+		}
 	}
 }
 
@@ -278,4 +308,71 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 			t.Fatalf("err = %v, want one naming %s", err, keys)
 		}
 	})
+}
+
+func TestBuildAppliesDefaults(t *testing.T) {
+	cfg := fsConfig(t)
+	cfg.Limits = config.Limits{}
+	cfg.Tailscale = config.Tailscale{}
+	if _, _, err := Build(t.Context(), cfg, fakeWho{}, quiet, Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 500<<20 || cfg.Tailscale.Capability != testCap {
+		t.Fatalf("defaults not applied: %+v %+v", cfg.Limits, cfg.Tailscale)
+	}
+}
+
+func TestLockWorkDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "work")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	release, err := LockWorkDir(t.Context(), dir, time.Second, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := mode(t, dir); m.Perm() != 0o700 {
+		t.Errorf("work_dir mode %v", m)
+	}
+	start := time.Now()
+	if _, err := LockWorkDir(t.Context(), dir, 200*time.Millisecond, log); err == nil || !strings.Contains(err.Error(), "another instance") {
+		t.Fatalf("second lock: %v", err)
+	}
+	if time.Since(start) < 200*time.Millisecond {
+		t.Error("did not wait before giving up")
+	}
+	if !strings.Contains(logs.String(), "waiting") {
+		t.Errorf("no wait log line: %s", logs.String())
+	}
+	// Released: a waiter gets it.
+	go func() { time.Sleep(100 * time.Millisecond); release() }()
+	r2, err := LockWorkDir(t.Context(), dir, 2*time.Second, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2()
+}
+
+// start runs the background loops until ctx ends and returns only once they
+// have stopped, so callers can wait for them before removing work_dir.
+func TestStartReturnsAfterLoopsStop(t *testing.T) {
+	cfg := gitConfig(t, config.Source{Name: "g", Type: "git", Claims: []string{"acme/*"}, Remotes: []string{t.TempDir()}, PollInterval: 10 * time.Millisecond})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	_, start, err := Build(ctx, cfg, fakeWho{}, quiet, Hooks{AllowFileRemotes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { start(ctx); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("start returned before ctx ended")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("start did not return after ctx ended")
+	}
 }

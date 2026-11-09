@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,7 +21,7 @@ func newTestCache(t *testing.T, max int64) (*Cache, Driver) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewCache(context.Background(), d, max)
+	c, err := NewCache(context.Background(), d, max, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +130,7 @@ func TestCacheIndexRebuild(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c, err := NewCache(ctx, d, 30)
+	c, err := NewCache(ctx, d, 30, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +153,7 @@ func TestCacheRebuildTrims(t *testing.T) {
 	for _, k := range []string{"a", "b", "c"} {
 		cachePut(t, c, k)
 	}
-	c2, err := NewCache(context.Background(), d, 20)
+	c2, err := NewCache(context.Background(), d, 20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +181,7 @@ func TestCacheEvictDeleteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	c, err := NewCache(ctx, failKeyDelete{d, "a"}, 20)
+	c, err := NewCache(ctx, failKeyDelete{d, "a"}, 20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +205,7 @@ func TestCacheOversizeDeleteFailureStaysIndexed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewCache(context.Background(), failKeyDelete{d, "big"}, 5)
+	c, err := NewCache(context.Background(), failKeyDelete{d, "big"}, 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,5 +254,26 @@ func TestCacheConcurrent(t *testing.T) {
 	}
 	if c.total != disk {
 		t.Errorf("index total %d != bytes on disk %d", c.total, disk)
+	}
+}
+
+func TestNewCacheTrimFailureDoesNotFailStartup(t *testing.T) {
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, k := range []string{"a", "b"} {
+		if _, err := d.Put(ctx, k, strings.NewReader("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var logs bytes.Buffer
+	c, err := NewCache(ctx, failKeyDelete{d, "a"}, 10, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("startup failed on a trim delete: %v", err)
+	}
+	if c.total != 20 || !strings.Contains(logs.String(), "boom") {
+		t.Fatalf("total=%d logs=%s", c.total, logs.String())
 	}
 }

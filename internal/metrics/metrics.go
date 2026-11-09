@@ -1,7 +1,7 @@
 // Package metrics holds tspackages' Prometheus registry and the helpers the
 // handlers and sources call to record observations.
 //
-// Label values come from configuration (ecosystem, source, remote) or are
+// Label values come from configuration (ecosystem, source) or are
 // fixed (the numeric status code); never pass client input.
 package metrics
 
@@ -21,6 +21,10 @@ type Health struct {
 	Name   string
 	OK     bool
 	Detail string
+	// Scoped rows describe one package's remote and are shown only to callers
+	// allowed to read Package ("" while unknown: shown to nobody).
+	Scoped  bool
+	Package string
 }
 
 // StatusSource reports its health on the status page.
@@ -46,8 +50,8 @@ var (
 	}, []string{"source"})
 	gitLastSync = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "tspackages_git_last_sync_timestamp_seconds",
-		Help: "Unix time of the last successful sync of a git remote.",
-	}, []string{"source", "remote"})
+		Help: "Unix time of the oldest last successful sync among a git source's remotes (0 while one never synced).",
+	}, []string{"source"})
 
 	rejected atomic.Pointer[func() uint64]
 )
@@ -103,6 +107,11 @@ func ObserveUpstream(source string, d time.Duration) {
 	upstreamDuration.WithLabelValues(source).Observe(d.Seconds())
 }
 
-func SetGitLastSync(source, remote string, t time.Time) {
-	gitLastSync.WithLabelValues(source, RedactRemote(remote)).Set(float64(t.Unix()))
+// SetGitLastSync sets the source's last-sync gauge; a zero t is reported as 0.
+func SetGitLastSync(source string, t time.Time) {
+	v := 0.0
+	if !t.IsZero() {
+		v = float64(t.Unix())
+	}
+	gitLastSync.WithLabelValues(source).Set(v)
 }

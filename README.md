@@ -47,6 +47,13 @@ you deploy.
    with any store or `tailscale.state_dir`. Startup validates the whole config
    and refuses to start on errors.
 
+   Stores use `driver: fs` (`path`) or `driver: s3` with `bucket` and the
+   optional keys `region` (default `us-east-1`), `endpoint` (for MinIO and
+   other S3-compatible services; enables path-style addressing), `prefix`
+   (lowercase), `access_key_id` and `secret_access_key`. Without the two key
+   fields the AWS default credential chain applies (environment, shared config,
+   instance or task role). `cache` also takes `max_size` (default 10GiB).
+
 2. Run it with an auth key (or an OAuth client secret, in which case it
    advertises `tailscale.tags`):
 
@@ -59,14 +66,18 @@ you deploy.
    ```
 
    The image runs as uid 10001 with `/var/lib/tspackages` as a volume and reads
-   `/etc/tspackages/config.yaml`. Or build the binary: `go build ./cmd/tspackages`
+   `/etc/tspackages/config.yaml`. With a bind mount instead of a named volume,
+   the host directories for `work_dir` and `tailscale.state_dir` must be owned
+   by uid 10001 with mode 0700 (`install -d -o 10001 -m 0700 <dir>`), or
+   startup refuses them. Or build the binary: `go build ./cmd/tspackages`
    and run `tspackages -config config.yaml`.
 
 3. Grant access in your tailnet policy (see below).
 
-The node serves HTTPS on `https://<hostname>.<tailnet>.ts.net`. `/` shows a
-status page, `/healthz`, `/readyz` and `/metrics` are available to any caller
-with a capability.
+The node serves HTTPS on `https://<hostname>.<tailnet>.ts.net`. `/` (a status
+page), `/readyz` and `/metrics` need at least one capability rule; `/healthz`
+answers any tailnet identity. The status page lists a git remote only to
+callers who may read the package it declares.
 
 ## Composer sources
 
@@ -79,12 +90,16 @@ may be unclaimed (the public catch-all); `storage` sources must have claims.
 |------|------|------|
 | `git` | `remotes`, `branches`, `ssh_key`, `known_hosts`, `token`, `poll_interval` | Tags become versions, allowlisted branches become `dev-*`. Dist zips are built with `git archive` and kept. Package names come from each repo's `composer.json`. |
 | `storage` | `store`, `claims` | Hosts uploaded dist zips on the named store. |
-| `registry` | `url`, `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to an upstream (Packagist). Dist URLs are rewritten to this server. |
+| `registry` | `url` (https), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to an upstream (Packagist). Dist URLs are rewritten to this server. |
 
 `ssh_key`, `known_hosts`, `token` and credentials accept `${env:NAME}` or
 `${file:/path}`. Limits (`max_upload_bytes`, `max_decompressed_bytes`,
-`max_archive_entries`, `requests_per_second`, `burst`,
-`upstream_fetches_per_second`) have defaults; see `internal/config`.
+`max_archive_entries`, `max_artifact_bytes`, `requests_per_second`, `burst`,
+`upstream_fetches_per_second`) have defaults; see `internal/config`. Rates must
+be positive. `max_artifact_bytes` (default 500MiB) caps a registry dist download
+and a git-built archive; each is buffered in memory up to that size, so size
+the container's memory for it. `max_decompressed_bytes` applies to upload
+inspection.
 
 ## Client setup
 
@@ -108,7 +123,8 @@ curl -fsS -X PUT --data-binary @b-1.0.0.zip \
   https://registry.<tailnet>.ts.net/composer/upload/acme/b/1.0.0
 ```
 
-Republishing a version is rejected with `409`.
+Republishing a version is rejected with `409`, and so is an upload of a name
+that an earlier source also claims (it would be stored but never served).
 
 ## Tailnet policy
 

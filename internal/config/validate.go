@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -11,8 +12,17 @@ import (
 	"strings"
 )
 
+// ValidateOptions loosen validation for tests. Configuration never sets them.
+type ValidateOptions struct {
+	AllowFileRemotes   bool // git remotes may be local paths or file:// URLs
+	AllowHTTPUpstreams bool // registry urls may use http
+}
+
 // Validate returns every problem found in c, joined with errors.Join.
-func Validate(c *Config) error {
+func Validate(c *Config) error { return ValidateWith(c, ValidateOptions{}) }
+
+// ValidateWith is Validate with test-only loosening.
+func ValidateWith(c *Config, opts ValidateOptions) error {
 	var errs []error
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
@@ -26,7 +36,7 @@ func Validate(c *Config) error {
 			add("ecosystem %q is not supported yet", eco)
 			continue
 		}
-		errs = append(errs, validateSources(eco, e.Sources, c.Storage.Stores)...)
+		errs = append(errs, validateSources(eco, e.Sources, c.Storage.Stores, opts)...)
 	}
 	return errors.Join(errs...)
 }
@@ -44,6 +54,10 @@ func validateStores(s *Storage) []error {
 		case "s3":
 			if sc.Bucket == "" {
 				add("%s: bucket is required for the s3 driver", name)
+			}
+			// Keys are lowercase so they stay unique on case-insensitive stores.
+			if sc.Prefix != strings.ToLower(sc.Prefix) {
+				add("%s: prefix %q must be lowercase", name, sc.Prefix)
 			}
 		default:
 			add("%s: driver must be fs or s3, got %q", name, sc.Driver)
@@ -127,9 +141,15 @@ func validateLimits(l *Limits) []error {
 	neg("max_upload_bytes", l.MaxUploadBytes < 0)
 	neg("max_decompressed_bytes", l.MaxDecompressedBytes < 0)
 	neg("max_archive_entries", l.MaxArchiveEntries < 0)
-	neg("requests_per_second", l.RequestsPerSecond < 0)
+	neg("max_artifact_bytes", l.MaxArtifactBytes < 0)
 	neg("burst", l.Burst < 0)
-	neg("upstream_fetches_per_second", l.UpstreamFetchesPerSecond < 0)
+	rate := func(name string, v float64) {
+		if !(v > 0) || math.IsInf(v, 0) {
+			errs = append(errs, fmt.Errorf("limits.%s must be a positive number", name))
+		}
+	}
+	rate("requests_per_second", l.RequestsPerSecond)
+	rate("upstream_fetches_per_second", l.UpstreamFetchesPerSecond)
 	return errs
 }
 
@@ -184,9 +204,10 @@ func normPrefix(p string) string {
 	return p + "/"
 }
 
-func validateSources(eco string, sources []Source, stores map[string]StoreConfig) []error {
+func validateSources(eco string, sources []Source, stores map[string]StoreConfig, opts ValidateOptions) []error {
 	var errs []error
 	seen := map[string]bool{}
+	claimedBy := map[string]string{} // claim -> first source with it
 	unclaimed := 0
 	for _, s := range sources {
 		add := func(format string, a ...any) {
@@ -194,6 +215,8 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		}
 		if s.Name == "" {
 			errs = append(errs, fmt.Errorf("%s: source name is required", eco))
+		} else if !sourceNameRe.MatchString(s.Name) {
+			add("invalid source name (use [a-z0-9._-], starting with a letter or digit)")
 		} else if seen[s.Name] {
 			add("duplicate source name")
 		}
@@ -201,6 +224,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		for _, c := range s.Claims {
 			if !validClaim(c) {
 				add(`invalid claim %q (use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-])`, c)
+			}
+			if first, ok := claimedBy[c]; ok && s.Type == "storage" && first != s.Name {
+				add("claim %q is already claimed by source %q; uploads would never be served", c, first)
+			} else if !ok {
+				claimedBy[c] = s.Name
 			}
 		}
 
@@ -227,9 +255,10 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			}
 			ssh := false
 			for _, r := range s.Remotes {
-				switch kind := remoteKind(r); kind {
+				switch kind := remoteKind(r, opts.AllowFileRemotes); kind {
 				case "ssh":
 					ssh = true
+				case "file":
 				case "https":
 					if u, err := url.Parse(r); err == nil && u.User != nil {
 						add("remote must not contain credentials; use token")
@@ -255,11 +284,18 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			if u, err := url.Parse(s.URL); s.URL != "" && (err != nil || u.Host == "") {
 				add("url %q is not a valid URL", s.URL)
 			} else if s.URL != "" {
+				if u.Scheme != "https" && !(u.Scheme == "http" && opts.AllowHTTPUpstreams) {
+					add("url %q must use https", s.URL)
+				}
 				if !hostAllowed(s.FetchHosts, u) {
 					add("url host %q is not in fetch_hosts", u.Host)
 				}
-				if _, dup := s.DownloadCredentials[u.Host]; dup && s.Credentials != nil {
-					add("host %q has both credentials and download_credentials", u.Host)
+				if s.Credentials != nil {
+					for host := range s.DownloadCredentials {
+						if credHost(host) == credHost(u.Host) {
+							add("host %q has both credentials and download_credentials", u.Host)
+						}
+					}
 				}
 			}
 			for host := range s.DownloadCredentials {
@@ -277,11 +313,21 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 	return errs
 }
 
+// sourceNameRe keeps source names safe as storage key segments, file names
+// and URL path segments.
+var sourceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
 var claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
 
 // validClaim accepts "*" or exactly two lowercase segments, so a claim can
 // never be a pattern that matches no Composer name or uses path.Match classes.
 func validClaim(c string) bool { return c == "*" || claimRe.MatchString(c) }
+
+// credHost normalises a credential host for comparison: lowercase, with the
+// https default port dropped.
+func credHost(h string) string {
+	return strings.TrimSuffix(strings.ToLower(h), ":443")
+}
 
 // hostAllowed mirrors the upstream allowlist: an entry matches the URL's
 // hostname case-insensitively, and an entry with a port also needs that port.
@@ -295,13 +341,16 @@ func hostAllowed(hosts []string, u *url.URL) bool {
 }
 
 // remoteKind classifies a git remote as "https", "ssh" (ssh:// or scp-style
-// user@host:path) or "" for anything else.
-func remoteKind(r string) string {
+// user@host:path), "file" (only with allowFile: an absolute path or file://)
+// or "" for anything else.
+func remoteKind(r string, allowFile bool) string {
 	switch {
 	case strings.HasPrefix(r, "https://"):
 		return "https"
 	case strings.HasPrefix(r, "ssh://"):
 		return "ssh"
+	case allowFile && (strings.HasPrefix(r, "file://") || strings.HasPrefix(r, "/")):
+		return "file"
 	case strings.Contains(r, "://"):
 		return ""
 	}
@@ -311,6 +360,6 @@ func remoteKind(r string) string {
 	return ""
 }
 
-// scpRe matches scp-style [user@]host:path; the host is plain hostname
+// scpRe matches scp-style [user@]host:path; user and host are plain
 // characters, never starting with "-", and "::" (transport helpers) is out.
-var scpRe = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)
+var scpRe = regexp.MustCompile(`^(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^:]`)

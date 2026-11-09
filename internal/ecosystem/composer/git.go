@@ -78,8 +78,8 @@ type GitSource struct {
 
 	mu     sync.Mutex // serialises Index; guards the fields below
 	prev   []remoteResult
-	loaded map[string]loaded // by commit; archives are immutable
-	prov   map[string]bool   // commit + version pairs whose provenance is stored
+	loaded map[string]loaded // by commit; archives are immutable; pruned to the index after each pass
+	prov   map[string]bool   // commit + version pairs whose provenance is stored; pruned likewise
 
 	idx atomic.Pointer[gitIndex]
 }
@@ -132,7 +132,6 @@ func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.M
 
 func (g *GitSource) Name() string     { return g.name }
 func (g *GitSource) Claims() []string { return g.claims }
-func (g *GitSource) Type() string     { return "git" }
 
 func archiveKey(source, commit string) string {
 	return "composer-git/" + source + "/" + commit + ".zip"
@@ -157,38 +156,153 @@ func archiveMetaKey(source, commit string) string {
 }
 
 // Index runs one sync-and-index pass over all mirrors. A remote whose sync or
-// indexing fails keeps its previous entries. Problems with single remotes or
-// versions are logged; only a cancelled context is returned.
+// indexing fails keeps its previous entries. A remote without previous entries
+// (this process never indexed it) is indexed from its local mirror when the
+// sync fails, and from its pins and their archive sidecars when that fails too
+// or the default branch is unusable, so versions already served survive an
+// unreachable remote at startup; it is marked failing either way. Problems
+// with single remotes or versions are logged; only a cancelled context is
+// returned.
 func (g *GitSource) Index(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for i, m := range g.mirrors {
-		if err := m.Sync(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			g.log.Warn("composer git sync failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
-			continue
+		syncErr := m.Sync(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		metrics.SetGitLastSync(g.name, m.Remote(), m.LastSync())
+		if syncErr != nil {
+			if g.prev[i].ok {
+				g.log.Warn("composer git sync failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", syncErr)
+				g.setFailing(i)
+				continue
+			}
+			g.log.Warn("composer git sync failed; indexing the local mirror", "source", g.name, "remote", m.Remote(), "error", syncErr)
+		}
 		res, err := g.indexRemote(ctx, m)
+		degraded := syncErr != nil
+		if err != nil && !g.prev[i].ok && ctx.Err() == nil {
+			res, err = g.fallbackToPins(ctx, m, err)
+			degraded = true
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if err != nil {
 			g.log.Error("composer git: indexing failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
-			g.hmu.Lock()
-			g.failing[i] = true
-			g.hmu.Unlock()
+			g.setFailing(i)
 			continue
 		}
 		g.prev[i] = res
 		g.hmu.Lock()
-		g.indexed[i], g.failing[i], g.pkgOf[i] = res.ok, false, res.pkg
+		g.indexed[i], g.failing[i], g.pkgOf[i] = res.ok, degraded, res.pkg
 		g.hmu.Unlock()
 	}
 	g.idx.Store(g.assemble())
+	g.prune()
+	metrics.SetGitLastSync(g.name, g.oldestSync())
 	return nil
+}
+
+// prune drops loaded and prov entries the current index no longer references.
+func (g *GitSource) prune() {
+	commits, pairs := map[string]bool{}, map[string]bool{}
+	for _, r := range g.prev {
+		for _, v := range r.versions {
+			commits[v.Reference] = true
+			pairs[v.Reference+"\x00"+v.Version] = true
+		}
+	}
+	maps.DeleteFunc(g.loaded, func(c string, _ loaded) bool { return !commits[c] })
+	maps.DeleteFunc(g.prov, func(k string, _ bool) bool { return !pairs[k] })
+}
+
+func (g *GitSource) setFailing(i int) {
+	g.hmu.Lock()
+	g.failing[i] = true
+	g.hmu.Unlock()
+}
+
+// fallbackToPins indexes a remote from its pins alone: every pinned tag whose
+// archive sidecar is stored, under the package name those sidecars declare
+// (they must all agree). cause is why the remote itself could not be indexed.
+func (g *GitSource) fallbackToPins(ctx context.Context, m *gitmirror.Mirror, cause error) (remoteResult, error) {
+	remote := m.Remote()
+	pinned, corrupt, err := g.pins.List(ctx, "composer", g.name, remote)
+	if err != nil {
+		return remoteResult{}, fmt.Errorf("%w; listing pins: %v", cause, err)
+	}
+	for _, cerr := range corrupt {
+		g.log.Error("composer git: unreadable pin ignored", "source", g.name, "remote", remote, "error", cerr)
+	}
+	type pinnedVersion struct {
+		tag, normalized, commit string
+		l                       loaded
+	}
+	var found []pinnedVersion
+	pkg := ""
+	for _, p := range pinned {
+		normalized, err := NormalizeVersion(p.Tag)
+		if err != nil || strings.HasPrefix(normalized, "dev-") || strings.HasSuffix(normalized, "-dev") {
+			continue
+		}
+		l, err := g.readMeta(ctx, archiveMetaKey(g.name, p.SHA))
+		if err != nil {
+			g.skip(ctx, "composer git: pinned tag without a usable archive skipped", "source", g.name, "remote", remote, "tag", p.Tag, "error", err)
+			continue
+		}
+		n, err := Normalize(strOf(l.meta["name"]))
+		if err != nil {
+			g.skip(ctx, "composer git: pinned tag without a package name skipped", "source", g.name, "remote", remote, "tag", p.Tag)
+			continue
+		}
+		if pkg != "" && n != pkg {
+			return remoteResult{}, fmt.Errorf("%w; pinned tags declare both %q and %q", cause, pkg, n)
+		}
+		pkg = n
+		found = append(found, pinnedVersion{p.Tag, normalized, p.SHA, l})
+	}
+	if pkg == "" {
+		return remoteResult{}, fmt.Errorf("%w; no pinned version to fall back to", cause)
+	}
+	if !g.claimsName(pkg) {
+		return remoteResult{ok: true}, nil
+	}
+	g.log.Warn("composer git: serving pinned versions only", "source", g.name, "remote", remote, "package", pkg, "cause", cause)
+	res := remoteResult{ok: true, pkg: pkg}
+	seen := map[string]bool{}
+	for _, f := range found {
+		if seen[f.normalized] {
+			continue
+		}
+		if err := g.recordProvenance(ctx, m, pkg, f.tag, f.commit, f.l.d); err != nil {
+			g.skip(ctx, "composer git: version skipped", "source", g.name, "remote", remote, "version", f.tag, "commit", f.commit, "error", err)
+			continue
+		}
+		seen[f.normalized] = true
+		res.versions = append(res.versions, Version{
+			Package:   packageEntry(f.l.meta, pkg, f.tag, f.normalized, f.commit, f.l.d.sha1),
+			Version:   f.tag,
+			Reference: f.commit,
+		})
+	}
+	sortVersions(res.versions)
+	return res, ctx.Err()
+}
+
+// oldestSync is the earliest last sync among the mirrors, zero if one never synced.
+func (g *GitSource) oldestSync() time.Time {
+	var oldest time.Time
+	for i, m := range g.mirrors {
+		t := m.LastSync()
+		if t.IsZero() {
+			return time.Time{}
+		}
+		if i == 0 || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return oldest
 }
 
 // assemble merges the per-remote results; a name claimed by two remotes is
@@ -363,13 +477,23 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 			g.skip(ctx, "composer git: branch skipped", "source", g.name, "remote", remote, "branch", r.Short, "error", err)
 			continue
 		}
+		n := len(res.versions)
 		add(version, normalized, r.Commit, l, true)
+		if r.Short == def && len(res.versions) > n {
+			res.versions[n].Package["default-branch"] = true
+		}
 	}
 	if ctx.Err() != nil {
 		return remoteResult{}, ctx.Err()
 	}
 
-	slices.SortStableFunc(res.versions, func(a, b Version) int {
+	sortVersions(res.versions)
+	return res, nil
+}
+
+// sortVersions orders tags highest first, then dev versions.
+func sortVersions(vs []Version) {
+	slices.SortStableFunc(vs, func(a, b Version) int {
 		if a.Dev != b.Dev {
 			if a.Dev {
 				return 1
@@ -382,7 +506,6 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 		}
 		return compareNormalized(bn, an)
 	})
-	return res, nil
 }
 
 func strOf(v any) string { s, _ := v.(string); return s }
@@ -578,15 +701,15 @@ func (g *GitSource) readStored(ctx context.Context, key string, max int64) ([]by
 	return data, nil
 }
 
-// Health reports one entry per remote: OK once indexed and synced within
-// three poll intervals. Package-name conflicts are a separate, not-OK entry.
+// Health reports one entry per remote, scoped to the package the remote
+// declares: OK once indexed and synced within three poll intervals. Package-name conflicts are a separate, not-OK entry.
 func (g *GitSource) Health(context.Context) []metrics.Health {
 	g.hmu.RLock()
-	indexed, failing := slices.Clone(g.indexed), slices.Clone(g.failing)
+	indexed, failing, pkgOf := slices.Clone(g.indexed), slices.Clone(g.failing), slices.Clone(g.pkgOf)
 	g.hmu.RUnlock()
 	var out []metrics.Health
 	for i, m := range g.mirrors {
-		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote())}
+		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Scoped: true, Package: pkgOf[i]}
 		last := m.LastSync()
 		switch {
 		case !indexed[i]:
@@ -646,15 +769,9 @@ func (g *GitSource) lookup(pkg string) ([]Version, error) {
 	return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
 }
 
-func (g *GitSource) Packages(context.Context) ([]string, bool, error) {
-	pkgs := g.idx.Load().pkgs
-	names := slices.Sorted(maps.Keys(pkgs))
-	return names, true, nil
-}
-
-// Versions returns the indexed versions of name: tags highest first, then dev
-// branches. The returned metadata is a copy the caller may modify.
-func (g *GitSource) Versions(_ context.Context, name string) ([]Version, error) {
+// Versions returns the indexed tags (highest first) or, with dev, the indexed
+// dev branches of name. The returned metadata is a copy the caller may modify.
+func (g *GitSource) Versions(_ context.Context, name string, dev bool) ([]Version, error) {
 	pkg, err := Normalize(name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
@@ -663,12 +780,15 @@ func (g *GitSource) Versions(_ context.Context, name string) ([]Version, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Version, len(vs))
-	for i, v := range vs {
+	out := []Version{}
+	for _, v := range vs {
+		if v.Dev != dev {
+			continue
+		}
 		p := maps.Clone(v.Package)
 		p["dist"] = maps.Clone(p["dist"].(map[string]any))
 		v.Package = p
-		out[i] = v
+		out = append(out, v)
 	}
 	return out, nil
 }
@@ -713,6 +833,5 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 		rc.Close()
 		return Artifact{}, fmt.Errorf("composer git: stored archive of %s %s is %d bytes, expected %d", name, version, info.Size, l.size)
 	}
-	dist, _ := found.Package["dist"].(map[string]any)
-	return Artifact{Body: rc, Size: info.Size, SHA1: strOf(dist["shasum"])}, nil
+	return Artifact{Body: rc, Size: info.Size}, nil
 }

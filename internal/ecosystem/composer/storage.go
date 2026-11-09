@@ -61,6 +61,7 @@ type StorageSource struct {
 	d         storage.Driver
 	rec       *records.Store
 	limits    archive.Limits
+	log       *slog.Logger
 	rebuilds  singleflight.Group // per package: concurrent readers share one rebuild
 	unhealthy atomic.Bool        // last Health probe failed; logs only on change
 	locks     sync.Map           // "<pkg>@<normalized>" -> *sync.Mutex; serialises uploads of one version (entries are tiny and never freed)
@@ -75,13 +76,15 @@ var errCorruptIndex = errors.New("composer: corrupt index")
 
 var _ Source = (*StorageSource)(nil)
 
-func NewStorageSource(name string, claims []string, d storage.Driver, rec *records.Store, l archive.Limits) *StorageSource {
-	return &StorageSource{name: name, claims: claims, d: d, rec: rec, limits: l}
+func NewStorageSource(name string, claims []string, d storage.Driver, rec *records.Store, l archive.Limits, log *slog.Logger) *StorageSource {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &StorageSource{name: name, claims: claims, d: d, rec: rec, limits: l, log: log}
 }
 
 func (s *StorageSource) Name() string     { return s.name }
 func (s *StorageSource) Claims() []string { return s.claims }
-func (s *StorageSource) Type() string     { return "storage" }
 
 type index struct {
 	Versions []Version `json:"versions"`
@@ -440,18 +443,6 @@ func prettyVersion(normalized string) string {
 	return v
 }
 
-// Rebuild rewrites the package index from the stored zips. Archives that
-// cannot be read are left out and reported in the returned error (the index is
-// still written); it wraps resolve.ErrNotFound when there are no archives.
-func (s *StorageSource) Rebuild(ctx context.Context, name string) error {
-	pkg, err := Normalize(name)
-	if err != nil {
-		return fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
-	}
-	_, err = s.rebuild(ctx, pkg, true)
-	return err
-}
-
 type rebuilt struct {
 	vs  []Version
 	err error // skipped archives
@@ -459,19 +450,21 @@ type rebuilt struct {
 
 const rebuildTimeout = 2 * time.Minute
 
-// rebuild is shared per package: concurrent callers wait for one rebuild. It
-// runs detached from the first caller's context (bounded by rebuildTimeout) so
-// that caller giving up does not fail the others; each caller still stops
-// waiting when its own ctx ends. Unless force is set, an index that appeared
-// in the meantime is used as is.
-func (s *StorageSource) rebuild(ctx context.Context, pkg string, force bool) ([]Version, error) {
+// rebuild rewrites the package index from the stored zips, unless an index
+// appeared in the meantime, which is used as is. Archives that cannot be read
+// are left out and reported in the returned error (the index is still
+// written); it wraps resolve.ErrNotFound when there are no archives.
+//
+// It is shared per package: concurrent callers wait for one rebuild. It runs
+// detached from the first caller's context (bounded by rebuildTimeout) so that
+// caller giving up does not fail the others; each caller still stops waiting
+// when its own ctx ends.
+func (s *StorageSource) rebuild(ctx context.Context, pkg string) ([]Version, error) {
 	ch := s.rebuilds.DoChan(pkg, func() (any, error) {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rebuildTimeout)
 		defer cancel()
-		if !force {
-			if vs, _, err := s.loadIndex(rctx, pkg); err == nil {
-				return rebuilt{vs: vs}, nil
-			}
+		if vs, _, err := s.loadIndex(rctx, pkg); err == nil {
+			return rebuilt{vs: vs}, nil
 		}
 		vs, skipped, err := s.doRebuild(rctx, pkg)
 		return rebuilt{vs: vs, err: errors.Join(skipped...)}, err
@@ -519,16 +512,25 @@ func (s *StorageSource) doRebuild(ctx context.Context, pkg string) ([]Version, [
 }
 
 // Versions returns the stored versions of name, highest first (see
-// compareNormalized). A missing or corrupt index is rebuilt from the zips; an
-// unknown name costs one Get of index.json plus one List.
-func (s *StorageSource) Versions(ctx context.Context, name string) ([]Version, error) {
+// compareNormalized). Uploads are never dev versions, so dev=true yields an
+// empty list for a known name. A missing or corrupt index is rebuilt from the
+// zips; an unknown name costs one Get of index.json plus one List.
+func (s *StorageSource) Versions(ctx context.Context, name string, dev bool) ([]Version, error) {
+	vs, err := s.versions(ctx, name)
+	if err != nil || !dev {
+		return vs, err
+	}
+	return []Version{}, nil
+}
+
+func (s *StorageSource) versions(ctx context.Context, name string) ([]Version, error) {
 	pkg, err := Normalize(name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
 	vs, _, err := s.loadIndex(ctx, pkg)
 	if errors.Is(err, storage.ErrNotFound) || errors.Is(err, errCorruptIndex) {
-		vs, err = s.rebuild(ctx, pkg, false)
+		vs, err = s.rebuild(ctx, pkg)
 		if len(vs) > 0 { // skipped archives are not fatal here
 			err = nil
 		}
@@ -550,12 +552,11 @@ func (s *StorageSource) Dist(ctx context.Context, name, version, reference strin
 	if err != nil {
 		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	vs, err := s.Versions(ctx, name)
+	vs, err := s.versions(ctx, name)
 	if err != nil {
 		return Artifact{}, err
 	}
-	i := slices.IndexFunc(vs, func(v Version) bool { return normalizedOf(v) == normalized && v.Reference == reference })
-	if i < 0 {
+	if !slices.ContainsFunc(vs, func(v Version) bool { return normalizedOf(v) == normalized && v.Reference == reference }) {
 		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, name, version)
 	}
 	pkg, _ := Normalize(name)
@@ -566,30 +567,7 @@ func (s *StorageSource) Dist(ctx context.Context, name, version, reference strin
 	if err != nil {
 		return Artifact{}, err
 	}
-	dist, _ := vs[i].Package["dist"].(map[string]any)
-	shasum, _ := dist["shasum"].(string)
-	return Artifact{Body: rc, Size: info.Size, SHA1: shasum}, nil
-}
-
-// Packages lists every stored package name; storage is always enumerable. It
-// lists the whole composer/ prefix, which is acceptable because it only backs
-// packages.json.
-func (s *StorageSource) Packages(ctx context.Context) ([]string, bool, error) {
-	seen := map[string]bool{}
-	for info, err := range s.d.List(ctx, "composer/") {
-		if err != nil {
-			return nil, false, err
-		}
-		if p := strings.Split(info.Key, "/"); len(p) == 4 {
-			seen[p[1]+"/"+p[2]] = true
-		}
-	}
-	names := make([]string, 0, len(seen))
-	for n := range seen {
-		names = append(names, n)
-	}
-	slices.Sort(names)
-	return names, true, nil
+	return Artifact{Body: rc, Size: info.Size}, nil
 }
 
 // probeKey is stat-ed to check the store is reachable; it never exists.
@@ -602,7 +580,7 @@ func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		h.OK, h.Detail = false, "unreachable"
 		if s.unhealthy.CompareAndSwap(false, true) {
-			slog.Warn("composer storage source unreachable", "source", s.name, "error", err)
+			s.log.Warn("composer storage source unreachable", "source", s.name, "error", err)
 		}
 	} else {
 		s.unhealthy.Store(false)

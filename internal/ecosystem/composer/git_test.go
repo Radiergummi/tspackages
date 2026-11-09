@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,7 +110,7 @@ func TestIndexTagsAndDefaultBranch(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	vs, err := g.Versions(context.Background(), "matchory/a")
+	vs, err := allVersions(context.Background(), g, "matchory/a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,10 +130,6 @@ func TestIndexTagsAndDefaultBranch(t *testing.T) {
 			t.Errorf("dist: %v", dist)
 		}
 	}
-	names, enum, err := g.Packages(context.Background())
-	if err != nil || !enum || !slices.Equal(names, []string{"matchory/a"}) {
-		t.Fatalf("Packages = %v %v %v", names, enum, err)
-	}
 }
 
 func TestBranchAllowlist(t *testing.T) {
@@ -143,7 +140,7 @@ func TestBranchAllowlist(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(context.Background(), "matchory/a")
+	vs, _ := allVersions(context.Background(), g, "matchory/a")
 	if got := versionNames(vs); !slices.Equal(got, []string{"dev-release/1"}) {
 		t.Fatalf("versions = %v", got)
 	}
@@ -163,7 +160,7 @@ func TestTagPinnedAfterForcePush(t *testing.T) {
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(ctx, "matchory/a")
+	vs, _ := allVersions(ctx, g, "matchory/a")
 	var seen bool
 	for _, v := range vs {
 		if v.Version == "v1.0.0" {
@@ -193,7 +190,7 @@ func TestArchiveStableAcrossRebuilds(t *testing.T) {
 		if err := g.Index(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		vs, _ := g.Versions(context.Background(), "matchory/a")
+		vs, _ := allVersions(context.Background(), g, "matchory/a")
 		for _, v := range vs {
 			if v.Version == "v1.0.0" {
 				return v.Package["dist"].(map[string]any)["shasum"].(string)
@@ -221,7 +218,7 @@ func TestProvenanceRecorded(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(context.Background(), "matchory/a")
+	vs, _ := allVersions(context.Background(), g, "matchory/a")
 	var v Version
 	for _, x := range vs {
 		if x.Version == "v1.0.0" {
@@ -232,8 +229,9 @@ func TestProvenanceRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, _ := io.ReadAll(art.Body)
 	art.Body.Close()
-	if art.SHA1 != v.Package["dist"].(map[string]any)["shasum"] || art.Size == 0 {
+	if fmt.Sprintf("%x", sha1.Sum(body)) != v.Package["dist"].(map[string]any)["shasum"] || art.Size != int64(len(body)) {
 		t.Fatalf("artifact = %+v", art)
 	}
 	var found bool
@@ -256,13 +254,13 @@ func TestDuplicatePackageName(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.Versions(context.Background(), "matchory/a"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(context.Background(), g, "matchory/a"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("err = %v", err)
 	}
 	if _, err := g.Dist(context.Background(), "matchory/a", "v1.0.0", strings.Repeat("a", 40)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Dist err = %v", err)
 	}
-	if _, err := g.Versions(context.Background(), "matchory/c"); err != nil {
+	if _, err := allVersions(context.Background(), g, "matchory/c"); err != nil {
 		t.Fatal(err)
 	}
 	cs := g.Conflicts()
@@ -281,7 +279,7 @@ func TestTagWithMismatchedName(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(context.Background(), "matchory/a")
+	vs, _ := allVersions(context.Background(), g, "matchory/a")
 	if got := versionNames(vs); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
 		t.Fatalf("versions = %v", got)
 	}
@@ -295,7 +293,7 @@ func TestDistUnknownReference(t *testing.T) {
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(ctx, "matchory/a")
+	vs, _ := allVersions(ctx, g, "matchory/a")
 	good := vs[0].Reference
 	for _, tc := range []struct{ name, version, ref string }{
 		{"matchory/a", "v1.0.0", strings.Repeat("a", 40)},
@@ -317,7 +315,7 @@ func TestOversizeArchiveSkipped(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.Versions(context.Background(), "matchory/a"); !errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(context.Background(), g, "matchory/a"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -330,7 +328,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 	go func() { g.Run(ctx); close(done) }()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := g.Versions(ctx, "matchory/a"); err == nil {
+		if _, err := allVersions(ctx, g, "matchory/a"); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -348,7 +346,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 
 func versionsOf(t *testing.T, g *GitSource, name string) map[string]Version {
 	t.Helper()
-	vs, err := g.Versions(context.Background(), name)
+	vs, err := allVersions(context.Background(), g, name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +368,7 @@ func TestDevLookingTagsSkipped(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	vs, _ := g.Versions(context.Background(), "matchory/a")
+	vs, _ := allVersions(context.Background(), g, "matchory/a")
 	if len(vs) != 1 || vs[0].Version != "dev-main" || !vs[0].Dev {
 		t.Fatalf("versions = %+v", versionNames(vs))
 	}
@@ -413,7 +411,7 @@ func TestConflictStaysWithheldWhenOneSideFails(t *testing.T) {
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.Versions(ctx, "matchory/a"); !errors.Is(err, ErrUnavailable) {
+	if _, err := allVersions(ctx, g, "matchory/a"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
 	}
 	if len(g.Conflicts()) != 1 {
@@ -427,7 +425,7 @@ func TestUnavailableBeforeFirstPassAndForNeverIndexedRemote(t *testing.T) {
 	commitFile(t, bad, "composer.json", `{broken`, "break")
 	g, _ := newGit(t, fsState(t), nil, good, bad)
 	ctx := context.Background()
-	if _, err := g.Versions(ctx, "matchory/a"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(ctx, g, "matchory/a"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("before first pass: %v", err)
 	}
 	if _, err := g.Dist(ctx, "matchory/a", "v1.0.0", strings.Repeat("a", 40)); !errors.Is(err, ErrUnavailable) {
@@ -436,13 +434,13 @@ func TestUnavailableBeforeFirstPassAndForNeverIndexedRemote(t *testing.T) {
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.Versions(ctx, "matchory/a"); err != nil {
+	if _, err := allVersions(ctx, g, "matchory/a"); err != nil {
 		t.Fatalf("healthy remote: %v", err)
 	}
-	if _, err := g.Versions(ctx, "matchory/b"); !errors.Is(err, ErrUnavailable) {
+	if _, err := allVersions(ctx, g, "matchory/b"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("never-indexed remote: %v", err)
 	}
-	if _, err := g.Versions(ctx, "other/x"); !errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(ctx, g, "other/x"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("unclaimed name: %v", err)
 	}
 }
@@ -543,8 +541,8 @@ func TestStoredArchiveIsReadBackNotRebuilt(t *testing.T) {
 	}
 	defer art.Body.Close()
 	body, _ := io.ReadAll(art.Body)
-	if !bytes.Equal(body, junk) || art.SHA1 != want {
-		t.Fatalf("Dist served %d bytes, sha1 %s", len(body), art.SHA1)
+	if !bytes.Equal(body, junk) {
+		t.Fatalf("Dist served %d bytes", len(body))
 	}
 }
 
@@ -580,11 +578,10 @@ func TestClaimsFilterIndexedPackages(t *testing.T) {
 	if err := g.Index(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	names, _, _ := g.Packages(context.Background())
-	if !slices.Equal(names, []string{"matchory/a"}) {
-		t.Fatalf("packages = %v", names)
+	if _, err := g.Versions(context.Background(), "matchory/a", false); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := g.Versions(context.Background(), "other/b"); !errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(context.Background(), g, "other/b"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -636,7 +633,7 @@ func TestBeforeFirstPassIsUnavailable(t *testing.T) {
 	if err := g.Index(ctx); err == nil {
 		t.Fatal("want ctx error")
 	}
-	if _, err := g.Versions(context.Background(), "matchory/a"); !errors.Is(err, ErrUnavailable) {
+	if _, err := allVersions(context.Background(), g, "matchory/a"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -648,16 +645,16 @@ func TestUnclaimedSourceNotFoundWhilePending(t *testing.T) {
 	g, _ := newGit(t, fsState(t), nil, good, bad)
 	g.claims = nil
 	ctx := context.Background()
-	if _, err := g.Versions(ctx, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(ctx, g, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("before first pass: %v", err)
 	}
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.Versions(ctx, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
+	if _, err := allVersions(ctx, g, "any/thing"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("pending remote: %v", err)
 	}
-	if _, err := g.Versions(ctx, "matchory/a"); err != nil {
+	if _, err := allVersions(ctx, g, "matchory/a"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -772,5 +769,175 @@ func TestFirstSightPinLostRaceLogsMove(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "tag moved upstream") || len(ps.Moved()) != 1 {
 		t.Fatalf("moved = %v, logs:\n%s", ps.Moved(), logs.String())
+	}
+}
+
+// allVersions is the stable versions of name followed by its dev versions.
+func allVersions(ctx context.Context, g *GitSource, name string) ([]Version, error) {
+	vs, err := g.Versions(ctx, name, false)
+	if err != nil {
+		return nil, err
+	}
+	dev, err := g.Versions(ctx, name, true)
+	return append(vs, dev...), err
+}
+
+func TestVersionsSplitByDevAndDefaultBranchFlag(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	runGit(t, src, "branch", "feature")
+	g, _ := newGit(t, fsState(t), []string{"main", "feature"}, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stable, err := g.Versions(ctx, "matchory/a", false)
+	if err != nil || !slices.Equal(versionNames(stable), []string{"v1.0.0"}) {
+		t.Fatalf("stable = %v, %v", versionNames(stable), err)
+	}
+	if _, ok := stable[0].Package["default-branch"]; ok {
+		t.Error("tag carries default-branch")
+	}
+	dev, err := g.Versions(ctx, "matchory/a", true)
+	if err != nil || !slices.Equal(versionNames(dev), []string{"dev-feature", "dev-main"}) {
+		t.Fatalf("dev = %v, %v", versionNames(dev), err)
+	}
+	for _, v := range dev {
+		db, ok := v.Package["default-branch"]
+		if (v.Version == "dev-main") != ok || (ok && db != true) {
+			t.Errorf("%s: default-branch = %v (%v)", v.Version, db, ok)
+		}
+	}
+}
+
+// moveAway makes a local remote unreachable without changing its URL.
+func moveAway(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Rename(dir, dir+".gone"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir + ".gone") })
+}
+
+func TestServedVersionsSurviveUnreachableRemoteAtStartup(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	base, d := t.TempDir(), fsState(t)
+	g1, _ := newGitIn(t, base, d, nil, src)
+	ctx := context.Background()
+	if err := g1.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	moveAway(t, src)
+
+	// The local mirror survives: index from it, dev branch included.
+	g2, _ := newGitIn(t, base, d, nil, src)
+	if err := g2.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := versionNames(mustVersions(t, g2, "matchory/a")); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
+		t.Fatalf("from mirror: %v", got)
+	}
+	if h := g2.Health(ctx); h[0].OK {
+		t.Errorf("unreachable remote reported OK: %+v", h[0])
+	}
+
+	// No mirror at all: the pinned tags are served from their sidecars.
+	g3, _ := newGit(t, d, nil, src)
+	if err := g3.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	vs := mustVersions(t, g3, "matchory/a")
+	if got := versionNames(vs); !slices.Equal(got, []string{"v1.0.0"}) {
+		t.Fatalf("from pins: %v", got)
+	}
+	if vs[0].Reference != versionsOf(t, g1, "matchory/a")["v1.0.0"].Reference || shasumOf(vs[0]) != shasumOf(versionsOf(t, g1, "matchory/a")["v1.0.0"]) {
+		t.Errorf("pinned version differs: %+v", vs[0])
+	}
+	art, err := g3.Dist(ctx, "matchory/a", "v1.0.0", vs[0].Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	art.Body.Close()
+	if h := g3.Health(ctx); h[0].OK || h[0].Package != "matchory/a" {
+		t.Errorf("health: %+v", h[0])
+	}
+}
+
+func TestBrokenDefaultBranchFallsBackToPins(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	d := fsState(t)
+	ctx := context.Background()
+	g1, _ := newGit(t, d, nil, src)
+	if err := g1.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	commitFile(t, src, "composer.json", `{broken`, "break")
+	g2, _ := newGit(t, d, nil, src)
+	if err := g2.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := versionNames(mustVersions(t, g2, "matchory/a")); !slices.Equal(got, []string{"v1.0.0"}) {
+		t.Fatalf("versions = %v", got)
+	}
+}
+
+func TestPinFallbackSkipsDisagreeingNames(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	runGit(t, src, "tag", "v1.0.0")
+	d := fsState(t)
+	ctx := context.Background()
+	g1, _ := newGit(t, d, nil, src)
+	if err := g1.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The repository renames its package; v2.0.0 is pinned under the new name.
+	commitFile(t, src, "composer.json", `{"name":"matchory/b"}`, "rename")
+	runGit(t, src, "tag", "v2.0.0")
+	if err := g1.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	moveAway(t, src)
+	g2, _ := newGit(t, d, nil, src)
+	if err := g2.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"matchory/a", "matchory/b"} {
+		if _, err := g2.Versions(ctx, n, false); err == nil {
+			t.Errorf("%s served despite disagreeing pins", n)
+		}
+	}
+}
+
+func mustVersions(t *testing.T, g *GitSource, name string) []Version {
+	t.Helper()
+	vs, err := allVersions(context.Background(), g, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vs
+}
+
+func TestLoadedAndProvenanceCachesPruned(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	old := runGit(t, src, "rev-parse", "HEAD")
+	g, _ := newGit(t, fsState(t), nil, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.loaded[old]; !ok {
+		t.Fatal("first pass did not load the head")
+	}
+	head := commitFile(t, src, "README", "x", "two")
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.loaded[old]; ok || len(g.loaded) != 1 {
+		t.Errorf("loaded not pruned: %v", slices.Collect(maps.Keys(g.loaded)))
+	}
+	if len(g.prov) != 1 || !g.prov[head+"\x00dev-main"] {
+		t.Errorf("prov not pruned: %v", g.prov)
 	}
 }

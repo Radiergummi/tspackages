@@ -10,7 +10,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/radiergummi/tspackages/internal/authz"
@@ -25,9 +24,6 @@ type (
 	Health       = metrics.Health
 	StatusSource = metrics.StatusSource
 )
-
-// Registry is the Prometheus registry served at /metrics.
-func Registry() *prometheus.Registry { return metrics.Registry() }
 
 //go:embed status.html
 var statusHTML string
@@ -69,14 +65,26 @@ func (w *Web) Mount(mux *http.ServeMux) {
 		rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = rw.Write([]byte("ok"))
 	}))
-	mux.HandleFunc("GET /readyz", w.requireCaller(w.readyz))
+	mux.HandleFunc("GET /readyz", w.requireRule(w.readyz))
 	metricsHandler := promhttp.HandlerFor(metrics.Registry(), promhttp.HandlerOpts{})
-	mux.HandleFunc("GET /metrics", w.requireCaller(metricsHandler.ServeHTTP))
+	mux.HandleFunc("GET /metrics", w.requireRule(metricsHandler.ServeHTTP))
 }
 
+// requireCaller admits any request with a tailnet identity.
 func (w *Web) requireCaller(h http.HandlerFunc) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
 		if _, ok := identity.FromContext(r.Context()); !ok {
+			http.Error(rw, "forbidden", http.StatusForbidden)
+			return
+		}
+		h(rw, r)
+	}
+}
+
+// requireRule admits only callers with at least one capability rule.
+func (w *Web) requireRule(h http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		if c, ok := identity.FromContext(r.Context()); !ok || !hasAnyRule(c.Rules) {
 			http.Error(rw, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -91,7 +99,10 @@ func (w *Web) readyz(rw http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		if err := w.ready(ctx); err != nil {
 			category := "unavailable"
-			if ctx.Err() != nil {
+			switch {
+			case r.Context().Err() != nil:
+				category = "cancelled"
+			case ctx.Err() != nil:
 				category = "timeout"
 			}
 			slog.Warn("not ready", "category", category, "error", err)
@@ -132,11 +143,15 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 	sort.Strings(d.Ecosystems)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	for _, s := range w.sources {
-		d.Health = append(d.Health, s.Health(ctx)...)
-	}
 	allowed := func(pkg string) bool {
 		return authz.Allowed(caller.Rules, "composer", pkg, authz.Read, composer.Match)
+	}
+	for _, s := range w.sources {
+		for _, h := range s.Health(ctx) {
+			if !h.Scoped || (h.Package != "" && allowed(h.Package)) {
+				d.Health = append(d.Health, h)
+			}
+		}
 	}
 	if w.moved != nil && w.movedPkg != nil {
 		for _, m := range w.moved() {
