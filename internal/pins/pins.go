@@ -51,7 +51,7 @@ func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha str
 	if !shaRE.MatchString(sha) {
 		return "", false, fmt.Errorf("pins: invalid sha %q", sha)
 	}
-	key := "pins/" + ecosystem + "/" + source + "/" + storage.EscapeSegment(remote) + "/" + storage.EscapeSegment(tag) + ".json"
+	key := keyPrefix(ecosystem, source, remote) + storage.EscapeSegment(tag) + ".json"
 	body, err := json.Marshal(pinFile{Tag: tag, SHA: sha, FirstSeen: time.Now().UTC()})
 	if err != nil {
 		return "", false, err
@@ -88,6 +88,48 @@ func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha str
 	}
 	s.mu.Unlock()
 	return pf.SHA, true, nil
+}
+
+func keyPrefix(ecosystem, source, remote string) string {
+	return "pins/" + ecosystem + "/" + source + "/" + storage.EscapeSegment(remote) + "/"
+}
+
+// Pin is one stored pin.
+type Pin struct {
+	Tag       string
+	SHA       string
+	FirstSeen time.Time
+}
+
+// List returns every pin of the remote, sorted by tag. Pins whose tag no
+// longer exists upstream are included.
+func (s *Store) List(ctx context.Context, ecosystem, source, remote string) ([]Pin, error) {
+	var keys []string
+	for info, err := range s.d.List(ctx, keyPrefix(ecosystem, source, remote)) {
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, info.Key)
+	}
+	var out []Pin
+	for _, key := range keys {
+		rc, _, err := s.d.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		var pf pinFile
+		if err := json.Unmarshal(raw, &pf); err != nil || !shaRE.MatchString(pf.SHA) {
+			return nil, fmt.Errorf("pins: corrupt pin %s", key)
+		}
+		out = append(out, Pin{Tag: pf.Tag, SHA: pf.SHA, FirstSeen: pf.FirstSeen})
+	}
+	slices.SortFunc(out, func(a, b Pin) int { return strings.Compare(a.Tag, b.Tag) })
+	return out, nil
 }
 
 // Moved returns the moved tags seen since start, sorted.

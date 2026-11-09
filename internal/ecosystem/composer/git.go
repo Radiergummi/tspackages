@@ -33,15 +33,29 @@ type Conflict struct {
 	Remotes []string
 }
 
+// ErrUnavailable is returned (instead of a not-found) when the source cannot
+// say whether a name exists: it is withheld because several remotes declare it,
+// or the first index pass has not finished, or a remote has never been indexed
+// successfully. It deliberately does not wrap resolve.ErrNotFound so that
+// resolution never falls through to another source.
+var ErrUnavailable = errors.New("composer git source unavailable")
+
 // GitSource serves packages built from git repositories. Tags are versions
-// (pinned on first sight), the default branch (or those matching the branches
-// allowlist) are dev versions. Dist zips are built once with git archive and
-// kept in the state store as
+// (pinned on first sight, only once the tagged commit validates), the default
+// branch (or those matching the branches allowlist) are dev versions. Dist zips
+// are built once with git archive and kept in the state store as
 //
 //	composer-git/<source>/<commit>.zip
 //
-// so their checksum never changes. The index is held in memory and rebuilt by
-// Index, which Run repeats every poll interval.
+// next to composer-git/<source>/<commit>.meta.json holding the digests and the
+// commit's composer.json, so a served version stays servable (with an
+// unchanged checksum) even if its tag or commit later disappears upstream.
+// The index is held in memory and rebuilt by Index, which Run repeats every
+// poll interval.
+//
+// Archives are never deleted: every commit ever served as a dev branch head
+// leaves a zip behind (no garbage collection in v1), and once a branch moves
+// the old dev reference is no longer indexed, so it answers 404.
 type GitSource struct {
 	name       string
 	claims     []string
@@ -54,10 +68,10 @@ type GitSource struct {
 	log        *slog.Logger
 	maxArchive int64 // largest zip kept in memory; bigger versions are skipped
 
-	mu      sync.Mutex // serialises Index; guards the fields below
-	prev    []remoteResult
-	digests map[string]digest // by commit; archives are immutable
-	prov    map[string]bool   // commit + version pairs whose provenance is stored
+	mu     sync.Mutex // serialises Index; guards the fields below
+	prev   []remoteResult
+	loaded map[string]loaded // by commit; archives are immutable
+	prov   map[string]bool   // commit + version pairs whose provenance is stored
 
 	idx atomic.Pointer[gitIndex]
 }
@@ -65,27 +79,45 @@ type GitSource struct {
 var _ Source = (*GitSource)(nil)
 
 type remoteResult struct {
+	ok       bool // indexed successfully at least once
 	pkg      string
 	versions []Version
 }
 
 type digest struct{ sha1, sha256 string }
 
+type loaded struct {
+	meta map[string]any
+	d    digest
+}
+
 type gitIndex struct {
+	done      bool // first pass finished
+	pending   bool // some remote has never been indexed successfully
 	pkgs      map[string][]Version
 	conflicts []Conflict
 }
 
-func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.Mirror, pins *pins.Store, rec *records.Store, state storage.Driver, poll time.Duration, log *slog.Logger, maxArchive int64) *GitSource {
+// NewGitSource validates the branch allowlist (path.Match syntax); poll <= 0
+// means one minute.
+func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.Mirror, pins *pins.Store, rec *records.Store, state storage.Driver, poll time.Duration, log *slog.Logger, maxArchive int64) (*GitSource, error) {
+	for _, p := range branches {
+		if _, err := path.Match(p, ""); err != nil {
+			return nil, fmt.Errorf("composer git source %q: invalid branch pattern %q: %w", name, p, err)
+		}
+	}
+	if poll <= 0 {
+		poll = time.Minute
+	}
 	g := &GitSource{
 		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pins, rec: rec,
 		state: state, poll: poll, log: log, maxArchive: maxArchive,
-		prev:    make([]remoteResult, len(mirrors)),
-		digests: map[string]digest{},
-		prov:    map[string]bool{},
+		prev:   make([]remoteResult, len(mirrors)),
+		loaded: map[string]loaded{},
+		prov:   map[string]bool{},
 	}
 	g.idx.Store(&gitIndex{pkgs: map[string][]Version{}})
-	return g
+	return g, nil
 }
 
 func (g *GitSource) Name() string     { return g.name }
@@ -110,9 +142,13 @@ func (g *GitSource) Run(ctx context.Context) {
 	}
 }
 
-// Index runs one sync-and-index pass over all mirrors. A mirror whose sync
-// fails keeps its previous entries. Problems with single remotes or versions
-// are logged; only a cancelled context is returned.
+func archiveMetaKey(source, commit string) string {
+	return "composer-git/" + source + "/" + commit + ".meta.json"
+}
+
+// Index runs one sync-and-index pass over all mirrors. A remote whose sync or
+// indexing fails keeps its previous entries. Problems with single remotes or
+// versions are logged; only a cancelled context is returned.
 func (g *GitSource) Index(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -124,10 +160,15 @@ func (g *GitSource) Index(ctx context.Context) error {
 			g.log.Warn("composer git sync failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
 			continue
 		}
-		g.prev[i] = g.indexRemote(ctx, m)
+		res, err := g.indexRemote(ctx, m)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if err != nil {
+			g.log.Error("composer git: indexing failed; keeping previous index", "source", g.name, "remote", m.Remote(), "error", err)
+			continue
+		}
+		g.prev[i] = res
 	}
 	g.idx.Store(g.assemble())
 	return nil
@@ -137,12 +178,15 @@ func (g *GitSource) Index(ctx context.Context) error {
 // dropped and reported as a conflict.
 func (g *GitSource) assemble() *gitIndex {
 	owners := map[string][]string{}
+	out := &gitIndex{done: true, pkgs: map[string][]Version{}}
 	for i, r := range g.prev {
+		if !r.ok {
+			out.pending = true
+		}
 		if r.pkg != "" {
 			owners[r.pkg] = append(owners[r.pkg], g.mirrors[i].Remote())
 		}
 	}
-	out := &gitIndex{pkgs: map[string][]Version{}}
 	for _, r := range g.prev {
 		if r.pkg != "" && len(owners[r.pkg]) == 1 && len(r.versions) > 0 {
 			out.pkgs[r.pkg] = r.versions
@@ -159,17 +203,26 @@ func (g *GitSource) assemble() *gitIndex {
 	return out
 }
 
-func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) remoteResult {
+func (g *GitSource) claimsName(pkg string) bool {
+	return len(g.claims) == 0 || slices.ContainsFunc(g.claims, func(c string) bool { return Match(c, pkg) })
+}
+
+// skip logs a skipped version unless the pass is being cancelled.
+func (g *GitSource) skip(ctx context.Context, msg string, args ...any) {
+	if ctx.Err() == nil {
+		g.log.Warn(msg, args...)
+	}
+}
+
+func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remoteResult, error) {
 	remote := m.Remote()
 	refs, err := m.Refs(ctx)
 	if err != nil {
-		g.log.Error("composer git: listing refs failed", "source", g.name, "remote", remote, "error", err)
-		return remoteResult{}
+		return remoteResult{}, fmt.Errorf("listing refs: %w", err)
 	}
 	def, err := m.DefaultBranch(ctx)
 	if err != nil {
-		g.log.Error("composer git: no default branch", "source", g.name, "remote", remote, "error", err)
-		return remoteResult{}
+		return remoteResult{}, fmt.Errorf("default branch: %w", err)
 	}
 	var head string
 	for _, r := range refs {
@@ -178,69 +231,98 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) remote
 		}
 	}
 	if head == "" {
-		g.log.Error("composer git: default branch has no commit", "source", g.name, "remote", remote, "branch", def)
-		return remoteResult{}
+		return remoteResult{}, fmt.Errorf("default branch %q has no commit", def)
 	}
-	meta, err := readComposerJSON(ctx, m, head)
+	meta, _, err := readComposerJSON(ctx, m, head)
 	if err != nil {
-		g.log.Error("composer git: unreadable composer.json on default branch", "source", g.name, "remote", remote, "error", err)
-		return remoteResult{}
+		return remoteResult{}, fmt.Errorf("composer.json on default branch: %w", err)
 	}
 	declared, _ := meta["name"].(string)
 	pkg, err := Normalize(declared)
 	if err != nil {
-		g.log.Error("composer git: invalid package name on default branch", "source", g.name, "remote", remote, "name", declared)
-		return remoteResult{}
+		return remoteResult{}, fmt.Errorf("package name on default branch: %w", err)
+	}
+	if !g.claimsName(pkg) {
+		g.log.Warn("composer git: package is outside the source's claims; ignored", "source", g.name, "remote", remote, "package", pkg)
+		return remoteResult{ok: true}, nil
+	}
+	pinned, err := g.pins.List(ctx, "composer", g.name, remote)
+	if err != nil {
+		return remoteResult{}, fmt.Errorf("listing pins: %w", err)
 	}
 
-	res := remoteResult{pkg: pkg}
+	res := remoteResult{ok: true, pkg: pkg}
 	seen := map[string]bool{}
-	add := func(version, normalized, commit string, meta map[string]any, dev bool) {
+	add := func(version, normalized, commit string, l loaded, dev bool) {
 		if seen[normalized] {
 			g.log.Debug("composer git: duplicate version skipped", "source", g.name, "remote", remote, "version", version)
 			return
 		}
-		d, err := g.archive(ctx, m, pkg, version, commit)
-		if err != nil {
-			g.log.Warn("composer git: version skipped", "source", g.name, "remote", remote, "version", version, "commit", commit, "error", err)
+		if err := g.recordProvenance(ctx, m, pkg, version, commit, l.d); err != nil {
+			g.skip(ctx, "composer git: version skipped", "source", g.name, "remote", remote, "version", version, "commit", commit, "error", err)
 			return
 		}
 		seen[normalized] = true
 		res.versions = append(res.versions, Version{
-			Package:   packageEntry(meta, pkg, version, normalized, commit, d.sha1),
+			Package:   packageEntry(l.meta, pkg, version, normalized, commit, l.d.sha1),
 			Version:   version,
 			Reference: commit,
 			Dev:       dev,
 		})
 	}
 
+	// Tags: those upstream plus every pinned one, so versions already served
+	// survive their tag (or commit) disappearing.
+	upstream := map[string]string{}
 	for _, r := range refs {
-		if !r.IsTag {
-			continue
+		if r.IsTag {
+			upstream[r.Short] = r.Commit
 		}
-		normalized, err := NormalizeVersion(r.Short)
+	}
+	pinSHA := map[string]string{}
+	tags := slices.Collect(maps.Keys(upstream))
+	for _, p := range pinned {
+		pinSHA[p.Tag] = p.SHA
+		if _, ok := upstream[p.Tag]; !ok {
+			tags = append(tags, p.Tag)
+		}
+	}
+	slices.Sort(tags)
+	for _, tag := range tags {
+		normalized, err := NormalizeVersion(tag)
 		if err != nil {
-			g.log.Debug("composer git: tag is not a version", "source", g.name, "remote", remote, "tag", r.Short)
+			g.log.Debug("composer git: tag is not a version", "source", g.name, "remote", remote, "tag", tag)
 			continue
 		}
-		commit, moved, err := g.pins.Pin(ctx, "composer", g.name, remote, r.Short, r.Commit)
+		if strings.HasPrefix(normalized, "dev-") || strings.HasSuffix(normalized, "-dev") {
+			g.skip(ctx, "composer git: tag is a dev version; skipped", "source", g.name, "remote", remote, "tag", tag)
+			continue
+		}
+		commit, up := pinSHA[tag], upstream[tag]
+		switch {
+		case commit == "": // first sight: pin only a commit that validates
+			if _, err := g.loadFor(ctx, m, pkg, up); err != nil {
+				g.skip(ctx, "composer git: tag skipped", "source", g.name, "remote", remote, "tag", tag, "error", err)
+				continue
+			}
+			commit, _, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
+			if err != nil {
+				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
+				continue
+			}
+		case up != "" && up != commit: // an existing pin always wins; record the move
+			if commit, _, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up); err != nil {
+				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
+				continue
+			}
+			g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", commit, "seen", up)
+		}
+		l, err := g.loadFor(ctx, m, pkg, commit)
 		if err != nil {
-			g.log.Warn("composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", r.Short, "error", err)
+			g.skip(ctx, "composer git: tag skipped", "source", g.name, "remote", remote, "tag", tag, "error", err)
 			continue
 		}
-		if moved {
-			g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", r.Short, "pinned", commit, "seen", r.Commit)
-		}
-		tm, err := readComposerJSON(ctx, m, commit)
-		if err != nil {
-			g.log.Warn("composer git: tag skipped", "source", g.name, "remote", remote, "tag", r.Short, "error", err)
-			continue
-		}
-		if n, err := Normalize(strOf(tm["name"])); err != nil || n != pkg {
-			g.log.Warn("composer git: tag names a different package", "source", g.name, "remote", remote, "tag", r.Short, "name", tm["name"], "want", pkg)
-			continue
-		}
-		add(r.Short, normalized, commit, tm, false)
+		add(tag, normalized, commit, l, false)
 	}
 
 	for _, r := range refs {
@@ -252,18 +334,15 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) remote
 		if !strings.HasPrefix(normalized, "dev-") {
 			version = name + "-dev"
 		}
-		bm := meta
-		if r.Commit != head {
-			if bm, err = readComposerJSON(ctx, m, r.Commit); err != nil {
-				g.log.Warn("composer git: branch skipped", "source", g.name, "remote", remote, "branch", r.Short, "error", err)
-				continue
-			}
-		}
-		if n, err := Normalize(strOf(bm["name"])); err != nil || n != pkg {
-			g.log.Warn("composer git: branch names a different package", "source", g.name, "remote", remote, "branch", r.Short, "name", bm["name"], "want", pkg)
+		l, err := g.loadFor(ctx, m, pkg, r.Commit)
+		if err != nil {
+			g.skip(ctx, "composer git: branch skipped", "source", g.name, "remote", remote, "branch", r.Short, "error", err)
 			continue
 		}
-		add(version, normalized, r.Commit, bm, true)
+		add(version, normalized, r.Commit, l, true)
+	}
+	if ctx.Err() != nil {
+		return remoteResult{}, ctx.Err()
 	}
 
 	slices.SortStableFunc(res.versions, func(a, b Version) int {
@@ -279,7 +358,7 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) remote
 		}
 		return compareNormalized(bn, an)
 	})
-	return res
+	return res, nil
 }
 
 func strOf(v any) string { s, _ := v.(string); return s }
@@ -294,11 +373,16 @@ func (g *GitSource) wantBranch(branch, def string) bool {
 	})
 }
 
-func readComposerJSON(ctx context.Context, m *gitmirror.Mirror, commit string) (map[string]any, error) {
+func readComposerJSON(ctx context.Context, m *gitmirror.Mirror, commit string) (map[string]any, []byte, error) {
 	raw, err := m.ReadFile(ctx, commit, "composer.json")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	meta, err := parseComposerJSON(raw)
+	return meta, raw, err
+}
+
+func parseComposerJSON(raw []byte) (map[string]any, error) {
 	var meta map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber() // keep large integers exact
@@ -336,35 +420,103 @@ func (w *capWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-// archive makes sure the zip of commit is in the state store and returns its
-// digests. A stored zip is canonical and is read back, never rebuilt.
-func (g *GitSource) archive(ctx context.Context, m *gitmirror.Mirror, pkg, version, commit string) (digest, error) {
-	d, ok := g.digests[commit]
-	if !ok {
-		data, err := g.zipBytes(ctx, m, commit)
-		if err != nil {
-			return digest{}, err
-		}
-		s1, s256 := sha1.Sum(data), sha256.Sum256(data)
-		d = digest{sha1: hex.EncodeToString(s1[:]), sha256: hex.EncodeToString(s256[:])}
-		g.digests[commit] = d
-	}
-	pk := commit + "\x00" + version
-	if !g.prov[pk] {
-		if err := g.rec.PutProvenance(ctx, records.Provenance{
-			Ecosystem: "composer", Package: pkg, Version: version, Source: g.name, SourceType: "git",
-			Remote: m.Remote(), Commit: commit, SHA1: d.sha1, SHA256: d.sha256,
-		}); err != nil {
-			return digest{}, err
-		}
-		g.prov[pk] = true
-	}
-	return d, nil
+// archiveMeta is stored next to every archive, written with it and never
+// changed.
+type archiveMeta struct {
+	SHA1         string          `json:"sha1"`
+	SHA256       string          `json:"sha256"`
+	Size         int64           `json:"size"`
+	ComposerJSON json.RawMessage `json:"composer_json"`
 }
 
+// loadFor is load plus the check that the commit's composer.json names pkg.
+func (g *GitSource) loadFor(ctx context.Context, m *gitmirror.Mirror, pkg, commit string) (loaded, error) {
+	l, err := g.load(ctx, m, commit)
+	if err != nil {
+		return loaded{}, err
+	}
+	if n, err := Normalize(strOf(l.meta["name"])); err != nil || n != pkg {
+		return loaded{}, fmt.Errorf("composer.json names %q, not %q", l.meta["name"], pkg)
+	}
+	return l, nil
+}
+
+// load returns the composer.json and digests of commit's archive. A stored
+// sidecar is authoritative and needs neither the mirror nor the zip; without
+// one the archive is read back (or built once, if absent) and the sidecar is
+// written.
+func (g *GitSource) load(ctx context.Context, m *gitmirror.Mirror, commit string) (loaded, error) {
+	if l, ok := g.loaded[commit]; ok {
+		return l, nil
+	}
+	key := archiveMetaKey(g.name, commit)
+	l, err := g.readMeta(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		_, raw, rerr := readComposerJSON(ctx, m, commit)
+		if rerr != nil {
+			return loaded{}, rerr
+		}
+		data, zerr := g.zipBytes(ctx, m, commit)
+		if zerr != nil {
+			return loaded{}, zerr
+		}
+		s1, s256 := sha1.Sum(data), sha256.Sum256(data)
+		body, merr := json.Marshal(archiveMeta{
+			SHA1: hex.EncodeToString(s1[:]), SHA256: hex.EncodeToString(s256[:]),
+			Size: int64(len(data)), ComposerJSON: raw,
+		})
+		if merr != nil {
+			return loaded{}, merr
+		}
+		if _, perr := g.state.PutIfAbsent(ctx, key, bytes.NewReader(body)); perr != nil && !errors.Is(perr, storage.ErrExists) {
+			return loaded{}, perr
+		}
+		// Read back whatever won, so every instance agrees on the digests.
+		l, err = g.readMeta(ctx, key)
+	}
+	if err != nil {
+		return loaded{}, err
+	}
+	g.loaded[commit] = l
+	return l, nil
+}
+
+func (g *GitSource) readMeta(ctx context.Context, key string) (loaded, error) {
+	data, err := g.readStored(ctx, key, 4*maxComposerJSONSize)
+	if err != nil {
+		return loaded{}, err
+	}
+	var am archiveMeta
+	if err := json.Unmarshal(data, &am); err != nil {
+		return loaded{}, fmt.Errorf("corrupt %s: %w", key, err)
+	}
+	meta, err := parseComposerJSON(am.ComposerJSON)
+	if err != nil || am.SHA1 == "" || am.SHA256 == "" {
+		return loaded{}, fmt.Errorf("corrupt %s", key)
+	}
+	return loaded{meta: meta, d: digest{sha1: am.SHA1, sha256: am.SHA256}}, nil
+}
+
+func (g *GitSource) recordProvenance(ctx context.Context, m *gitmirror.Mirror, pkg, version, commit string, d digest) error {
+	pk := commit + "\x00" + version
+	if g.prov[pk] {
+		return nil
+	}
+	if err := g.rec.PutProvenance(ctx, records.Provenance{
+		Ecosystem: "composer", Package: pkg, Version: version, Source: g.name, SourceType: "git",
+		Remote: m.Remote(), Commit: commit, SHA1: d.sha1, SHA256: d.sha256,
+	}); err != nil {
+		return err
+	}
+	g.prov[pk] = true
+	return nil
+}
+
+// zipBytes returns the stored archive of commit, building and storing it only
+// if there is none. A stored zip is canonical and is never rebuilt.
 func (g *GitSource) zipBytes(ctx context.Context, m *gitmirror.Mirror, commit string) ([]byte, error) {
 	key := archiveKey(g.name, commit)
-	if data, err := g.readStored(ctx, key); err == nil {
+	if data, err := g.readStored(ctx, key, g.maxArchive); err == nil {
 		return data, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err
@@ -378,24 +530,50 @@ func (g *GitSource) zipBytes(ctx context.Context, m *gitmirror.Mirror, commit st
 	}
 	if _, err := g.state.PutIfAbsent(ctx, key, bytes.NewReader(w.buf.Bytes())); err != nil {
 		if errors.Is(err, storage.ErrExists) {
-			return g.readStored(ctx, key) // someone else stored it first: theirs is canonical
+			return g.readStored(ctx, key, g.maxArchive) // someone else stored it first: theirs is canonical
 		}
 		return nil, err
 	}
 	return w.buf.Bytes(), nil
 }
 
-func (g *GitSource) readStored(ctx context.Context, key string) ([]byte, error) {
+// readStored reads key, failing with errTooLarge beyond max bytes.
+func (g *GitSource) readStored(ctx context.Context, key string, max int64) ([]byte, error) {
 	rc, _, err := g.state.Get(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	data, err := io.ReadAll(io.LimitReader(rc, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("%w: %s over %d bytes", errTooLarge, key, max)
+	}
+	return data, nil
 }
 
 // Conflicts lists package names declared by several remotes in the last pass.
 func (g *GitSource) Conflicts() []Conflict { return slices.Clone(g.idx.Load().conflicts) }
+
+// lookup returns the indexed versions of pkg, ErrUnavailable when the source
+// cannot yet say whether the name exists, or a not-found.
+func (g *GitSource) lookup(pkg string) ([]Version, error) {
+	idx := g.idx.Load()
+	for _, c := range idx.conflicts {
+		if c.Package == pkg {
+			return nil, fmt.Errorf("%w: %s is declared by several remotes", ErrUnavailable, pkg)
+		}
+	}
+	if vs, ok := idx.pkgs[pkg]; ok {
+		return vs, nil
+	}
+	if (!idx.done || idx.pending) && g.claimsName(pkg) {
+		return nil, fmt.Errorf("%w: %s (not every remote is indexed yet)", ErrUnavailable, pkg)
+	}
+	return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
+}
 
 func (g *GitSource) Packages(context.Context) ([]string, bool, error) {
 	pkgs := g.idx.Load().pkgs
@@ -410,9 +588,9 @@ func (g *GitSource) Versions(_ context.Context, name string) ([]Version, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	vs, ok := g.idx.Load().pkgs[pkg]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, name)
+	vs, err := g.lookup(pkg)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]Version, len(vs))
 	for i, v := range vs {
@@ -432,9 +610,13 @@ func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (
 	if err != nil {
 		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
+	vs, err := g.lookup(pkg)
+	if err != nil {
+		return Artifact{}, err
+	}
 	nv, nerr := NormalizeVersion(version)
 	var found *Version
-	for _, v := range g.idx.Load().pkgs[pkg] {
+	for _, v := range vs {
 		if v.Reference == reference && (v.Version == version || normalizedOf(v) == version || (nerr == nil && normalizedOf(v) == nv)) {
 			found = &v
 			break

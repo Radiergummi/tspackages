@@ -152,3 +152,21 @@ func TestMovedSortedAndCopied(t *testing.T) {
 		t.Fatalf("store affected: %+v", got)
 	}
 }
+
+func TestListScopedAndSorted(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	sha := strings.Repeat("a", 40)
+	for _, c := range [][3]string{{"src", "r1", "v2"}, {"src", "r1", "v1"}, {"src", "r2", "v9"}, {"other", "r1", "v7"}} {
+		if _, _, err := s.Pin(ctx, "composer", c[0], c[1], c[2], sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.List(ctx, "composer", "src", "r1")
+	if err != nil || len(got) != 2 || got[0].Tag != "v1" || got[1].Tag != "v2" || got[0].SHA != sha || got[0].FirstSeen.IsZero() {
+		t.Fatalf("List = %+v, %v", got, err)
+	}
+	if got, err := s.List(ctx, "composer", "src", "none"); err != nil || len(got) != 0 {
+		t.Fatalf("empty List = %+v, %v", got, err)
+	}
+}
