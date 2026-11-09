@@ -102,9 +102,9 @@ tailscale.com).
 
 ## Known open items
 
-- CI and the Docker build had not run yet when milestone 1 landed; check the
-  first runs. The MinIO image in CI is not pinned by digest (no anonymous
-  digest lookup was possible); pin it once one can be resolved.
+- CI is green (tests with MinIO, real-Composer integration, Docker build).
+  MinIO images can't be pulled anonymously any more, so CI builds a pinned
+  MinIO commit from source; bump that pin deliberately.
 - `main` releases the work_dir lock without waiting for background git loops
   to stop.
 - The config check for overlapping claims is exact-string only (a git source
