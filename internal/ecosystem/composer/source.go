@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -29,4 +30,11 @@ type Source interface {
 	// name; resolve.ErrNotFound if the name is unknown.
 	Versions(ctx context.Context, name string, dev bool) ([]Version, error)
 	Dist(ctx context.Context, name, version, reference string) (Artifact, error)
+}
+
+// Uploader is a Source that accepts uploads. Upload returns ErrVersionExists,
+// *archive.Error or *UploadError for client mistakes.
+type Uploader interface {
+	Source
+	Upload(ctx context.Context, caller identity.Caller, name, version string, zipData []byte) (Version, error)
 }

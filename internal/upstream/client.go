@@ -149,20 +149,20 @@ func forbiddenAddr(a netip.Addr) bool {
 			return true
 		}
 	}
-	if documentation6.Contains(a) || teredo.Contains(a) || discard6.Contains(a) {
-		return true
-	}
-	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
-		a.IsLinkLocalMulticast() || a.IsInterfaceLocalMulticast() ||
-		a.IsMulticast() || a.IsUnspecified()
+	return documentation6.Contains(a) || teredo.Contains(a) || discard6.Contains(a) || nonUnicast(a)
 }
 
 func forbiddenV4(a netip.Addr) bool {
-	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
-		a.IsMulticast() || a.IsUnspecified() || thisNetwork.Contains(a) ||
+	return nonUnicast(a) || thisNetwork.Contains(a) ||
 		cgnat.Contains(a) || benchmark.Contains(a) || reserved.Contains(a) ||
 		ietfProtocol.Contains(a) || testNet1.Contains(a) || testNet2.Contains(a) ||
 		testNet3.Contains(a) || relay6to4.Contains(a)
+}
+
+// nonUnicast reports loopback, private, link-local, multicast (which includes
+// link- and interface-local multicast) and unspecified addresses.
+func nonUnicast(a netip.Addr) bool {
+	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsMulticast() || a.IsUnspecified()
 }
 
 var (
@@ -251,20 +251,12 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	return resp, nil
 }
 
-type Digest struct {
-	Algo string // "sha1" or "sha256"
-	Hex  string
-}
-
 // FetchVerified downloads at most maxBytes and returns the body with its
-// SHA-1 and SHA-256. If want is non-nil and differs, it returns
-// ErrDigestMismatch and no body.
-func (c *Client) FetchVerified(ctx context.Context, rawURL string, want *Digest, maxBytes int64) (body []byte, sha1Hex, sha256Hex string, err error) {
+// SHA-1 and SHA-256. If wantSHA1 is set and differs (case-insensitively), it
+// returns ErrDigestMismatch and no body.
+func (c *Client) FetchVerified(ctx context.Context, rawURL, wantSHA1 string, maxBytes int64) (body []byte, sha1Hex, sha256Hex string, err error) {
 	if maxBytes <= 0 {
 		return nil, "", "", fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
-	}
-	if want != nil && want.Algo != "sha1" && want.Algo != "sha256" {
-		return nil, "", "", fmt.Errorf("unsupported digest algorithm %q", want.Algo)
 	}
 	resp, err := c.Get(ctx, rawURL)
 	if err != nil {
@@ -289,14 +281,8 @@ func (c *Client) FetchVerified(ctx context.Context, rawURL string, want *Digest,
 		return nil, "", "", ErrTooLarge
 	}
 	sha1Hex, sha256Hex = digest.Of(body)
-	if want != nil {
-		got := sha256Hex
-		if want.Algo == "sha1" {
-			got = sha1Hex
-		}
-		if !strings.EqualFold(got, want.Hex) {
-			return nil, "", "", fmt.Errorf("%w: %s want %s, got %s", ErrDigestMismatch, want.Algo, want.Hex, got)
-		}
+	if wantSHA1 != "" && !strings.EqualFold(sha1Hex, wantSHA1) {
+		return nil, "", "", fmt.Errorf("%w: sha1 want %s, got %s", ErrDigestMismatch, wantSHA1, sha1Hex)
 	}
 	return body, sha1Hex, sha256Hex, nil
 }

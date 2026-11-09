@@ -361,8 +361,31 @@ func TestStaleLocksRemoved(t *testing.T) {
 	write(t, src, "x", "x")
 	testutil.Git(t, src, "add", ".")
 	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	// Locks left by a killed process: the next process's first Sync removes them.
 	write(t, m.dir, "refs/heads/main.lock", "")
 	write(t, m.dir, "packed-refs.lock", "")
+	m, err := New(m.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(m.dir, "refs/heads/main.lock")); !os.IsNotExist(err) {
+		t.Errorf("lock remains: %v", err)
+	}
+}
+
+func TestStaleLocksRemovedAfterFailedFetch(t *testing.T) {
+	src := makeRepo(t)
+	m := newMirror(t, src)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.Sync(ctx); err == nil {
+		t.Fatal("Sync with a cancelled context succeeded")
+	}
+	write(t, m.dir, "refs/heads/main.lock", "")
+	testutil.Git(t, src, "commit", "-q", "--allow-empty", "-m", "two")
 	if err := m.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}

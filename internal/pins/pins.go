@@ -27,23 +27,17 @@ type MovedTag struct {
 	Pinned, Seen                   string
 }
 
-type pinFile struct {
-	Tag       string    `json:"tag"`
-	SHA       string    `json:"sha"`
-	FirstSeen time.Time `json:"first_seen"`
-}
-
 // Store pins tags in the state store. It is safe for concurrent use.
 type Store struct {
 	d storage.Driver
 
 	mu    sync.Mutex
 	moved map[[4]string]MovedTag
-	cache map[string]pinFile // by key; tspackages never rewrites a pin, but operators may delete one (List and Pin drop or replace such entries)
+	cache map[string]Pin // by key; tspackages never rewrites a pin, but operators may delete one (List and Pin drop or replace such entries)
 }
 
 func New(d storage.Driver) *Store {
-	return &Store{d: d, moved: map[[4]string]MovedTag{}, cache: map[string]pinFile{}}
+	return &Store{d: d, moved: map[[4]string]MovedTag{}, cache: map[string]Pin{}}
 }
 
 // Pin records sha for the tag on first sight and returns the pinned SHA. If
@@ -54,7 +48,7 @@ func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha str
 		return "", false, fmt.Errorf("pins: invalid sha %q", sha)
 	}
 	key := keyPrefix(ecosystem, source, remote) + storage.EscapeSegment(tag) + ".json"
-	fresh := pinFile{Tag: tag, SHA: sha, FirstSeen: time.Now().UTC()}
+	fresh := Pin{Tag: tag, SHA: sha, FirstSeen: time.Now().UTC()}
 	body, err := json.Marshal(fresh)
 	if err != nil {
 		return "", false, err
@@ -88,18 +82,18 @@ func keyPrefix(ecosystem, source, remote string) string {
 	return "pins/" + ecosystem + "/" + source + "/" + storage.EscapeSegment(remote) + "/"
 }
 
-// Pin is one stored pin.
+// Pin is one stored pin, in its stored JSON form.
 type Pin struct {
-	Tag       string
-	SHA       string
-	FirstSeen time.Time
+	Tag       string    `json:"tag"`
+	SHA       string    `json:"sha"`
+	FirstSeen time.Time `json:"first_seen"`
 }
 
 // read returns the pin stored at key. Valid pins are cached: tspackages never
 // rewrites a pin, and an operator's deletion is noticed by List (which drops
 // the entry) and Pin (which replaces it on re-pinning). Corrupt pins are
 // re-read every time.
-func (s *Store) read(ctx context.Context, key string) (pinFile, error) {
+func (s *Store) read(ctx context.Context, key string) (Pin, error) {
 	s.mu.Lock()
 	pf, ok := s.cache[key]
 	s.mu.Unlock()
@@ -108,18 +102,18 @@ func (s *Store) read(ctx context.Context, key string) (pinFile, error) {
 	}
 	rc, _, err := s.d.Get(ctx, key)
 	if err != nil {
-		return pinFile{}, err
+		return Pin{}, err
 	}
 	defer rc.Close()
 	raw, err := io.ReadAll(rc)
 	if err != nil {
-		return pinFile{}, err
+		return Pin{}, err
 	}
 	if err := json.Unmarshal(raw, &pf); err != nil {
-		return pinFile{}, fmt.Errorf("%w %s: %v", ErrCorrupt, key, err)
+		return Pin{}, fmt.Errorf("%w %s: %v", ErrCorrupt, key, err)
 	}
 	if !digest.IsHex(pf.SHA, 40, 64) {
-		return pinFile{}, fmt.Errorf("%w %s: invalid sha", ErrCorrupt, key)
+		return Pin{}, fmt.Errorf("%w %s: invalid sha", ErrCorrupt, key)
 	}
 	s.mu.Lock()
 	s.cache[key] = pf
@@ -159,7 +153,7 @@ func (s *Store) List(ctx context.Context, ecosystem, source, remote string) (pin
 			corrupt = append(corrupt, err)
 			continue
 		}
-		pins = append(pins, Pin{Tag: pf.Tag, SHA: pf.SHA, FirstSeen: pf.FirstSeen})
+		pins = append(pins, pf)
 	}
 	slices.SortFunc(pins, func(a, b Pin) int { return strings.Compare(a.Tag, b.Tag) })
 	return pins, corrupt, nil

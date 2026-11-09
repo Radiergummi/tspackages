@@ -196,3 +196,9 @@ func cmpInt(a, b int) int {
 	}
 	return 0
 }
+
+// isDevVersion reports whether a normalised version is a dev version
+// ("dev-<branch>" or a numeric branch ending in "-dev").
+func isDevVersion(normalized string) bool {
+	return strings.HasPrefix(normalized, "dev-") || strings.HasSuffix(normalized, "-dev")
+}

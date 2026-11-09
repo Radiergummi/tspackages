@@ -27,8 +27,8 @@ type Uploader struct {
 }
 
 // UploaderFrom copies the identifying fields of a caller.
-func UploaderFrom(c identity.Caller) *Uploader {
-	return &Uploader{
+func UploaderFrom(c identity.Caller) Uploader {
+	return Uploader{
 		Login:        c.Login,
 		Tags:         append([]string(nil), c.Tags...),
 		NodeName:     c.NodeName,

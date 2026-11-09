@@ -210,7 +210,7 @@ func TestFetchVerifiedOK(t *testing.T) {
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
 	wantSHA1, wantSHA256 := hexSum([]byte("hello"))
-	for _, want := range []*Digest{nil, {"sha1", strings.ToUpper(wantSHA1)}, {"sha256", wantSHA256}} {
+	for _, want := range []string{"", strings.ToUpper(wantSHA1), wantSHA1} {
 		body, s1, s2, err := c.FetchVerified(context.Background(), s.URL, want, 100)
 		if err != nil || string(body) != "hello" || s1 != wantSHA1 || s2 != wantSHA256 {
 			t.Fatalf("%v: %q %q %q %v", want, body, s1, s2, err)
@@ -222,16 +222,13 @@ func TestFetchVerifiedMismatch(t *testing.T) {
 	s := bodyServer("hello")
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
-	body, _, _, err := c.FetchVerified(context.Background(), s.URL, &Digest{"sha256", strings.Repeat("0", 64)}, 100)
+	body, _, _, err := c.FetchVerified(context.Background(), s.URL, strings.Repeat("0", 40), 100)
 	if !errors.Is(err, ErrDigestMismatch) || body != nil {
 		t.Fatalf("%q %v", body, err)
 	}
-	_, want256 := hexSum([]byte("hello"))
-	if !strings.Contains(err.Error(), want256) || !strings.Contains(err.Error(), strings.Repeat("0", 64)) {
+	want1, _ := hexSum([]byte("hello"))
+	if !strings.Contains(err.Error(), want1) || !strings.Contains(err.Error(), strings.Repeat("0", 40)) {
 		t.Fatalf("message lacks hashes: %v", err)
-	}
-	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, &Digest{"md5", "x"}, 100); err == nil {
-		t.Fatal("unknown algo must fail")
 	}
 }
 
@@ -239,10 +236,10 @@ func TestFetchTooLarge(t *testing.T) {
 	s := bodyServer("0123456789")
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
-	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, 9); !errors.Is(err, ErrTooLarge) {
+	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, "", 9); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("err = %v", err)
 	}
-	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, 10); err != nil {
+	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, "", 10); err != nil {
 		t.Fatalf("exactly max must pass: %v", err)
 	}
 }
@@ -251,7 +248,7 @@ func Test404IsNotFound(t *testing.T) {
 	s := httptest.NewServer(http.NotFoundHandler())
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
-	_, _, _, err := c.FetchVerified(context.Background(), s.URL+"/p?token=secret", nil, 100)
+	_, _, _, err := c.FetchVerified(context.Background(), s.URL+"/p?token=secret", "", 100)
 	if !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("err = %v", err)
 	}
@@ -267,7 +264,7 @@ func TestOtherStatusNotNotFound(t *testing.T) {
 	}))
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
-	_, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, 100)
+	_, _, _, err := c.FetchVerified(context.Background(), s.URL, "", 100)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != 500 || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("err = %v", err)
@@ -380,11 +377,11 @@ func TestMaxBytesValidation(t *testing.T) {
 	defer s.Close()
 	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
 	for _, n := range []int64{0, -1} {
-		if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, n); err == nil {
+		if _, _, _, err := c.FetchVerified(context.Background(), s.URL, "", n); err == nil {
 			t.Fatalf("maxBytes %d accepted", n)
 		}
 	}
-	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, nil, math.MaxInt64); err != nil {
+	if _, _, _, err := c.FetchVerified(context.Background(), s.URL, "", math.MaxInt64); err != nil {
 		t.Fatalf("MaxInt64: %v", err)
 	}
 }
@@ -401,7 +398,7 @@ func TestContentLengthRefusedEarly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, _, _, err := c.FetchVerified(ctx, s.URL, nil, 10)
+	_, _, _, err := c.FetchVerified(ctx, s.URL, "", 10)
 	if !errors.Is(err, ErrTooLarge) || time.Since(start) > 2*time.Second {
 		t.Fatalf("err = %v after %v", err, time.Since(start))
 	}
@@ -427,7 +424,7 @@ func TestTimeoutBoundsHeadersNotBody(t *testing.T) {
 		w.Write([]byte("late"))
 	}))
 	defer slowBody.Close()
-	body, _, _, err := c.FetchVerified(context.Background(), slowBody.URL, nil, 100)
+	body, _, _, err := c.FetchVerified(context.Background(), slowBody.URL, "", 100)
 	if err != nil || string(body) != "late" {
 		t.Fatalf("%q %v", body, err)
 	}

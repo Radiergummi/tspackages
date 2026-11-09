@@ -7,6 +7,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
 // nameRE is Composer's package-name pattern, applied to the lowercased name.
@@ -35,4 +37,13 @@ func Match(pattern, name string) bool {
 	}
 	ok, err := path.Match(strings.ToLower(pattern), strings.ToLower(name))
 	return err == nil && ok
+}
+
+// lookupName normalises a requested name; an invalid name is a definite miss.
+func lookupName(name string) (string, error) {
+	pkg, err := Normalize(name)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+	}
+	return pkg, nil
 }

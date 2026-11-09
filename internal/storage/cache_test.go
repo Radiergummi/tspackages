@@ -77,12 +77,12 @@ func TestCacheGetMissing(t *testing.T) {
 func TestCacheAge(t *testing.T) {
 	c, _ := newTestCache(t, 30)
 	cachePut(t, c, "a")
-	rc, age, err := c.Get(context.Background(), "a")
+	rc, written, err := c.Get(context.Background(), "a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	if age < 0 || age >= time.Second {
+	if age := time.Since(written); age < 0 || age >= time.Second {
 		t.Fatalf("age = %v", age)
 	}
 	b, _ := io.ReadAll(rc)

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -75,6 +74,14 @@ type statusWriter struct {
 	status int
 }
 
+// code is the status sent so far; 200 if the handler wrote nothing.
+func (w *statusWriter) code() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
 func (w *statusWriter) WriteHeader(code int) {
 	if w.status == 0 {
 		w.status = code
@@ -83,9 +90,7 @@ func (w *statusWriter) WriteHeader(code int) {
 }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
+	w.status = w.code()
 	return w.ResponseWriter.Write(b)
 }
 
@@ -112,10 +117,7 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 		w := &statusWriter{ResponseWriter: rw}
 		e := &entry{}
 		h(w, r, caller, e)
-		status := w.status
-		if status == 0 {
-			status = http.StatusOK
-		}
+		status := w.code()
 		src := e.source
 		if src == "" {
 			src = "none"
@@ -148,31 +150,25 @@ func (c *Composer) packagesJSON(w http.ResponseWriter, r *http.Request, caller i
 		"packages":     []any{},
 		"metadata-url": "/composer/p2/%package%.json",
 	}
-	// Composer may skip a repository for names matching none of these
-	// patterns. They are the claims of every source, not filtered per caller:
-	// they describe routing, not access. Any unclaimed source (or a "*" claim)
-	// can answer any name, so the key is omitted.
-	patterns := map[string]bool{}
-	for _, s := range c.sources {
-		if len(s.Claims()) == 0 {
-			patterns = nil
-			break
-		}
-		for _, cl := range s.Claims() {
-			if cl == "*" {
-				patterns = nil
-				break
-			}
-			patterns[cl] = true
-		}
-		if patterns == nil {
-			break
-		}
-	}
-	if patterns != nil {
-		body["available-package-patterns"] = slices.Sorted(maps.Keys(patterns))
+	if patterns, ok := claimPatterns(c.sources); ok {
+		body["available-package-patterns"] = patterns
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// claimPatterns returns the claims of every source, sorted and deduplicated.
+// Composer may skip a repository for names matching none of these patterns.
+// They are not filtered per caller: they describe routing, not access. Any
+// unclaimed source (or a "*" claim) can answer any name, so then ok is false.
+func claimPatterns(sources []Source) (patterns []string, ok bool) {
+	for _, s := range sources {
+		if len(s.Claims()) == 0 || slices.Contains(s.Claims(), "*") {
+			return nil, false
+		}
+		patterns = append(patterns, s.Claims()...)
+	}
+	slices.Sort(patterns)
+	return slices.Compact(patterns), true
 }
 
 func hasComposerRule(rules []authz.Rule) bool {
@@ -198,11 +194,8 @@ func (c *Composer) p2(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		http.NotFound(w, r)
 		return
 	}
-	e.pkg = name
-	cands, claimed := resolve.Candidates(c.sources, name, Match)
-	e.claimed = claimed
-	if !authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	cands, ok := c.authorize(w, caller, e, name, authz.Read)
+	if !ok {
 		return
 	}
 	vs, src, err := resolve.First(r.Context(), cands, func(ctx context.Context, s Source) ([]Version, error) {
@@ -226,11 +219,8 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 		http.NotFound(w, r)
 		return
 	}
-	e.pkg = name
-	cands, claimed := resolve.Candidates(c.sources, name, Match)
-	e.claimed = claimed
-	if !authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	cands, ok := c.authorize(w, caller, e, name, authz.Read)
+	if !ok {
 		return
 	}
 	var src Source
@@ -244,11 +234,9 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 		return
 	}
 	e.source = src.Name()
-	art, _, err := resolve.First(r.Context(), []Source{src}, func(ctx context.Context, s Source) (Artifact, error) {
-		return s.Dist(ctx, name, r.PathValue("version"), r.PathValue("reference"))
-	})
+	art, err := src.Dist(r.Context(), name, r.PathValue("version"), r.PathValue("reference"))
 	if err != nil {
-		c.fail(w, r, err)
+		c.fail(w, r, resolve.Wrap(src.Name(), err))
 		return
 	}
 	defer art.Body.Close()
@@ -269,17 +257,15 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 		http.Error(w, "invalid package name", http.StatusBadRequest)
 		return
 	}
-	e.pkg = name
-	if !authz.Allowed(caller.Rules, ecoName, name, authz.Write, Match) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	cands, ok := c.authorize(w, caller, e, name, authz.Write)
+	if !ok {
 		return
 	}
-	cands, claimed := resolve.Candidates(c.sources, name, Match)
-	var store *StorageSource
-	if claimed {
+	var store Uploader
+	if e.claimed {
 		for _, s := range cands {
-			if ss, ok := s.(*StorageSource); ok {
-				store = ss
+			if u, ok := s.(Uploader); ok {
+				store = u
 				break
 			}
 		}
@@ -290,7 +276,7 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 	}
 	// Reads resolve from the first claiming source; an upload anywhere else
 	// would be stored but never served.
-	if Source(store) != cands[0] {
+	if store != cands[0] {
 		http.Error(w, fmt.Sprintf("%q is served by source %q", name, cands[0].Name()), http.StatusConflict)
 		return
 	}
@@ -310,19 +296,43 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 		return
 	}
 	v, err := store.Upload(r.Context(), caller, name, r.PathValue("version"), data)
+	if err != nil {
+		status, body := uploadStatus(err)
+		if status >= 500 {
+			c.log.Error("composer upload failed", "package", name, "source", store.Name(), "error", err)
+		}
+		http.Error(w, body, status)
+		return
+	}
+	e.sha256 = v.Reference
+	writeJSON(w, http.StatusCreated, c.withDistURL(r, store.Name(), name, v))
+}
+
+// authorize records name in e, answers 403 unless the caller may perform
+// action on it and returns the candidate sources for it.
+func (c *Composer) authorize(w http.ResponseWriter, caller identity.Caller, e *entry, name string, action authz.Action) ([]Source, bool) {
+	e.pkg = name
+	cands, claimed := resolve.Candidates(c.sources, name, Match)
+	e.claimed = claimed
+	if !authz.Allowed(caller.Rules, ecoName, name, action, Match) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	return cands, true
+}
+
+// uploadStatus maps an Upload error to a status and a client-safe body, as
+// resolve.HTTPStatus does for reads.
+func uploadStatus(err error) (int, string) {
 	var ae *archive.Error
 	var ue *UploadError
 	switch {
 	case errors.Is(err, ErrVersionExists):
-		http.Error(w, "version already exists", http.StatusConflict)
+		return http.StatusConflict, "version already exists"
 	case errors.As(err, &ae), errors.As(err, &ue):
-		http.Error(w, err.Error(), http.StatusBadRequest)
-	case err != nil:
-		c.log.Error("composer upload failed", "package", name, "source", store.Name(), "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		return http.StatusBadRequest, err.Error()
 	default:
-		e.sha256 = v.Reference
-		writeJSON(w, http.StatusCreated, c.withDistURL(r, store.Name(), name, v))
+		return http.StatusInternalServerError, "internal error"
 	}
 }
 

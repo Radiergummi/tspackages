@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/server"
+	"github.com/radiergummi/tspackages/internal/workdir"
 	"tailscale.com/tsnet"
 )
 
@@ -44,10 +44,7 @@ func run(configPath string, log *slog.Logger) error {
 		return err
 	}
 	// The state dir holds the node and TLS keys.
-	if cfg.Tailscale.StateDir == "" {
-		return errors.New("tailscale.state_dir is required")
-	}
-	if err := server.EnsurePrivateDir(cfg.Tailscale.StateDir); err != nil {
+	if err := workdir.EnsurePrivateDir(cfg.Tailscale.StateDir); err != nil {
 		return fmt.Errorf("tsnet state dir: %w", err)
 	}
 
@@ -55,7 +52,7 @@ func run(configPath string, log *slog.Logger) error {
 	defer stop()
 
 	// One instance per work_dir: mirrors and key files are not shared.
-	unlock, err := server.LockWorkDir(ctx, cfg.Storage.WorkDir, 60*time.Second, log)
+	unlock, err := workdir.Lock(ctx, cfg.Storage.WorkDir, 60*time.Second, log)
 	if err != nil {
 		return err
 	}

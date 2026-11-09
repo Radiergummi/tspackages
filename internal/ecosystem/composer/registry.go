@@ -83,25 +83,25 @@ func NewRegistrySource(name string, claims []string, baseURL string, c *upstream
 func (s *RegistrySource) Name() string     { return s.name }
 func (s *RegistrySource) Claims() []string { return s.claims }
 
-func (s *RegistrySource) metaKey(pkg string, dev bool) string {
-	suffix := ".json"
+// metaSuffix ends the name of a p2 file holding stable or dev versions.
+func metaSuffix(dev bool) string {
 	if dev {
-		suffix = "~dev.json"
+		return "~dev.json"
 	}
-	return "composer/" + s.name + "/p2/" + pkg + suffix
+	return ".json"
+}
+
+func (s *RegistrySource) metaKey(pkg string, dev bool) string {
+	return "composer/" + s.name + "/p2/" + pkg + metaSuffix(dev)
 }
 
 func (s *RegistrySource) metaURL(pkg string, dev bool) string {
-	suffix := ".json"
-	if dev {
-		suffix = "~dev.json"
-	}
-	return s.base + "/p2/" + pkg + suffix
+	return s.base + "/p2/" + pkg + metaSuffix(dev)
 }
 
 // readCached returns the cached bytes and whether they are still fresh.
 func (s *RegistrySource) readCached(ctx context.Context, key string) (body []byte, fresh, ok bool) {
-	rc, age, err := s.cache.Get(ctx, key)
+	rc, written, err := s.cache.Get(ctx, key)
 	if err != nil {
 		return nil, false, false
 	}
@@ -110,8 +110,7 @@ func (s *RegistrySource) readCached(ctx context.Context, key string) (body []byt
 	if err != nil {
 		return nil, false, false
 	}
-	// Cache ages come from the real clock; shift them by the injected one.
-	age += s.now().Sub(time.Now())
+	age := max(s.now().Sub(written), 0)
 	return body, age < s.ttl, true
 }
 
@@ -145,18 +144,19 @@ func (s *RegistrySource) fetchMeta(ctx context.Context, url string) ([]byte, boo
 	return b, true, nil
 }
 
-// metadata returns the raw p2 document, or found=false for a definite miss.
-func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (body []byte, found bool, err error) {
+// metadata returns the parsed p2 document (nil when it does not list pkg), or
+// found=false for a definite miss.
+func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (vs []Version, found bool, err error) {
 	key := s.metaKey(pkg, dev)
 	cached, fresh, have := s.readCached(ctx, key)
 	if have && fresh {
 		metrics.ObserveCacheHit(ecoName, s.name)
-		return cached, !bytes.Equal(cached, notFoundMarker), nil
+		return parseCached(cached, pkg, dev)
 	}
-	body, found, err = s.fetchMeta(ctx, s.metaURL(pkg, dev))
+	body, found, err := s.fetchMeta(ctx, s.metaURL(pkg, dev))
 	if err == nil && found {
 		// Validate before caching, so garbage never replaces good bytes.
-		_, err = parseMetadata(body, pkg, dev)
+		vs, err = parseMetadata(body, pkg, dev)
 	}
 	s.noteFetch(ctx, err, have)
 	if err != nil {
@@ -164,7 +164,7 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 			// A stale not-found marker is served too, deliberately: during an
 			// outage an unknown name stays unknown rather than turning into a 502.
 			s.log.Warn("serving stale composer metadata", "source", s.name, "package", pkg, "dev", dev, "error", err)
-			return cached, !bytes.Equal(cached, notFoundMarker), nil
+			return parseCached(cached, pkg, dev)
 		}
 		return nil, false, err
 	}
@@ -175,7 +175,16 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (bo
 	if perr := s.cache.Put(ctx, key, bytes.NewReader(toStore)); perr != nil {
 		s.log.Warn("caching composer metadata failed", "source", s.name, "package", pkg, "error", perr)
 	}
-	return body, found, nil
+	return vs, found, nil
+}
+
+// parseCached parses cached metadata; the not-found marker is a definite miss.
+func parseCached(cached []byte, pkg string, dev bool) ([]Version, bool, error) {
+	if bytes.Equal(cached, notFoundMarker) {
+		return nil, false, nil
+	}
+	vs, err := parseMetadata(cached, pkg, dev)
+	return vs, true, err
 }
 
 // parseMetadata decodes a p2 document for pkg; versions is nil when the
@@ -241,22 +250,18 @@ func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 // Versions returns the stable or dev versions of name as upstream lists them,
 // fetching only that file. A 404 on it is a definite miss.
 func (s *RegistrySource) Versions(ctx context.Context, name string, dev bool) ([]Version, error) {
-	pkg, err := Normalize(name)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
-	}
-	body, found, err := s.metadata(ctx, pkg, dev)
+	pkg, err := lookupName(name)
 	if err != nil {
 		return nil, err
 	}
-	if !found {
+	vs, found, err := s.metadata(ctx, pkg, dev)
+	if err != nil {
+		return nil, err
+	}
+	if !found || vs == nil { // nil: the document does not list the package
 		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
 	}
-	vs, err := parseMetadata(body, pkg, dev)
-	if err == nil && vs == nil { // the document does not list the package
-		err = fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
-	}
-	return vs, err
+	return vs, nil
 }
 
 func (s *RegistrySource) distKey(sha256 string) string {
@@ -300,9 +305,9 @@ func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string
 // Dist serves the archive of the version whose number and dist.reference
 // match. The only URL fetched is the dist.url from upstream's own metadata.
 func (s *RegistrySource) Dist(ctx context.Context, name, version, reference string) (Artifact, error) {
-	pkg, err := Normalize(name)
+	pkg, err := lookupName(name)
 	if err != nil {
-		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+		return Artifact{}, err
 	}
 	// The route does not say whether version is a dev version: look in the
 	// stable file first, then in ~dev.
@@ -339,13 +344,11 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 		return a, nil
 	}
 
-	var want *upstream.Digest
 	declared := ""
 	if shasum != "" {
-		want = &upstream.Digest{Algo: "sha1", Hex: shasum}
 		declared = "sha1:" + shasum
 	}
-	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, want)
+	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, shasum)
 	if errors.Is(err, resolve.ErrNotFound) {
 		// Listed in metadata but gone upstream: a source fault, not a miss.
 		return Artifact{}, fmt.Errorf("upstream dist missing for listed version: %v", err)
@@ -367,7 +370,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body))}, nil
 }
 
-func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstream.Digest) (body []byte, sha1Hex, sha256Hex string, err error) {
+func (s *RegistrySource) fetchDist(ctx context.Context, url, wantSHA1 string) (body []byte, sha1Hex, sha256Hex string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
 	defer cancel()
 	if err := s.wait(ctx); err != nil {
@@ -375,7 +378,7 @@ func (s *RegistrySource) fetchDist(ctx context.Context, url string, want *upstre
 	}
 	start := time.Now()
 	defer func() { metrics.ObserveUpstream(s.name, time.Since(start)) }()
-	return s.c.FetchVerified(ctx, url, want, s.maxArtifact)
+	return s.c.FetchVerified(ctx, url, wantSHA1, s.maxArtifact)
 }
 
 // noteFetch records the outcome of an upstream metadata fetch for Health.

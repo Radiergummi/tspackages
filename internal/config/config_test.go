@@ -93,6 +93,8 @@ func TestByteSize(t *testing.T) {
 
 // base is a valid config; SECRET is a placeholder for a string field.
 const base = `
+tailscale:
+  state_dir: /ts
 storage:
   work_dir: /work
   cache: {driver: fs, path: /cache}
@@ -148,7 +150,8 @@ func TestValidateErrors(t *testing.T) {
 		{"work_dir equals cache", strings.Replace(base, "work_dir: /work", "work_dir: /cache", 1), "storage.work_dir and storage.cache must not share a location"},
 		{"work_dir inside state", strings.Replace(base, "work_dir: /work", "work_dir: /state/work", 1), "storage.work_dir and storage.state must not share a location"},
 		{"work_dir contains fs store", strings.Replace(strings.Replace(base, "work_dir: /work", "work_dir: /data", 1), "main: {driver: s3, bucket: b, prefix: hosted/,", "main: {driver: fs, path: /data/hosted,", 1), "storage.work_dir and storage.stores.main must not share a location"},
-		{"work_dir overlaps state_dir", "tailscale: {state_dir: /work/ts}\n" + base, "storage.work_dir and tailscale.state_dir must not share a location"},
+		{"work_dir overlaps state_dir", strings.Replace(base, "state_dir: /ts", "state_dir: /work/ts", 1), "storage.work_dir and tailscale.state_dir must not share a location"},
+		{"no state_dir", strings.Replace(base, "state_dir: /ts", "hostname: r", 1), "tailscale.state_dir is required"},
 		{"registry url host not in fetch_hosts", ecoc(`      - {name: r, type: registry, url: "https://a", fetch_hosts: [b]}
 `), `url host "a" is not in fetch_hosts`},
 		{"credentials host also in download_credentials", ecoc(`      - name: r
@@ -172,7 +175,7 @@ func TestValidateErrors(t *testing.T) {
 
 func TestStoreOverlap(t *testing.T) {
 	storage := func(cache, state, hosted string) string {
-		return "storage:\n  work_dir: /work\n  cache: " + cache + "\n  state: " + state + "\n  stores:\n    main: " + hosted + "\n" +
+		return "tailscale: {state_dir: /ts}\nstorage:\n  work_dir: /work\n  cache: " + cache + "\n  state: " + state + "\n  stores:\n    main: " + hosted + "\n" +
 			"ecosystems:" + strings.SplitN(base, "ecosystems:", 2)[1]
 	}
 	cwd, err := os.Getwd()

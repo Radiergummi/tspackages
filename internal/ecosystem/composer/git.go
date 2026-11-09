@@ -69,10 +69,8 @@ type GitSource struct {
 
 	now func() time.Time // replaced in tests
 
-	hmu     sync.RWMutex // guards the fields below
-	indexed []bool       // per mirror: indexed successfully at least once
-	failing []bool       // per mirror: the last index pass failed
-	pkgOf   []string     // per mirror: the package it declares, as last indexed
+	hmu    sync.RWMutex   // guards status
+	status []remoteStatus // per mirror
 
 	mu     sync.Mutex // serialises Index; guards the fields below
 	prev   []remoteResult
@@ -83,6 +81,12 @@ type GitSource struct {
 }
 
 var _ Source = (*GitSource)(nil)
+
+type remoteStatus struct {
+	indexed bool   // indexed successfully at least once
+	failing bool   // the last index pass failed
+	pkg     string // the package the remote declares, as last indexed
+}
 
 type remoteResult struct {
 	ok       bool // indexed successfully at least once
@@ -125,7 +129,7 @@ func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.M
 	g := &GitSource{
 		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pins, rec: rec,
 		state: state, poll: poll, log: log, maxArchive: maxArchive,
-		now: time.Now, indexed: make([]bool, len(mirrors)), failing: make([]bool, len(mirrors)), pkgOf: make([]string, len(mirrors)),
+		now: time.Now, status: make([]remoteStatus, len(mirrors)),
 		prev:   make([]remoteResult, len(mirrors)),
 		loaded: map[string]loaded{},
 		prov:   map[string]bool{},
@@ -199,7 +203,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 		}
 		g.prev[i] = res
 		g.hmu.Lock()
-		g.indexed[i], g.failing[i], g.pkgOf[i] = res.ok, degraded, res.pkg
+		g.status[i] = remoteStatus{indexed: res.ok, failing: degraded, pkg: res.pkg}
 		g.hmu.Unlock()
 	}
 	g.idx.Store(g.assemble())
@@ -223,7 +227,7 @@ func (g *GitSource) prune() {
 
 func (g *GitSource) setFailing(i int) {
 	g.hmu.Lock()
-	g.failing[i] = true
+	g.status[i].failing = true
 	g.hmu.Unlock()
 }
 
@@ -232,12 +236,9 @@ func (g *GitSource) setFailing(i int) {
 // (they must all agree). cause is why the remote itself could not be indexed.
 func (g *GitSource) fallbackToPins(ctx context.Context, m *gitmirror.Mirror, cause error) (remoteResult, error) {
 	remote := m.Remote()
-	pinned, corrupt, err := g.pins.List(ctx, "composer", g.name, remote)
+	pinned, err := g.listPins(ctx, remote)
 	if err != nil {
 		return remoteResult{}, fmt.Errorf("%w; listing pins: %v", cause, err)
-	}
-	for _, cerr := range corrupt {
-		g.log.Error("composer git: unreadable pin ignored", "source", g.name, "remote", remote, "error", cerr)
 	}
 	type pinnedVersion struct {
 		tag, normalized, commit string
@@ -247,7 +248,7 @@ func (g *GitSource) fallbackToPins(ctx context.Context, m *gitmirror.Mirror, cau
 	pkg := ""
 	for _, p := range pinned {
 		normalized, err := NormalizeVersion(p.Tag)
-		if err != nil || strings.HasPrefix(normalized, "dev-") || strings.HasSuffix(normalized, "-dev") {
+		if err != nil || isDevVersion(normalized) {
 			continue
 		}
 		l, err := g.readMeta(ctx, archiveMetaKey(g.name, p.SHA))
@@ -273,25 +274,58 @@ func (g *GitSource) fallbackToPins(ctx context.Context, m *gitmirror.Mirror, cau
 		return remoteResult{ok: true}, nil
 	}
 	g.log.Warn("composer git: serving pinned versions only", "source", g.name, "remote", remote, "package", pkg, "cause", cause)
-	res := remoteResult{ok: true, pkg: pkg}
-	seen := map[string]bool{}
+	c := g.collector(m, pkg)
 	for _, f := range found {
-		if seen[f.normalized] {
-			continue
-		}
-		if err := g.recordProvenance(ctx, m, pkg, f.tag, f.commit, f.l.d); err != nil {
-			g.skip(ctx, "composer git: version skipped", "source", g.name, "remote", remote, "version", f.tag, "commit", f.commit, "error", err)
-			continue
-		}
-		seen[f.normalized] = true
-		res.versions = append(res.versions, Version{
-			Package:   packageEntry(f.l.meta, pkg, f.tag, f.normalized, f.commit, f.l.d.sha1),
-			Version:   f.tag,
-			Reference: f.commit,
-		})
+		c.add(ctx, f.tag, f.normalized, f.commit, f.l, false)
 	}
-	sortVersions(res.versions)
-	return res, ctx.Err()
+	sortVersions(c.res.versions)
+	return c.res, ctx.Err()
+}
+
+// listPins lists the remote's pins, logging corrupt ones.
+func (g *GitSource) listPins(ctx context.Context, remote string) ([]pins.Pin, error) {
+	pinned, corrupt, err := g.pins.List(ctx, "composer", g.name, remote)
+	if err != nil {
+		return nil, err
+	}
+	for _, cerr := range corrupt {
+		g.log.Error("composer git: unreadable pin ignored", "source", g.name, "remote", remote, "error", cerr)
+	}
+	return pinned, nil
+}
+
+// versionCollector builds the result of indexing one remote.
+type versionCollector struct {
+	g    *GitSource
+	m    *gitmirror.Mirror
+	res  remoteResult
+	seen map[string]bool // normalised versions added
+}
+
+func (g *GitSource) collector(m *gitmirror.Mirror, pkg string) *versionCollector {
+	return &versionCollector{g: g, m: m, res: remoteResult{ok: true, pkg: pkg}, seen: map[string]bool{}}
+}
+
+// add records the version's provenance and appends it, unless a version with
+// the same normalised form was added before; it reports whether it did.
+func (c *versionCollector) add(ctx context.Context, version, normalized, commit string, l loaded, dev bool) bool {
+	g, remote := c.g, c.m.Remote()
+	if c.seen[normalized] {
+		g.log.Debug("composer git: duplicate version skipped", "source", g.name, "remote", remote, "version", version)
+		return false
+	}
+	if err := g.recordProvenance(ctx, c.m, c.res.pkg, version, commit, l.d); err != nil {
+		g.skip(ctx, "composer git: version skipped", "source", g.name, "remote", remote, "version", version, "commit", commit, "error", err)
+		return false
+	}
+	c.seen[normalized] = true
+	c.res.versions = append(c.res.versions, Version{
+		Package:   packageEntry(l.meta, c.res.pkg, version, normalized, commit, l.d.sha1),
+		Version:   version,
+		Reference: commit,
+		Dev:       dev,
+	})
+	return true
 }
 
 // oldestSync is the earliest last sync among the mirrors, zero if one never synced.
@@ -381,33 +415,11 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 		g.log.Warn("composer git: package is outside the source's claims; ignored", "source", g.name, "remote", remote, "package", pkg)
 		return remoteResult{ok: true}, nil
 	}
-	pinned, corrupt, err := g.pins.List(ctx, "composer", g.name, remote)
+	pinned, err := g.listPins(ctx, remote)
 	if err != nil {
 		return remoteResult{}, fmt.Errorf("listing pins: %w", err)
 	}
-	for _, cerr := range corrupt {
-		g.log.Error("composer git: unreadable pin ignored", "source", g.name, "remote", remote, "error", cerr)
-	}
-
-	res := remoteResult{ok: true, pkg: pkg}
-	seen := map[string]bool{}
-	add := func(version, normalized, commit string, l loaded, dev bool) {
-		if seen[normalized] {
-			g.log.Debug("composer git: duplicate version skipped", "source", g.name, "remote", remote, "version", version)
-			return
-		}
-		if err := g.recordProvenance(ctx, m, pkg, version, commit, l.d); err != nil {
-			g.skip(ctx, "composer git: version skipped", "source", g.name, "remote", remote, "version", version, "commit", commit, "error", err)
-			return
-		}
-		seen[normalized] = true
-		res.versions = append(res.versions, Version{
-			Package:   packageEntry(l.meta, pkg, version, normalized, commit, l.d.sha1),
-			Version:   version,
-			Reference: commit,
-			Dev:       dev,
-		})
-	}
+	c := g.collector(m, pkg)
 
 	// Tags: those upstream plus every pinned one, so versions already served
 	// survive their tag (or commit) disappearing.
@@ -432,39 +444,36 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 			g.log.Debug("composer git: tag is not a version", "source", g.name, "remote", remote, "tag", tag)
 			continue
 		}
-		if strings.HasPrefix(normalized, "dev-") || strings.HasSuffix(normalized, "-dev") {
+		if isDevVersion(normalized) {
 			g.skip(ctx, "composer git: tag is a dev version; skipped", "source", g.name, "remote", remote, "tag", tag)
 			continue
 		}
 		commit, up := pinSHA[tag], upstream[tag]
-		switch {
-		case commit == "": // first sight: pin only a commit that validates
+		if commit == "" { // first sight: pin only a commit that validates
 			if _, err := g.loadFor(ctx, m, pkg, up); err != nil {
 				g.skip(ctx, "composer git: tag skipped", "source", g.name, "remote", remote, "tag", tag, "error", err)
 				continue
 			}
-			var moved bool
-			commit, moved, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
+		}
+		// A new tag is pinned; an existing pin always wins, and pinning again
+		// records the move.
+		if commit == "" || (up != "" && up != commit) {
+			pinned, moved, err := g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
 			if err != nil {
 				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
 				continue
 			}
-			if moved { // another instance pinned it first
-				g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", commit, "seen", up)
+			if moved || commit != "" { // moved: another instance pinned it first
+				g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", pinned, "seen", up)
 			}
-		case up != "" && up != commit: // an existing pin always wins; record the move
-			if commit, _, err = g.pins.Pin(ctx, "composer", g.name, remote, tag, up); err != nil {
-				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
-				continue
-			}
-			g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", commit, "seen", up)
+			commit = pinned
 		}
 		l, err := g.loadFor(ctx, m, pkg, commit)
 		if err != nil {
 			g.skip(ctx, "composer git: tag skipped", "source", g.name, "remote", remote, "tag", tag, "error", err)
 			continue
 		}
-		add(tag, normalized, commit, l, false)
+		c.add(ctx, tag, normalized, commit, l, false)
 	}
 
 	for _, r := range refs {
@@ -481,18 +490,16 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 			g.skip(ctx, "composer git: branch skipped", "source", g.name, "remote", remote, "branch", r.Short, "error", err)
 			continue
 		}
-		n := len(res.versions)
-		add(version, normalized, r.Commit, l, true)
-		if r.Short == def && len(res.versions) > n {
-			res.versions[n].Package["default-branch"] = true
+		if c.add(ctx, version, normalized, r.Commit, l, true) && r.Short == def {
+			c.res.versions[len(c.res.versions)-1].Package["default-branch"] = true
 		}
 	}
 	if ctx.Err() != nil {
 		return remoteResult{}, ctx.Err()
 	}
 
-	sortVersions(res.versions)
-	return res, nil
+	sortVersions(c.res.versions)
+	return c.res, nil
 }
 
 // sortVersions orders tags highest first, then dev versions.
@@ -709,18 +716,18 @@ func (g *GitSource) readStored(ctx context.Context, key string, max int64) ([]by
 // declares: OK once indexed and synced within three poll intervals. Package-name conflicts are a separate, not-OK entry.
 func (g *GitSource) Health(context.Context) []metrics.Health {
 	g.hmu.RLock()
-	indexed, failing, pkgOf := slices.Clone(g.indexed), slices.Clone(g.failing), slices.Clone(g.pkgOf)
+	status := slices.Clone(g.status)
 	g.hmu.RUnlock()
 	var out []metrics.Health
 	for i, m := range g.mirrors {
-		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Scoped: true, Package: pkgOf[i]}
+		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Scoped: true, Package: status[i].pkg}
 		last := m.LastSync()
 		switch {
-		case !indexed[i]:
+		case !status[i].indexed:
 			h.Detail = "never indexed"
 		case g.now().Sub(last) > 3*g.poll:
 			h.Detail = "sync stale"
-		case failing[i]:
+		case status[i].failing:
 			h.Detail = "index failing"
 		default:
 			h.OK = true
@@ -728,7 +735,7 @@ func (g *GitSource) Health(context.Context) []metrics.Health {
 		}
 		out = append(out, h)
 	}
-	if cs := g.Conflicts(); len(cs) > 0 {
+	if len(g.idx.Load().conflicts) > 0 {
 		out = append(out, metrics.Health{Name: g.name + " conflicts", Detail: "conflict"})
 	}
 	return out
@@ -744,7 +751,7 @@ func (g *GitSource) MovedPackage(m pins.MovedTag) string {
 	defer g.hmu.RUnlock()
 	for i, mir := range g.mirrors {
 		if mir.Remote() == m.Remote {
-			return g.pkgOf[i]
+			return g.status[i].pkg
 		}
 	}
 	return ""
@@ -776,9 +783,9 @@ func (g *GitSource) lookup(pkg string) ([]Version, error) {
 // Versions returns the indexed tags (highest first) or, with dev, the indexed
 // dev branches of name. The returned metadata is a copy the caller may modify.
 func (g *GitSource) Versions(_ context.Context, name string, dev bool) ([]Version, error) {
-	pkg, err := Normalize(name)
+	pkg, err := lookupName(name)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+		return nil, err
 	}
 	vs, err := g.lookup(pkg)
 	if err != nil {
@@ -801,9 +808,9 @@ func (g *GitSource) Versions(_ context.Context, name string, dev bool) ([]Versio
 // commit indexed for that name and version; anything else is not found, so a
 // client cannot reach commits that are not published.
 func (g *GitSource) Dist(ctx context.Context, name, version, reference string) (Artifact, error) {
-	pkg, err := Normalize(name)
+	pkg, err := lookupName(name)
 	if err != nil {
-		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+		return Artifact{}, err
 	}
 	vs, err := g.lookup(pkg)
 	if err != nil {

@@ -29,6 +29,9 @@ func ValidateWith(c *Config, opts ValidateOptions) error {
 	var errs []error
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
+	if c.Tailscale.StateDir == "" {
+		add("tailscale.state_dir is required") // it holds the node and TLS keys
+	}
 	errs = append(errs, validateStores(&c.Storage)...)
 	errs = append(errs, validateWorkDir(c)...)
 	errs = append(errs, validateLimits(&c.Limits)...)

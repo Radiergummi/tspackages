@@ -94,21 +94,22 @@ func (c *Cache) lockKey(key string) func() {
 	}
 }
 
-// Get opens key and marks it as used. A missing key returns ErrNotFound.
-func (c *Cache) Get(ctx context.Context, key string) (io.ReadCloser, time.Duration, error) {
+// Get opens key, marks it as used and returns when it was written. A missing
+// key returns ErrNotFound.
+func (c *Cache) Get(ctx context.Context, key string) (io.ReadCloser, time.Time, error) {
 	rc, info, err := c.d.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			c.forget(ctx, key)
 		}
-		return nil, 0, err
+		return nil, time.Time{}, err
 	}
 	c.mu.Lock()
 	if el, ok := c.entries[key]; ok {
 		c.lru.MoveToFront(el)
 	}
 	c.mu.Unlock()
-	return rc, max(time.Since(info.ModTime), 0), nil
+	return rc, info.ModTime, nil
 }
 
 // Put stores r under key, then evicts least-recently-used entries until the

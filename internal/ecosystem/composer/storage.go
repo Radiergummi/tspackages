@@ -70,7 +70,7 @@ var trustedLimits = archive.Limits{MaxBytes: math.MaxInt64, MaxDecompressed: mat
 // errCorruptIndex marks an index.json that cannot be decoded.
 var errCorruptIndex = errors.New("composer: corrupt index")
 
-var _ Source = (*StorageSource)(nil)
+var _ Uploader = (*StorageSource)(nil)
 
 func NewStorageSource(name string, claims []string, d storage.Driver, rec *records.Store, l archive.Limits, log *slog.Logger) *StorageSource {
 	if log == nil {
@@ -122,9 +122,6 @@ func (s *StorageSource) putSidecar(ctx context.Context, pkg, normalized string, 
 // previous upload died between the two writes), the index is repaired first;
 // the same bytes then succeed idempotently, other bytes get ErrVersionExists.
 func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, name, version string, zipData []byte) (Version, error) {
-	if int64(len(zipData)) > s.limits.MaxBytes {
-		return Version{}, &archive.Error{Reason: fmt.Sprintf("archive exceeds %d bytes", s.limits.MaxBytes)}
-	}
 	pkg, err := Normalize(name)
 	if err != nil {
 		return Version{}, rejectUpload("%v", err)
@@ -198,6 +195,7 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 }
 
 func (s *StorageSource) record(ctx context.Context, caller identity.Caller, pkg string, v Version, sha1Hex string) error {
+	u := records.UploaderFrom(caller)
 	if err := s.rec.PutProvenance(ctx, records.Provenance{
 		Ecosystem:  "composer",
 		Package:    pkg,
@@ -206,7 +204,7 @@ func (s *StorageSource) record(ctx context.Context, caller identity.Caller, pkg 
 		SourceType: "storage",
 		SHA1:       sha1Hex,
 		SHA256:     v.Reference,
-		Uploader:   records.UploaderFrom(caller),
+		Uploader:   &u,
 	}); err != nil {
 		return err
 	}
@@ -216,7 +214,7 @@ func (s *StorageSource) record(ctx context.Context, caller identity.Caller, pkg 
 		Package:   pkg,
 		Version:   v.Version,
 		SHA256:    v.Reference,
-		Uploader:  *records.UploaderFrom(caller),
+		Uploader:  u,
 	})
 }
 
@@ -236,7 +234,7 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 	if err != nil {
 		return Version{}, "", rejectUpload("%v", err)
 	}
-	if strings.HasSuffix(normalized, "-dev") || strings.HasPrefix(normalized, "dev-") {
+	if isDevVersion(normalized) {
 		return Version{}, "", rejectUpload("dev versions cannot be uploaded: %q", version)
 	}
 	zr, err := archive.InspectZip(zipData, l)
@@ -281,32 +279,23 @@ func (s *StorageSource) inspect(pkg, version string, zipData []byte, l archive.L
 // addToIndex adds v to the package index, retrying when a concurrent upload
 // changed it, and reports whether the index lacked it. A missing or corrupt
 // index is first derived from the stored zips.
-func (s *StorageSource) addToIndex(ctx context.Context, pkg string, v Version) (added bool, err error) {
+func (s *StorageSource) addToIndex(ctx context.Context, pkg string, v Version) (bool, error) {
 	for range indexRetries {
 		idx, etag, err := s.loadIndex(ctx, pkg)
+		rebuilt := false // a missing or corrupt index lacked v
 		switch {
-		case errors.Is(err, storage.ErrNotFound):
+		case errors.Is(err, storage.ErrNotFound), errors.Is(err, errCorruptIndex):
 			// Derive from the stored zips (which include v) so versions
 			// uploaded while the index was lost are not dropped.
 			if idx, _, err = s.scan(ctx, pkg); err != nil {
 				return false, err
 			}
-			etag = ""
-			added = true // the index did not exist, so it lacked v
-		case errors.Is(err, errCorruptIndex):
-			if idx, _, err = s.scan(ctx, pkg); err != nil {
-				return false, err
-			}
-			added = true
+			rebuilt = true
 		case err != nil:
 			return false, err
-		default:
-			added = false
 		}
-		var had bool
-		idx, had = upsert(idx, v)
-		added = added || !had
-		if !added {
+		idx, had := upsert(idx, v)
+		if had && !rebuilt {
 			return false, nil
 		}
 		err = s.writeIndex(ctx, pkg, idx, etag)
@@ -363,8 +352,7 @@ func (s *StorageSource) writeIndex(ctx context.Context, pkg string, vs []Version
 // returning) those that cannot be read so one bad archive does not hide the
 // rest. Archives are inspected under trustedLimits. The version spelling comes
 // from the sidecar; without one it is the normalised version with trailing ".0"
-// parts trimmed ("1.2.0.0" becomes "1.2.0"). zips is the number of archives
-// found.
+// parts trimmed ("1.2.0.0" becomes "1.2.0").
 func (s *StorageSource) scan(ctx context.Context, pkg string) (vs []Version, skipped []error, err error) {
 	var keys []string
 	for info, err := range s.d.List(ctx, "composer/"+pkg+"/") {
@@ -504,18 +492,18 @@ func (s *StorageSource) doRebuild(ctx context.Context, pkg string) ([]Version, [
 // empty list for a known name. A missing or corrupt index is rebuilt from the
 // zips; an unknown name costs one Get of index.json plus one List.
 func (s *StorageSource) Versions(ctx context.Context, name string, dev bool) ([]Version, error) {
-	vs, err := s.versions(ctx, name)
+	pkg, err := lookupName(name)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.versions(ctx, pkg)
 	if err != nil || !dev {
 		return vs, err
 	}
 	return []Version{}, nil
 }
 
-func (s *StorageSource) versions(ctx context.Context, name string) ([]Version, error) {
-	pkg, err := Normalize(name)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
-	}
+func (s *StorageSource) versions(ctx context.Context, pkg string) ([]Version, error) {
 	vs, _, err := s.loadIndex(ctx, pkg)
 	if errors.Is(err, storage.ErrNotFound) || errors.Is(err, errCorruptIndex) {
 		vs, err = s.rebuild(ctx, pkg)
@@ -540,14 +528,17 @@ func (s *StorageSource) Dist(ctx context.Context, name, version, reference strin
 	if err != nil {
 		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
 	}
-	vs, err := s.versions(ctx, name)
+	pkg, err := lookupName(name)
+	if err != nil {
+		return Artifact{}, err
+	}
+	vs, err := s.versions(ctx, pkg)
 	if err != nil {
 		return Artifact{}, err
 	}
 	if !slices.ContainsFunc(vs, func(v Version) bool { return normalizedOf(v) == normalized && v.Reference == reference }) {
 		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, name, version)
 	}
-	pkg, _ := Normalize(name)
 	rc, info, err := s.d.Get(ctx, zipKey(pkg, normalized))
 	if errors.Is(err, storage.ErrNotFound) {
 		return Artifact{}, fmt.Errorf("%w: %s %s", resolve.ErrNotFound, name, version)

@@ -46,23 +46,25 @@ func reader() *identity.Caller {
 	return &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"*"}}}}
 }
 
+// movedPkg maps remotes containing "other" to b/x, all others to a/x.
+func movedPkg(m pins.MovedTag) string {
+	if strings.Contains(m.Remote, "other") {
+		return "b/x"
+	}
+	return "a/x"
+}
+
 func newWeb(ready func(context.Context) error) *Web {
-	w := New("fallback", []ecosystem.Ecosystem{fakeEco{}},
+	return New("fallback", []ecosystem.Ecosystem{fakeEco{}},
 		[]StatusSource{fakeSource{{Name: "main", OK: true, Detail: "fine"}, {Name: "<b>bad</b>", OK: false, Detail: "never indexed"}}},
 		func() []pins.MovedTag {
 			return []pins.MovedTag{{Ecosystem: "composer", Source: "git", Remote: "https://x/y.git", Tag: "v1.0.0<script>", Pinned: "aaa", Seen: "bbb"}}
 		},
+		movedPkg,
 		func() []composer.Conflict {
 			return []composer.Conflict{{Package: "a/b", Remotes: []string{"r1", "r2"}}}
 		},
 		ready)
-	w.SetMovedPackage(func(m pins.MovedTag) string {
-		if strings.Contains(m.Remote, "other") {
-			return "b/x"
-		}
-		return "a/x"
-	})
-	return w
 }
 
 func TestStatusShowsMovedTag(t *testing.T) {
@@ -122,7 +124,7 @@ func TestStatusFiltersScopedHealthRows(t *testing.T) {
 		{Name: "git https://h/a.git", Scoped: true, Package: "a/x", OK: true, Detail: "x"},
 		{Name: "git https://h/b.git", Scoped: true, Package: "b/x", OK: true, Detail: "x"},
 		{Name: "git https://h/unknown.git", Scoped: true, OK: false, Detail: "never indexed"},
-	}}, nil, nil, nil)
+	}}, nil, nil, nil, nil)
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
 	body := serve(t, w, "/", c).Body.String()
 	for _, want := range []string{"store", "h/a.git"} {
@@ -177,22 +179,20 @@ func TestReadyzClientCancelled(t *testing.T) {
 }
 
 func TestStatusFiltersByReadRules(t *testing.T) {
-	w := New("h", []ecosystem.Ecosystem{fakeEco{}}, nil,
-		func() []pins.MovedTag {
-			return []pins.MovedTag{
-				{Source: "git", Remote: "https://tok@h/a.git", Tag: "v-a", Pinned: "1", Seen: "2"},
-				{Source: "git", Remote: "https://h/other.git", Tag: "v-b", Pinned: "1", Seen: "2"},
-			}
-		},
-		func() []composer.Conflict {
-			return []composer.Conflict{{Package: "a/x", Remotes: []string{"https://tok@h/1.git", "r2"}}, {Package: "b/x", Remotes: []string{"r3", "r4"}}}
-		}, nil)
-	w.SetMovedPackage(func(m pins.MovedTag) string {
-		if strings.Contains(m.Remote, "other") {
-			return "b/x"
-		}
-		return "a/x"
-	})
+	newW := func(movedPkg func(pins.MovedTag) string) *Web {
+		return New("h", []ecosystem.Ecosystem{fakeEco{}}, nil,
+			func() []pins.MovedTag {
+				return []pins.MovedTag{
+					{Source: "git", Remote: "https://tok@h/a.git", Tag: "v-a", Pinned: "1", Seen: "2"},
+					{Source: "git", Remote: "https://h/other.git", Tag: "v-b", Pinned: "1", Seen: "2"},
+				}
+			},
+			movedPkg,
+			func() []composer.Conflict {
+				return []composer.Conflict{{Package: "a/x", Remotes: []string{"https://tok@h/1.git", "r2"}}, {Package: "b/x", Remotes: []string{"r3", "r4"}}}
+			}, nil)
+	}
+	w := newW(movedPkg)
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
 	body := serve(t, w, "/", c).Body.String()
 	for _, want := range []string{"v-a", "a/x"} {
@@ -206,8 +206,7 @@ func TestStatusFiltersByReadRules(t *testing.T) {
 		}
 	}
 	// No movedPackage mapping: moved tags are hidden (fail closed).
-	w.movedPkg = nil
-	if body := serve(t, w, "/", c).Body.String(); strings.Contains(body, "v-a") {
+	if body := serve(t, newW(nil), "/", c).Body.String(); strings.Contains(body, "v-a") {
 		t.Error("moved tag shown without package mapping")
 	}
 }
@@ -218,7 +217,7 @@ func TestMetricsExposed(t *testing.T) {
 	metrics.ObserveUpstream("main", time.Second)
 	metrics.SetGitLastSync("git", time.Unix(1700000000, 0))
 	w := newWeb(nil)
-	w.SetRejected(func() uint64 { return 7 })
+	metrics.SetRejected(func() uint64 { return 7 })
 	rec := serve(t, w, "/metrics", reader())
 	body := rec.Body.String()
 	for _, want := range []string{

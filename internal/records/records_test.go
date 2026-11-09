@@ -29,7 +29,7 @@ func TestProvenanceIdempotent(t *testing.T) {
 	p := Provenance{
 		Ecosystem: "composer", Package: "Matchory/SDK", Version: "1.0.0/rc",
 		Source: "gh", SourceType: "git", SHA256: sum,
-		Attestation: "sigstore:id", Uploader: UploaderFrom(identity.Caller{Login: "a@b", Tags: []string{"tag:x"}, NodeName: "n", NodeStableID: "s"}),
+		Attestation: "sigstore:id", Uploader: new(UploaderFrom(identity.Caller{Login: "a@b", Tags: []string{"tag:x"}, NodeName: "n", NodeStableID: "s"})),
 	}
 	if err := s.PutProvenance(ctx, p); err != nil {
 		t.Fatal(err)

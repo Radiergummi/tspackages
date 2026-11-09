@@ -143,7 +143,7 @@ func TestComposerEndToEnd(t *testing.T) {
 
 	statePath := filepath.Join(root, "state")
 	cfg := &config.Config{
-		Tailscale: config.Tailscale{Hostname: "registry", Capability: capName},
+		Tailscale: config.Tailscale{Hostname: "registry", Capability: capName, StateDir: filepath.Join(root, "ts")},
 		Storage: config.Storage{
 			WorkDir: filepath.Join(root, "work"),
 			Cache:   config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "cache"), MaxSize: 1 << 30},

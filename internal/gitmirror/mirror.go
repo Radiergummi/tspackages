@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,7 +45,7 @@ type Options struct {
 	KnownHostsPath string
 	Token          string
 
-	// Logger receives warnings; nil means slog.Default().
+	// Logger receives warnings; nil means slog.Default() as of New.
 	Logger *slog.Logger
 
 	// AllowFileRemotesForTesting permits file:// URLs and local paths as
@@ -67,9 +68,11 @@ type Mirror struct {
 	syncTimeout time.Duration // bounds one Sync; replaced in tests
 	killDelay   time.Duration // SIGTERM to SIGKILL of a cancelled git's process group
 
-	mu       sync.Mutex // serialises Sync
-	stateMu  sync.RWMutex
-	lastSync time.Time // guarded by stateMu
+	mu         sync.Mutex // serialises Sync; guards fetchClean
+	fetchClean bool       // the last fetch in this process completed, so no stale locks are left
+
+	lastSync      atomic.Pointer[time.Time]
+	defaultBranch atomic.Pointer[string] // as last set from the remote by this process
 }
 
 const (
@@ -126,6 +129,9 @@ func New(o Options) (*Mirror, error) {
 		}
 	}
 	o.BaseDir = base
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
 	identity := o.SSHKeyPath
 	if o.Token != "" {
 		t := sha256.Sum256([]byte(o.Token))
@@ -171,13 +177,6 @@ func RemoteKind(r string, allowFile bool) (string, error) {
 	return "", fmt.Errorf("gitmirror: unsupported remote %q (use https:// or ssh)", r)
 }
 
-func (m *Mirror) log() *slog.Logger {
-	if m.opts.Logger != nil {
-		return m.opts.Logger
-	}
-	return slog.Default()
-}
-
 // Remote returns the remote URL the mirror was configured with.
 func (m *Mirror) Remote() string { return m.opts.Remote }
 
@@ -186,9 +185,10 @@ func (m *Mirror) Dir() string { return m.dir }
 
 // LastSync returns the time of the last successful Sync (zero if none).
 func (m *Mirror) LastSync() time.Time {
-	m.stateMu.RLock()
-	defer m.stateMu.RUnlock()
-	return m.lastSync
+	if t := m.lastSync.Load(); t != nil {
+		return *t
+	}
+	return time.Time{}
 }
 
 // Sync creates the mirror on first use and fetches branches and tags
@@ -205,7 +205,10 @@ func (m *Mirror) Sync(ctx context.Context) error {
 	_, err := os.Stat(filepath.Join(m.dir, "HEAD"))
 	switch {
 	case err == nil:
-		m.removeStaleLocks()
+		if !m.fetchClean {
+			m.removeStaleLocks()
+		}
+		m.fetchClean = false
 		if err := m.fetch(ctx, m.dir); err != nil {
 			return err
 		}
@@ -216,18 +219,18 @@ func (m *Mirror) Sync(ctx context.Context) error {
 	default:
 		return err
 	}
+	m.fetchClean = true
 	// The refs are fetched; a failure to learn the remote's default branch
 	// only keeps the previous HEAD.
 	if err := m.followRemoteHead(ctx); err != nil {
 		if ctx.Err() != nil {
 			return err
 		}
-		m.log().Warn("gitmirror: could not read the remote's default branch; keeping the previous HEAD",
+		m.opts.Logger.Warn("gitmirror: could not read the remote's default branch; keeping the previous HEAD",
 			"remote", m.opts.Remote, "error", err)
 	}
-	m.stateMu.Lock()
-	m.lastSync = time.Now()
-	m.stateMu.Unlock()
+	now := time.Now()
+	m.lastSync.Store(&now)
 	return nil
 }
 
@@ -274,9 +277,10 @@ func (m *Mirror) fetch(ctx context.Context, gitDir string) error {
 }
 
 // removeStaleLocks deletes leftover ref and packed-refs lock files from a
-// killed fetch. All of them, regardless of age: Sync holds m.mu and the
-// directory is private to this mirror (keyed by remote and credentials), so no
-// live writer can own a lock when Sync starts.
+// killed fetch. Sync runs it before a fetch unless the previous fetch in this
+// process completed. It removes all of them, regardless of age: Sync holds m.mu
+// and the directory is private to this mirror (keyed by remote and
+// credentials), so no live writer can own a lock when Sync starts.
 func (m *Mirror) removeStaleLocks() {
 	for _, f := range []string{"packed-refs.lock", "shallow.lock"} {
 		_ = os.Remove(filepath.Join(m.dir, f))
@@ -289,7 +293,8 @@ func (m *Mirror) removeStaleLocks() {
 	})
 }
 
-// followRemoteHead points the mirror's HEAD at the remote's default branch.
+// followRemoteHead points the mirror's HEAD at the remote's default branch,
+// unless it already points there.
 func (m *Mirror) followRemoteHead(ctx context.Context) error {
 	out, err := m.git(ctx, m.dir, nil, nil, "ls-remote", "--symref", "--", "origin", "HEAD")
 	if err != nil {
@@ -301,8 +306,14 @@ func (m *Mirror) followRemoteHead(ctx context.Context) error {
 			if branch == "" {
 				continue
 			}
-			_, err := m.git(ctx, m.dir, nil, nil, "symbolic-ref", "HEAD", "refs/heads/"+branch)
-			return err
+			if cur := m.defaultBranch.Load(); cur != nil && *cur == branch {
+				return nil
+			}
+			if _, err := m.git(ctx, m.dir, nil, nil, "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+				return err
+			}
+			m.defaultBranch.Store(&branch)
+			return nil
 		}
 	}
 	return nil
@@ -351,6 +362,9 @@ func (m *Mirror) Refs(ctx context.Context) ([]Ref, error) {
 // DefaultBranch returns the branch the mirror's HEAD points to (the remote's
 // default branch as of the last Sync).
 func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
+	if b := m.defaultBranch.Load(); b != nil {
+		return *b, nil
+	}
 	out, err := m.git(ctx, m.dir, nil, nil, "symbolic-ref", "HEAD")
 	if err != nil {
 		return "", err
@@ -362,8 +376,8 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 // path or commit wraps resolve.ErrNotFound; files over 1 MiB are an error
 // (this is for small manifests such as composer.json and go.mod).
 func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, error) {
-	if !digest.IsHex(commit, 40, 64) {
-		return nil, fmt.Errorf("gitmirror: invalid commit %q", commit)
+	if err := checkCommit(commit); err != nil {
+		return nil, err
 	}
 	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00\n") {
 		return nil, fmt.Errorf("gitmirror: invalid path %q", path)
@@ -407,11 +421,19 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 // must treat anything already written to w as invalid when an error is
 // returned (the stream can be cut off part-way).
 func (m *Mirror) ArchiveZip(ctx context.Context, commit string, w io.Writer) error {
-	if !digest.IsHex(commit, 40, 64) {
-		return fmt.Errorf("gitmirror: invalid commit %q", commit)
+	if err := checkCommit(commit); err != nil {
+		return err
 	}
 	_, err := m.git(ctx, m.dir, nil, w, "archive", "--format=zip", commit)
 	return err
+}
+
+// checkCommit accepts a full SHA-1 or SHA-256 commit id.
+func checkCommit(commit string) error {
+	if !digest.IsHex(commit, 40, 64) {
+		return fmt.Errorf("gitmirror: invalid commit %q", commit)
+	}
+	return nil
 }
 
 type gitError struct {

@@ -64,17 +64,24 @@ func First[S Claimed, T any](ctx context.Context, cands []S, fn func(context.Con
 		if err == nil {
 			return v, s, nil
 		}
-		if errors.Is(err, ErrNotFound) && !isJoined(err) {
+		if definiteMiss(err) {
 			continue
 		}
-		return zeroT, zeroS, &SourceError{
-			Source:  s.Name(),
-			Err:     err,
-			Timeout: isTimeout(err),
-		}
+		return zeroT, zeroS, Wrap(s.Name(), err)
 	}
 	return zeroT, zeroS, ErrNotFound
 }
+
+// Wrap returns the error of one source: nil and definite misses unchanged,
+// anything else as a *SourceError.
+func Wrap(source string, err error) error {
+	if err == nil || definiteMiss(err) {
+		return err
+	}
+	return &SourceError{Source: source, Err: err, Timeout: isTimeout(err)}
+}
+
+func definiteMiss(err error) bool { return errors.Is(err, ErrNotFound) && !isJoined(err) }
 
 // isJoined reports whether a multi-error (errors.Join or similar) is anywhere
 // in the chain; such an error may hide a real failure next to a not-found.

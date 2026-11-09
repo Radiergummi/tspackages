@@ -328,14 +328,30 @@ func TestRunStopsOnCancel(t *testing.T) {
 	}
 }
 
-func versionsOf(t *testing.T, g *GitSource, name string) map[string]Version {
+// allVersions returns the stable and then the dev versions of name.
+func allVersions(ctx context.Context, g *GitSource, name string) ([]Version, error) {
+	vs, err := g.Versions(ctx, name, false)
+	if err != nil {
+		return nil, err
+	}
+	dev, err := g.Versions(ctx, name, true)
+	return append(vs, dev...), err
+}
+
+func mustVersions(t *testing.T, g *GitSource, name string) []Version {
 	t.Helper()
 	vs, err := allVersions(context.Background(), g, name)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return vs
+}
+
+// versionsOf is mustVersions by version string.
+func versionsOf(t *testing.T, g *GitSource, name string) map[string]Version {
+	t.Helper()
 	out := map[string]Version{}
-	for _, v := range vs {
+	for _, v := range mustVersions(t, g, name) {
 		out[v.Version] = v
 	}
 	return out
@@ -370,17 +386,9 @@ func TestTransientFailureKeepsPreviousIndex(t *testing.T) {
 	if err := g.Index(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := versionNames(mapVals(versionsOf(t, g, "matchory/a"))); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
+	if got := versionNames(mustVersions(t, g, "matchory/a")); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
 		t.Fatalf("versions = %v", got)
 	}
-}
-
-func mapVals(m map[string]Version) []Version {
-	var out []Version
-	for _, v := range m {
-		out = append(out, v)
-	}
-	return out
 }
 
 func TestConflictStaysWithheldWhenOneSideFails(t *testing.T) {
@@ -601,7 +609,7 @@ func TestCancelledPassDoesNotChangeIndex(t *testing.T) {
 	if err := g.Index(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Index = %v", err)
 	}
-	if got := versionNames(mapVals(versionsOf(t, g, "matchory/a"))); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
+	if got := versionNames(mustVersions(t, g, "matchory/a")); !slices.Equal(got, []string{"dev-main", "v1.0.0"}) {
 		t.Fatalf("versions = %v", got)
 	}
 	if strings.Contains(logs.String(), "skipped") || strings.Contains(logs.String(), "failed") {
@@ -757,15 +765,6 @@ func TestFirstSightPinLostRaceLogsMove(t *testing.T) {
 }
 
 // allVersions is the stable versions of name followed by its dev versions.
-func allVersions(ctx context.Context, g *GitSource, name string) ([]Version, error) {
-	vs, err := g.Versions(ctx, name, false)
-	if err != nil {
-		return nil, err
-	}
-	dev, err := g.Versions(ctx, name, true)
-	return append(vs, dev...), err
-}
-
 func TestVersionsSplitByDevAndDefaultBranchFlag(t *testing.T) {
 	src := gitRepo(t, "matchory/a")
 	testutil.Git(t, src, "tag", "v1.0.0")
@@ -892,15 +891,6 @@ func TestPinFallbackSkipsDisagreeingNames(t *testing.T) {
 			t.Errorf("%s served despite disagreeing pins", n)
 		}
 	}
-}
-
-func mustVersions(t *testing.T, g *GitSource, name string) []Version {
-	t.Helper()
-	vs, err := allVersions(context.Background(), g, name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return vs
 }
 
 func TestLoadedAndProvenanceCachesPruned(t *testing.T) {

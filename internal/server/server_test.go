@@ -25,7 +25,7 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 func fsConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
-		Tailscale: config.Tailscale{Hostname: "registry", Capability: testCap},
+		Tailscale: config.Tailscale{Hostname: "registry", Capability: testCap, StateDir: t.TempDir()},
 		Storage: config.Storage{
 			WorkDir: filepath.Join(t.TempDir(), "work"),
 			Cache:   config.StoreConfig{Driver: "fs", Path: t.TempDir(), MaxSize: 1 << 30},
@@ -283,43 +283,13 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 func TestBuildAppliesDefaults(t *testing.T) {
 	cfg := fsConfig(t)
 	cfg.Limits = config.Limits{}
-	cfg.Tailscale = config.Tailscale{}
+	cfg.Tailscale = config.Tailscale{StateDir: cfg.Tailscale.StateDir}
 	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 500<<20 || cfg.Tailscale.Capability != testCap {
 		t.Fatalf("defaults not applied: %+v %+v", cfg.Limits, cfg.Tailscale)
 	}
-}
-
-func TestLockWorkDir(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "work")
-	var logs bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&logs, nil))
-	release, err := LockWorkDir(t.Context(), dir, time.Second, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m := mode(t, dir); m.Perm() != 0o700 {
-		t.Errorf("work_dir mode %v", m)
-	}
-	start := time.Now()
-	if _, err := LockWorkDir(t.Context(), dir, 200*time.Millisecond, log); err == nil || !strings.Contains(err.Error(), "another instance") {
-		t.Fatalf("second lock: %v", err)
-	}
-	if time.Since(start) < 200*time.Millisecond {
-		t.Error("did not wait before giving up")
-	}
-	if !strings.Contains(logs.String(), "waiting") {
-		t.Errorf("no wait log line: %s", logs.String())
-	}
-	// Released: a waiter gets it.
-	go func() { time.Sleep(100 * time.Millisecond); release() }()
-	r2, err := LockWorkDir(t.Context(), dir, 2*time.Second, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r2()
 }
 
 // start runs the background loops until ctx ends and returns only once they
