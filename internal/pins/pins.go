@@ -78,6 +78,14 @@ func (s *Store) Pin(ctx context.Context, ecosystem, source, remote, tag, sha str
 	return pf.SHA, true, nil
 }
 
+// CheckRemote returns an error if remote is too long to be pinned.
+func CheckRemote(ecosystem, source, remote string) error {
+	if err := storage.ValidKey(keyPrefix(ecosystem, source, remote) + "x.json"); err != nil {
+		return fmt.Errorf("pins: remote %q is too long to pin (at most %d bytes)", remote, storage.MaxSegment*5/8)
+	}
+	return nil
+}
+
 func keyPrefix(ecosystem, source, remote string) string {
 	return "pins/" + ecosystem + "/" + source + "/" + storage.EscapeSegment(remote) + "/"
 }

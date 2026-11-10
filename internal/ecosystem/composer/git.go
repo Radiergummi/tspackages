@@ -119,17 +119,22 @@ type gitIndex struct {
 
 // NewGitSource validates the branch allowlist (path.Match syntax); poll <= 0
 // means one minute.
-func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.Mirror, pins *pins.Store, rec *records.Store, state storage.Driver, poll time.Duration, log *slog.Logger, maxArchive int64) (*GitSource, error) {
+func NewGitSource(name string, claims, branches []string, mirrors []*gitmirror.Mirror, pinStore *pins.Store, rec *records.Store, state storage.Driver, poll time.Duration, log *slog.Logger, maxArchive int64) (*GitSource, error) {
 	for _, p := range branches {
 		if _, err := path.Match(p, ""); err != nil {
 			return nil, fmt.Errorf("composer git source %q: invalid branch pattern %q: %w", name, p, err)
+		}
+	}
+	for _, m := range mirrors {
+		if err := pins.CheckRemote(ecoName, name, m.Remote()); err != nil {
+			return nil, fmt.Errorf("composer git source %q: %w", name, err)
 		}
 	}
 	if poll <= 0 {
 		poll = time.Minute
 	}
 	g := &GitSource{
-		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pins, rec: rec,
+		name: name, claims: claims, branches: branches, mirrors: mirrors, pins: pinStore, rec: rec,
 		state: state, poll: poll, log: log, maxArchive: maxArchive,
 		now: time.Now, status: make([]remoteStatus, len(mirrors)),
 		prev:   make([]remoteResult, len(mirrors)),

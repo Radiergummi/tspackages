@@ -59,12 +59,17 @@ func ValidKey(key string) error {
 		return fmt.Errorf("%w: length %d", ErrInvalidKey, len(key))
 	}
 	for seg := range strings.SplitSeq(key, "/") {
-		if seg == "." || seg == ".." || !segmentRE.MatchString(seg) {
+		if seg == "." || seg == ".." || len(seg) > MaxSegment || !segmentRE.MatchString(seg) {
 			return fmt.Errorf("%w: %q", ErrInvalidKey, key)
 		}
 	}
 	return nil
 }
+
+// MaxSegment is the longest key segment, in bytes: the common 255-byte
+// filename limit less the fs driver's sidecar suffixes, so every driver
+// accepts the same keys.
+const MaxSegment = 255 - len(etagSuffix)
 
 var segmentEncoding = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv").WithPadding(base32.NoPadding)
 

@@ -266,3 +266,13 @@ func TestListCorruptIsErrCorrupt(t *testing.T) {
 		t.Fatalf("corrupt = %v err = %v", corrupt, err)
 	}
 }
+
+func TestCheckRemote(t *testing.T) {
+	ok := "https://example.com/" + strings.Repeat("a", 156-len("https://example.com/"))
+	if err := CheckRemote("composer", "git", ok); err != nil {
+		t.Fatalf("%d bytes: %v", len(ok), err)
+	}
+	if err := CheckRemote("composer", "git", ok+"a"); err == nil {
+		t.Fatalf("%d bytes accepted", len(ok)+1)
+	}
+}

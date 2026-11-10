@@ -264,6 +264,13 @@ func TestValidKey(t *testing.T) {
 	if err := ValidKey(string(long)); !errors.Is(err, ErrInvalidKey) {
 		t.Errorf("long: %v", err)
 	}
+	seg := strings.Repeat("a", MaxSegment)
+	if err := ValidKey("x/" + seg); err != nil {
+		t.Errorf("segment of %d bytes: %v", MaxSegment, err)
+	}
+	if err := ValidKey("x/" + seg + "a"); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("segment of %d bytes: %v", MaxSegment+1, err)
+	}
 }
 
 func TestEscapeSegment(t *testing.T) {
@@ -281,7 +288,7 @@ func TestEscapeSegment(t *testing.T) {
 	for i := range all {
 		all[i] = byte(i)
 	}
-	for _, in := range []string{"A", "a", "release/2026-01", "Zz9", string(all)} {
+	for _, in := range []string{"A", "a", "release/2026-01", "Zz9", string(all[:128]), string(all[128:])} {
 		out := EscapeSegment(in)
 		if strings.ToLower(out) != out {
 			t.Errorf("%q -> %q has uppercase", in, out)
