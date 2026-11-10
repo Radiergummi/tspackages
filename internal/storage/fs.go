@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,29 +23,70 @@ import (
 // accepts, so they cannot collide with a key.
 const (
 	etagSuffix = "#etag"
-	lockSuffix = "#lock"
 	tmpSuffix  = "#tmp"
+	lockDir    = "#locks"
 )
+
+// lockStripes is the number of lock files. Keys share them by hash; a lock is
+// held only within one driver call and never nested, so sharing costs at most
+// a short wait.
+const lockStripes = 256
+
+// staleTemp is the age after which a temp file is a crash leftover: no write
+// takes that long.
+const staleTemp = time.Hour
 
 type fsDriver struct{ root string }
 
 // NewFS returns a driver storing objects as files below root. Next to each
-// object it keeps a "<key>#etag" sidecar and a "<key>#lock" file (temp files
-// end in "#tmp"); keys cannot contain "#", so these never collide. A key cannot also be a
-// prefix of another key (a file cannot be a directory); such writes fail with
-// ErrInvalidKey or ErrExists.
-//
-// Lock files are created on first write or read of an object and are never
-// removed, not even by Delete: removing a lock file races with holders.
+// object it keeps a "<key>#etag" sidecar (temp files end in "#tmp"), and it
+// locks through a fixed set of files in "#locks"; keys cannot contain "#", so
+// these never collide. A key cannot also be a prefix of another key (a file
+// cannot be a directory); such writes fail with ErrInvalidKey or ErrExists.
+// Temp files older than staleTemp are removed.
 func NewFS(root string) (Driver, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(abs, lockDir), 0o700); err != nil {
 		return nil, err
 	}
+	if err := removeStaleTemps(abs); err != nil {
+		return nil, fmt.Errorf("remove stale temp files: %w", err)
+	}
 	return &fsDriver{root: abs}, nil
+}
+
+func removeStaleTemps(root string) error {
+	cutoff := time.Now().Add(-staleTemp)
+	return filepath.WalkDir(root, func(p string, de fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			if isMissing(err) {
+				return nil
+			}
+			return err
+		case de.IsDir() && de.Name() == lockDir:
+			return filepath.SkipDir
+		case de.IsDir() || !strings.HasSuffix(de.Name(), tmpSuffix):
+			return nil
+		}
+		fi, err := de.Info()
+		if isMissing(err) {
+			return nil // gone meanwhile
+		}
+		if err != nil {
+			return err
+		}
+		if fi.ModTime().After(cutoff) {
+			return nil // possibly another instance's write in progress
+		}
+		if err := os.Remove(p); err != nil && !isMissing(err) {
+			return err
+		}
+		return nil
+	})
 }
 
 func (d *fsDriver) path(key string) (string, error) {
@@ -54,10 +96,12 @@ func (d *fsDriver) path(key string) (string, error) {
 	return filepath.Join(d.root, filepath.FromSlash(key)), nil
 }
 
-// lock takes an flock on "<p>.lock", polling so that ctx can abort the wait,
-// and returns the release function. The parent directory must exist.
-func lock(ctx context.Context, p string, how int) (func(), error) {
-	f, err := os.OpenFile(p+lockSuffix, os.O_RDWR|os.O_CREATE, 0o644)
+// lock takes an flock on the lock stripe of the object at p, polling so that
+// ctx can abort the wait, and returns the release function.
+func (d *fsDriver) lock(ctx context.Context, p string, how int) (func(), error) {
+	h := sha256.Sum256([]byte(strings.TrimPrefix(p, d.root)))
+	stripe := strconv.Itoa(int(h[0]) % lockStripes)
+	f, err := os.OpenFile(filepath.Join(d.root, lockDir, stripe), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +192,7 @@ func (d *fsDriver) Get(ctx context.Context, key string) (io.ReadCloser, Info, er
 	}
 	// The shared lock is held only while opening; the open file stays valid
 	// across a concurrent rename.
-	unlock, err := lock(ctx, p, unix.LOCK_SH)
+	unlock, err := d.lock(ctx, p, unix.LOCK_SH)
 	if err != nil {
 		return nil, Info{}, err
 	}
@@ -211,7 +255,7 @@ func stage(p string, r io.Reader) (tmp, etag string, err error) {
 	if _, err = io.Copy(io.MultiWriter(f, h), r); err != nil {
 		return "", "", err
 	}
-	if err = f.Chmod(0o644); err != nil {
+	if err = f.Chmod(0o600); err != nil {
 		return "", "", err
 	}
 	if err = f.Sync(); err != nil {
@@ -230,7 +274,7 @@ func writeSidecar(p string, etag string, fi fs.FileInfo) error {
 	}
 	_, err = fmt.Fprintf(f, "%s %d %d", etag, fi.Size(), fi.ModTime().UnixNano())
 	if err == nil {
-		err = f.Chmod(0o644)
+		err = f.Chmod(0o600)
 	}
 	if err == nil {
 		err = f.Sync()
@@ -277,10 +321,10 @@ func (d *fsDriver) write(ctx context.Context, key string, r io.Reader, mode comm
 		return Info{}, err
 	}
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return Info{}, conflictErr(err)
 	}
-	unlock, err := lock(ctx, p, unix.LOCK_EX)
+	unlock, err := d.lock(ctx, p, unix.LOCK_EX)
 	if err != nil {
 		return Info{}, err
 	}
@@ -377,7 +421,7 @@ func (d *fsDriver) Delete(ctx context.Context, key string) error {
 	if _, ok, err := regular(p); err != nil || !ok {
 		return err
 	}
-	unlock, err := lock(ctx, p, unix.LOCK_EX)
+	unlock, err := d.lock(ctx, p, unix.LOCK_EX)
 	if err != nil {
 		return err
 	}
@@ -391,7 +435,7 @@ func (d *fsDriver) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// isSidecar reports whether a file name is a sidecar, lock or temp file.
+// isSidecar reports whether a name is a sidecar, temp file or the lock directory.
 func isSidecar(name string) bool { return strings.Contains(name, "#") }
 
 func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, error] {
@@ -416,6 +460,9 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 			}
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if de.IsDir() && isSidecar(de.Name()) {
+				return filepath.SkipDir // the lock files
 			}
 			if de.IsDir() || isSidecar(de.Name()) {
 				return nil

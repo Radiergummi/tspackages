@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestFS(t *testing.T) {
@@ -78,9 +80,6 @@ func TestFSSidecarNamesCannotCollide(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "x#etag")); err != nil {
 		t.Errorf("sidecar: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "x#lock")); err != nil {
-		t.Errorf("lock file: %v", err)
-	}
 }
 
 func TestFSReadsCreateNothing(t *testing.T) {
@@ -90,8 +89,11 @@ func TestFSReadsCreateNothing(t *testing.T) {
 	d.Get(ctx, "no/such/key")
 	d.Stat(ctx, "no/such/key")
 	d.Delete(ctx, "no/such/key")
-	if ents, _ := os.ReadDir(root); len(ents) != 0 {
-		t.Fatalf("root not empty: %v", ents)
+	if ents, _ := os.ReadDir(root); len(ents) != 1 || ents[0].Name() != lockDir {
+		t.Fatalf("root holds more than %s: %v", lockDir, ents)
+	}
+	if locks, _ := os.ReadDir(filepath.Join(root, lockDir)); len(locks) != 0 {
+		t.Fatalf("reads of missing keys took locks: %v", locks)
 	}
 }
 
@@ -106,5 +108,88 @@ func TestFSStaleSidecarIgnored(t *testing.T) {
 	st, err := d.Stat(context.Background(), "k")
 	if err != nil || st.ETag != second.ETag || st.ETag == first.ETag {
 		t.Fatalf("stat=%+v err=%v first=%q second=%q", st, err, first.ETag, second.ETag)
+	}
+}
+
+// Lock files are a fixed set, so churn (a cache evicting) leaves nothing behind.
+func TestFSLeavesNoPerKeyFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	d, _ := NewFS(root)
+	for i := range 300 {
+		key := fmt.Sprintf("k/%d", i)
+		put(t, d, key, "x")
+		rc, _, err := d.Get(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc.Close()
+		if err := d.Delete(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("left behind: %d files, e.g. %s", len(entries), entries[0].Name())
+	}
+	locks, _ := os.ReadDir(filepath.Join(root, "#locks"))
+	if len(locks) > 256 {
+		t.Fatalf("%d lock files", len(locks))
+	}
+	put(t, d, "k/live", "x")
+	var keys []string
+	for info, err := range d.List(ctx, "") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, info.Key)
+	}
+	if !slices.Equal(keys, []string{"k/live"}) {
+		t.Fatalf("List = %v", keys)
+	}
+}
+
+func TestFSRemovesStaleTempFiles(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "a")
+	os.MkdirAll(dir, 0o755)
+	stale, fresh := filepath.Join(dir, "1#tmp"), filepath.Join(dir, "2#tmp")
+	for _, p := range []string{stale, fresh} {
+		os.WriteFile(p, []byte("x"), 0o644)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(stale, old, old)
+	if _, err := NewFS(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale temp file kept: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh temp file removed (it may be another instance's write): %v", err)
+	}
+}
+
+// Stores hold private packages and audit records: owner-only, like work_dir.
+func TestFSIsOwnerOnly(t *testing.T) {
+	root := t.TempDir()
+	d, _ := NewFS(root)
+	put(t, d, "a/b", "x")
+	for p, want := range map[string]os.FileMode{
+		filepath.Join(root, "a"):           0o700,
+		filepath.Join(root, "a", "b"):      0o600,
+		filepath.Join(root, "a", "b#etag"): 0o600,
+		filepath.Join(root, lockDir):       0o700,
+	} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fi.Mode().Perm(); got != want {
+			t.Errorf("%s: mode %o, want %o", p, got, want)
+		}
 	}
 }

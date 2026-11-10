@@ -40,6 +40,10 @@ tailnet. Read this before you deploy.
   `TS_ID_TOKEN`) and every variable the config references via `${env:}` are
   removed from the environment once read, so git and ssh never inherit them
   (`PATH`, `HOME`, `USER`, `TMPDIR`, `LANG` and `LC_*` are kept).
+- `fs` stores are owner-only: directories are created mode 0700 and files
+  0600, since they hold private packages and audit records. Files written by
+  earlier versions keep their modes; tighten them with
+  `chmod -R go-rwx <path>`.
 - Turn on **S3 versioning or Object Lock on the state bucket**. The state
   store holds tag pins, git-built archives and the audit records (one JSON
   record per publish: caller, node, time, package, version, digest). Without
