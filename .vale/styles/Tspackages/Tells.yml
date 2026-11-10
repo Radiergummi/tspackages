@@ -1,0 +1,41 @@
+extends: existence
+message: "'%s' is filler that reads as generated; cut it or use a plain word."
+level: error
+ignorecase: true
+# Words and phrases that machine-written prose leans on and plain technical
+# English doesn't need. "harness" stays: the dev harness is a real thing here.
+tokens:
+  - a testament to
+  - bolster(?:s|ed|ing)?
+  - crucial(?:ly)?
+  - deep dive
+  - delv(?:e|es|ed|ing)
+  - dive into
+  - elevat(?:e|es|ed|ing)
+  - embark(?:s|ed|ing)?
+  - empower(?:s|ed|ing)?
+  - foster(?:s|ed|ing)?
+  - holistic
+  - in conclusion
+  - in summary
+  - in today's
+  - intricac(?:y|ies)
+  - intricate
+  - it is important to note
+  - it is worth noting
+  - it's important to note
+  - it's worth noting
+  - look no further
+  - meticulous(?:ly)?
+  - myriad
+  - pivotal
+  - plethora
+  - realm
+  - rest assured
+  - robust(?:ly|ness)?
+  - showcas(?:e|es|ed|ing)
+  - streamlin(?:e|es|ed|ing)
+  - tapestry
+  - unleash(?:es|ed|ing)?
+  - unlock(?:s|ed|ing)? (?:the|your|new)
+  - whether you're

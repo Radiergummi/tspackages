@@ -1,0 +1,32 @@
+extends: existence
+message: "'%s' sells rather than describes; say what it does."
+level: error
+ignorecase: true
+# Hype and unverifiable praise. The docs state what tspackages does and let the
+# reader judge it; Google.ExcessiveClaims covers "best" and "fastest".
+tokens:
+  - awesome
+  - amazing
+  - battle-tested
+  - best-in-class
+  - blazing(?:ly)?[ -]fast
+  - cutting[ -]edge
+  - delightful(?:ly)?
+  - effortless(?:ly)?
+  - first-class
+  - game[ -]chang(?:er|ing)
+  - hassle-free
+  - incredibl[ey]
+  - industry[ -]leading
+  - lightning[ -]fast
+  - next[ -]generation
+  - peace of mind
+  - powerful
+  - revolutionar(?:y|ize)
+  - rock[ -]solid
+  - seamless(?:ly)?
+  - state[ -]of[ -]the[ -]art
+  - stunning
+  - supercharge[ds]?
+  - world[ -]class
+  - zero[ -]hassle

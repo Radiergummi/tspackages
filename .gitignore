@@ -4,3 +4,8 @@
 *.out
 .DS_Store
 /config.yaml
+/cover.html
+# Vale packages, fetched by `make lint-docs` at the versions the Makefile pins.
+/.vale/styles/*
+!/.vale/styles/Tspackages/
+!/.vale/styles/config/
