@@ -1,12 +1,14 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"tailscale.com/client/tailscale/apitype"
@@ -194,5 +196,17 @@ func TestMiddlewareNilLogger(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	if rec.Code != 403 {
 		t.Fatalf("code = %d", rec.Code)
+	}
+}
+
+func TestMiddlewareFailureWarningsAreThrottled(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil)) // info: debug lines are dropped
+	h := Middleware(&fakeWho{err: errors.New("boom")}, capName, log)(http.NotFoundHandler())
+	for range 5 {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	}
+	if n := strings.Count(buf.String(), "tailnet identity unavailable"); n != 1 {
+		t.Fatalf("logged %d warnings, want 1:\n%s", n, buf.String())
 	}
 }

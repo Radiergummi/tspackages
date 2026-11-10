@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/authz"
 	"tailscale.com/client/tailscale/apitype"
@@ -75,12 +77,18 @@ func FromContext(ctx context.Context) (Caller, bool) {
 	return c, ok
 }
 
+// failureLogInterval is the least time between two identity-failure warnings.
+const failureLogInterval = 10 * time.Second
+
 // Middleware strips client credentials, resolves the caller via WhoIs and
 // stores it in the request context. Any failure is a 403.
 func Middleware(w Whoiser, capName peercap.Cap, log *slog.Logger) func(http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
+	// Failures run before rate limiting, so one warning per interval at most;
+	// the rest go to debug.
+	var lastWarn atomic.Int64
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			r.Header.Del("Authorization")
@@ -91,7 +99,11 @@ func Middleware(w Whoiser, capName peercap.Cap, log *slog.Logger) func(http.Hand
 				c, err = FromWhoIs(resp, capName)
 			}
 			if err != nil {
-				log.Warn("tailnet identity unavailable", "remote", r.RemoteAddr, "err", err)
+				level, now, last := slog.LevelDebug, time.Now().UnixNano(), lastWarn.Load()
+				if now-last >= int64(failureLogInterval) && lastWarn.CompareAndSwap(last, now) {
+					level = slog.LevelWarn
+				}
+				log.Log(r.Context(), level, "tailnet identity unavailable", "remote", r.RemoteAddr, "err", err)
 				rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 				rw.WriteHeader(http.StatusForbidden)
 				_, _ = rw.Write([]byte("tailnet identity unavailable"))
