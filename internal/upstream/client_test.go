@@ -85,7 +85,8 @@ func TestForbiddenAddrs(t *testing.T) {
 		"192.0.0.1": true, "192.0.2.1": true, "198.51.100.1": true, "203.0.113.1": true, "192.88.99.1": true,
 		"192.0.3.1": false, "198.51.101.1": false, "203.0.114.1": false,
 		"2001:db8::1": true, "2001::1": true, "2001:0:ffff::1": true, "100::1": true, "100:0:0:1::1": false,
-		"2001:4860::8888": false,
+		"2001:4860::8888": false, "fec0::1": true, "3fff::1": true,
+		"::ffff:0:7f00:1": true, "::ffff:0:a00:1": true, "::ffff:0:808:808": false,
 	} {
 		if got := forbiddenAddr(netip.MustParseAddr(s)); got != want {
 			t.Errorf("%s: got %v want %v", s, got, want)

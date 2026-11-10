@@ -144,12 +144,15 @@ func forbiddenAddr(a netip.Addr) bool {
 		return forbiddenV4(netip.AddrFrom4([4]byte(b[12:])))
 	case sixToFour.Contains(a):
 		return forbiddenV4(netip.AddrFrom4([4]byte(b[2:6])))
+	case v4Translated.Contains(a):
+		return forbiddenV4(netip.AddrFrom4([4]byte(b[12:])))
 	case v4Compat.Contains(a) && !a.IsUnspecified():
 		if forbiddenV4(netip.AddrFrom4([4]byte(b[12:]))) {
 			return true
 		}
 	}
-	return documentation6.Contains(a) || teredo.Contains(a) || discard6.Contains(a) || nonUnicast(a)
+	return documentation6.Contains(a) || documentation6b.Contains(a) || teredo.Contains(a) ||
+		discard6.Contains(a) || siteLocal.Contains(a) || nonUnicast(a)
 }
 
 func forbiddenV4(a netip.Addr) bool {
@@ -166,22 +169,25 @@ func nonUnicast(a netip.Addr) bool {
 }
 
 var (
-	cgnat          = netip.MustParsePrefix("100.64.0.0/10")
-	thisNetwork    = netip.MustParsePrefix("0.0.0.0/8")
-	benchmark      = netip.MustParsePrefix("198.18.0.0/15")
-	reserved       = netip.MustParsePrefix("240.0.0.0/4") // incl. 255.255.255.255
-	ietfProtocol   = netip.MustParsePrefix("192.0.0.0/24")
-	testNet1       = netip.MustParsePrefix("192.0.2.0/24")
-	testNet2       = netip.MustParsePrefix("198.51.100.0/24")
-	testNet3       = netip.MustParsePrefix("203.0.113.0/24")
-	relay6to4      = netip.MustParsePrefix("192.88.99.0/24")
-	documentation6 = netip.MustParsePrefix("2001:db8::/32")
-	teredo         = netip.MustParsePrefix("2001::/32")
-	discard6       = netip.MustParsePrefix("100::/64")
-	nat64          = netip.MustParsePrefix("64:ff9b::/96")
-	nat64LocalUse  = netip.MustParsePrefix("64:ff9b:1::/48")
-	sixToFour      = netip.MustParsePrefix("2002::/16")
-	v4Compat       = netip.MustParsePrefix("::/96")
+	cgnat           = netip.MustParsePrefix("100.64.0.0/10")
+	thisNetwork     = netip.MustParsePrefix("0.0.0.0/8")
+	benchmark       = netip.MustParsePrefix("198.18.0.0/15")
+	reserved        = netip.MustParsePrefix("240.0.0.0/4") // incl. 255.255.255.255
+	ietfProtocol    = netip.MustParsePrefix("192.0.0.0/24")
+	testNet1        = netip.MustParsePrefix("192.0.2.0/24")
+	testNet2        = netip.MustParsePrefix("198.51.100.0/24")
+	testNet3        = netip.MustParsePrefix("203.0.113.0/24")
+	relay6to4       = netip.MustParsePrefix("192.88.99.0/24")
+	documentation6  = netip.MustParsePrefix("2001:db8::/32")
+	documentation6b = netip.MustParsePrefix("3fff::/20")
+	siteLocal       = netip.MustParsePrefix("fec0::/10")       // deprecated, but still routable on some networks
+	v4Translated    = netip.MustParsePrefix("::ffff:0:0:0/96") // SIIT
+	teredo          = netip.MustParsePrefix("2001::/32")
+	discard6        = netip.MustParsePrefix("100::/64")
+	nat64           = netip.MustParsePrefix("64:ff9b::/96")
+	nat64LocalUse   = netip.MustParsePrefix("64:ff9b:1::/48")
+	sixToFour       = netip.MustParsePrefix("2002::/16")
+	v4Compat        = netip.MustParsePrefix("::/96")
 )
 
 func (c *Client) checkURL(u *url.URL) error {
