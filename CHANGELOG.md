@@ -13,6 +13,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A Composer dist is served only by the source that resolution picks for the
+  name: when several sources claim it, a dist URL naming a later source
+  answers `404` while an earlier one knows the name. Lock files written
+  before sources were reordered may need `composer update`.
 - A `storage` source's claims must not overlap a claim of any earlier source.
   This used to be checked for identical claims only, and an overlapping
   pattern left uploads to the shared names answering `409`.

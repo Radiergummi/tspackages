@@ -223,18 +223,29 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 	if !ok {
 		return
 	}
-	var src Source
-	for _, s := range cands {
-		if s.Name() == r.PathValue("source") {
-			src = s
-		}
-	}
-	if src == nil {
+	i := slices.IndexFunc(cands, func(s Source) bool { return s.Name() == r.PathValue("source") })
+	if i < 0 {
 		http.NotFound(w, r)
 		return
 	}
+	// p2 answers from the first candidate that knows the name, so an earlier
+	// one must not know it either.
+	version := r.PathValue("version")
+	normalized, _ := NormalizeVersion(version)
+	_, _, err = resolve.First(r.Context(), cands[:i], func(ctx context.Context, s Source) ([]Version, error) {
+		return s.Versions(ctx, name, isDevVersion(normalized))
+	})
+	if err == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, failed := errors.AsType[*resolve.SourceError](err); failed {
+		c.fail(w, r, err)
+		return
+	}
+	src := cands[i]
 	e.source = src.Name()
-	art, err := src.Dist(r.Context(), name, r.PathValue("version"), r.PathValue("reference"))
+	art, err := src.Dist(r.Context(), name, version, r.PathValue("reference"))
 	if err != nil {
 		c.fail(w, r, resolve.Wrap(src.Name(), err))
 		return

@@ -260,6 +260,32 @@ func TestDistWrongSourceForClaimedName(t *testing.T) {
 	}
 }
 
+// With two claiming sources, p2 answers from the first that knows the name,
+// so dist must not serve the same name from a later one.
+func TestDistOnlyFromTheResolvingSource(t *testing.T) {
+	first := &fakeSource{name: "first", claims: []string{"acme/*"},
+		pkgs: map[string][]Version{"acme/a": {ver("acme/a", "1.0.0", false)}}}
+	second := &fakeSource{name: "second", claims: []string{"acme/*"},
+		pkgs: map[string][]Version{"acme/a": {ver("acme/a", "1.0.0", false)}, "acme/b": {ver("acme/b", "1.0.0", false)}}}
+	h := server(t, []Source{first, second}, readAll)
+
+	if w := do(h, "GET", "/composer/dist/second/acme/a/1.0.0/ref-1.0.0", nil); w.Code != 404 || second.distHit.Load() != 0 {
+		t.Fatalf("shadowed source: %d, dist calls %d", w.Code, second.distHit.Load())
+	}
+	if w := do(h, "GET", "/composer/dist/second/acme/b/1.0.0/ref-1.0.0", nil); w.Code != 200 {
+		t.Fatalf("first source does not know acme/b: %d", w.Code)
+	}
+	if w := do(h, "GET", "/composer/dist/first/acme/a/1.0.0/ref-1.0.0", nil); w.Code != 200 {
+		t.Fatalf("resolving source: %d", w.Code)
+	}
+	for _, err := range []error{errors.New("boom"), errors.Join(resolve.ErrNotFound, errors.New("boom"))} {
+		first.err = err
+		if w := do(h, "GET", "/composer/dist/second/acme/b/1.0.0/ref-1.0.0", nil); w.Code != 502 {
+			t.Fatalf("earlier source failing with %v: %d", err, w.Code)
+		}
+	}
+}
+
 func TestDistForbiddenAndError(t *testing.T) {
 	g, r := gitAndReg()
 	if w := do(server(t, []Source{g, r}, `{"read":["composer:x/*"]}`), "GET", "/composer/dist/git-fake/matchory/a/1/r", nil); w.Code != 403 || g.distHit.Load() != 0 {
