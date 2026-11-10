@@ -290,8 +290,10 @@ func parseMetadata(body []byte, pkg string, dev bool) ([]Version, error) {
 	return out, nil
 }
 
-// Versions returns the stable or dev versions of name as upstream lists them,
-// fetching only that file. A 404 on it is a definite miss.
+// Versions returns the stable or dev versions of name as upstream lists them.
+// A miss on the stable file is definite. A miss on the dev file is definite
+// only if the stable file misses too; otherwise the package has no dev
+// versions here, and resolution must not take them from another source.
 func (s *RegistrySource) Versions(ctx context.Context, name string, dev bool) ([]Version, error) {
 	pkg, err := lookupName(name)
 	if err != nil {
@@ -301,10 +303,19 @@ func (s *RegistrySource) Versions(ctx context.Context, name string, dev bool) ([
 	if err != nil {
 		return nil, err
 	}
-	if !found || vs == nil { // nil: the document does not list the package
-		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
+	if found && vs != nil { // nil: the document does not list the package
+		return vs, nil
 	}
-	return vs, nil
+	if dev {
+		stable, found, err := s.metadata(ctx, pkg, false)
+		if err != nil {
+			return nil, err
+		}
+		if found && stable != nil {
+			return []Version{}, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
 }
 
 func (s *RegistrySource) distKey(sha256 string) string {

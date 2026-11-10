@@ -577,3 +577,18 @@ func TestFlightFollowerStopsWaitingOnItsOwnCancel(t *testing.T) {
 		t.Fatal("follower kept waiting for the leader")
 	}
 }
+
+func TestRegistryDevMissIsEmptyWhenStableExists(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
+	// No ~dev file: the package still belongs to this source, so resolution
+	// must not move on to another one for its dev versions.
+	vs, err := e.src.Versions(ctx, "acme/pkg", true)
+	if err != nil || vs == nil || len(vs) != 0 {
+		t.Fatalf("dev = %v, %v; want an empty list", vs, err)
+	}
+	if _, err := e.src.Versions(ctx, "acme/none", true); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("unknown package dev: %v", err)
+	}
+}
