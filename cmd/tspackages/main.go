@@ -85,7 +85,11 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go start(ctx)
+	// Registered after unlock, so it runs first: the background loops write
+	// to work_dir and must stop before another instance may take the lock.
+	loopsDone := make(chan struct{})
+	go func() { defer close(loopsDone); start(ctx) }()
+	defer func() { stop(); <-loopsDone }()
 
 	// No WriteTimeout: artifact downloads can be large.
 	hs := &http.Server{
@@ -103,6 +107,7 @@ func run(configPath string, log *slog.Logger) error {
 		return err
 	case <-ctx.Done():
 	}
+	stop() // a second signal now terminates immediately
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
