@@ -993,3 +993,34 @@ func TestMovedTagStaysServedWhenRecordingTheMoveFails(t *testing.T) {
 		t.Fatalf("versions = %+v, %v", vs, err)
 	}
 }
+
+// Numeric branches are named as Composer's VCS repository names them.
+func TestNumericBranchVersionNames(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	for _, b := range []string{"1.x", "1.2", "v2.3", "1.2.3"} {
+		testutil.Git(t, src, "branch", b)
+	}
+	g, _ := newGit(t, fsState(t), []string{"*"}, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := g.Versions(ctx, "matchory/a", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, v := range dev {
+		got[v.Version] = normalizedOf(v)
+	}
+	want := map[string]string{
+		"dev-main":    "dev-main",
+		"1.x-dev":     "1.9999999.9999999.9999999-dev",
+		"1.2.x-dev":   "1.2.9999999.9999999-dev",
+		"v2.3.x-dev":  "2.3.9999999.9999999-dev",
+		"1.2.3.x-dev": "1.2.3.9999999-dev",
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("got %v\nwant %v", got, want)
+	}
+}

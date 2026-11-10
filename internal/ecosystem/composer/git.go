@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -523,11 +524,7 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 		if r.IsTag || !g.wantBranch(r.Short, def) {
 			continue
 		}
-		name, normalized := NormalizeBranch(r.Short)
-		version := normalized
-		if !strings.HasPrefix(normalized, "dev-") {
-			version = name + "-dev"
-		}
+		version, normalized := branchVersion(r.Short)
 		l, err := g.loadFor(ctx, m, pkg, r.Commit)
 		if err != nil {
 			g.skip(ctx, "composer git: branch skipped", "source", g.name, "remote", remote, "branch", r.Short, "error", err)
@@ -544,6 +541,24 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 	sortVersions(c.res.versions)
 	return c.res, nil
 }
+
+// branchVersion returns the version and normalised version of a branch as
+// Composer's VCS repository names them: "dev-<name>", or for a numeric
+// branch its normalised form with every run of ".9999999" written ".x"
+// ("1.2" -> "1.2.x-dev"), keeping a leading "v".
+func branchVersion(branch string) (version, normalized string) {
+	name, normalized := NormalizeBranch(branch)
+	if strings.HasPrefix(normalized, "dev-") {
+		return normalized, normalized
+	}
+	prefix := ""
+	if strings.HasPrefix(name, "v") {
+		prefix = "v"
+	}
+	return prefix + branchWildcardRE.ReplaceAllString(normalized, ".x"), normalized
+}
+
+var branchWildcardRE = regexp.MustCompile(`(\.9999999)+`)
 
 // sortVersions orders tags highest first, then dev versions.
 func sortVersions(vs []Version) {
