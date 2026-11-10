@@ -31,28 +31,16 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Start MinIO
-        # MinIO no longer publishes pullable images; build a pinned commit from source.
-        run: |
-          go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
-          mkdir -p "$RUNNER_TEMP/minio-data"
-          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            nohup "$(go env GOPATH)/bin/minio" server "$RUNNER_TEMP/minio-data" \
-            --address :9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
-          for _ in $(seq 60); do
-            curl -fs http://localhost:9000/minio/health/live && exit 0
-            sleep 1
-          done
-          echo "MinIO did not become ready" >&2
-          cat "$RUNNER_TEMP/minio.log"
-          exit 1
+      - uses: ./.github/actions/minio
       - run: go vet ./...
       - run: go test -race ./...
       - run: make tailnet
 
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      TSP_TEST_S3_ENDPOINT: http://localhost:9000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,6 +52,7 @@ jobs:
         with:
           php-version: "8.3"
           tools: composer
+      - uses: ./.github/actions/minio
       - run: go test -tags integration ./integration/...
 
   lint-go:
@@ -107,7 +96,7 @@ jobs:
       # Online, so an action that turns known-bad fails a run.
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: zizmor --config .github/zizmor.yml .github/workflows/
+        run: zizmor --config .github/zizmor.yml .github/workflows/ .github/actions/
 
   lint-docs:
     runs-on: ubuntu-latest

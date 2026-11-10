@@ -1,0 +1,21 @@
+name: Start MinIO
+description: Build a pinned MinIO from source and run it on localhost:9000 (minioadmin/minioadmin).
+runs:
+  using: composite
+  steps:
+    - name: Start MinIO
+      # MinIO no longer publishes pullable images; build a pinned commit from source.
+      shell: bash
+      run: |
+        go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+        mkdir -p "$RUNNER_TEMP/minio-data"
+        MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+          nohup "$(go env GOPATH)/bin/minio" server "$RUNNER_TEMP/minio-data" \
+          --address :9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+        for _ in $(seq 60); do
+          curl -fs http://localhost:9000/minio/health/live && exit 0
+          sleep 1
+        done
+        echo "MinIO did not become ready" >&2
+        cat "$RUNNER_TEMP/minio.log"
+        exit 1

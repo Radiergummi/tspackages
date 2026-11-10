@@ -13,7 +13,7 @@ lint-go:
 
 lint-workflows:
 	actionlint
-	zizmor --config .github/zizmor.yml .github/workflows/
+	zizmor --config .github/zizmor.yml .github/workflows/ .github/actions/
 
 ## Format the Go code in place
 fmt:
