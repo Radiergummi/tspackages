@@ -90,6 +90,7 @@ type regEnv struct {
 	cache *storage.Cache
 	d     storage.Driver
 	rec   *records.Store
+	up    *upstream.Client
 	clock time.Time
 }
 
@@ -111,7 +112,7 @@ func newRegEnv(t *testing.T) *regEnv {
 	rec := records.New(rd)
 	host := strings.TrimPrefix(f.srv.URL, "http://")
 	c := upstream.New(upstream.Options{FetchHosts: []string{strings.Split(host, ":")[0]}, AllowPrivateForTesting: true})
-	e := &regEnv{f: f, cache: cache, d: d, rec: rec, clock: time.Now()}
+	e := &regEnv{f: f, cache: cache, d: d, rec: rec, up: c, clock: time.Now()}
 	e.src = NewRegistrySource("packagist", nil, f.srv.URL, c, cache, rec, time.Minute, 1<<20, 0, nil, nil)
 	e.src.now = func() time.Time { return e.clock }
 	return e
@@ -132,6 +133,8 @@ func distMeta(base, shasum, ref string) []byte {
 }
 
 func sum1(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
+
+func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 func sum256(b []byte) string {
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
@@ -447,6 +450,63 @@ func TestDistEmptyShasumSHA1IsObserved(t *testing.T) {
 		if !bytes.Equal(got, zip) {
 			t.Fatalf("got %q", got)
 		}
+	}
+}
+
+// Without a declared shasum, the first digest seen for a version and
+// reference is the pin: a refetch with other bytes (after eviction or a
+// restart) is still served, but reported.
+func TestDistUndeclaredChangeIsReported(t *testing.T) {
+	e := newRegEnv(t)
+	fetch := func(src *RegistrySource, ref string) []byte {
+		t.Helper()
+		a, err := src.Dist(context.Background(), "acme/pkg", "1.0.0", ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Body.Close()
+		b, _ := io.ReadAll(a.Body)
+		return b
+	}
+	restart := func() *RegistrySource {
+		d, err := storage.NewFS(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cache, err := storage.NewCache(context.Background(), d, 1<<30, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewRegistrySource("packagist", nil, e.f.srv.URL, e.up, cache, e.rec, time.Minute, 1<<20, 0, nil, nil)
+	}
+	first, second := []byte("PK-first"), []byte("PK-second")
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
+	e.f.set("/dist/pkg.zip", first)
+	fetch(e.src, "r1")
+
+	same := restart()
+	fetch(same, "r1")
+	if c := same.ChangedDists(); len(c) != 0 {
+		t.Fatalf("same bytes reported: %+v", c)
+	}
+
+	e.f.set("/dist/pkg.zip", second)
+	changed := restart()
+	if got := fetch(changed, "r1"); !bytes.Equal(got, second) {
+		t.Fatalf("served %q, want the new bytes", got)
+	}
+	c := changed.ChangedDists()
+	if len(c) != 1 || c[0].Package != "acme/pkg" || c[0].Version != "1.0.0" || c[0].Reference != "r1" ||
+		c[0].Pinned != sha256Hex(first) || c[0].Seen != sha256Hex(second) {
+		t.Fatalf("changed = %+v", c)
+	}
+
+	// Another reference is another artifact, not a change.
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r2"))
+	other := restart()
+	fetch(other, "r2")
+	if c := other.ChangedDists(); len(c) != 0 {
+		t.Fatalf("new reference reported: %+v", c)
 	}
 }
 

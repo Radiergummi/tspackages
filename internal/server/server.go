@@ -82,6 +82,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	var (
 		sources    []composer.Source
 		gitSources []*composer.GitSource
+		regSources []*composer.RegistrySource
 		status     []web.StatusSource
 		mirrors    = mirrorSet{}
 	)
@@ -112,6 +113,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rec,
 				s.MetadataTTL, int64(l.MaxArtifactBytes), 0, limits.UpstreamWait, log)
 			sources, status = append(sources, src), append(status, src)
+			regSources = append(regSources, src)
 		case "git":
 			opts := gitmirror.Options{
 				BaseDir:                    gitDir,
@@ -166,6 +168,13 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		}
 		return out
 	}
+	changed := func() []composer.ChangedDist {
+		var out []composer.ChangedDist
+		for _, r := range regSources {
+			out = append(out, r.ChangedDists()...)
+		}
+		return out
+	}
 	movedPkg := func(m pins.MovedTag) string {
 		for _, g := range gitSources {
 			if p := g.MovedPackage(m); p != "" {
@@ -175,7 +184,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		return ""
 	}
 	metrics.SetRejected(limiter.Rejected)
-	web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, movedPkg, conflicts, stores.ready).Mount(mux)
+	web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, movedPkg, conflicts, changed, stores.ready).Mount(mux)
 
 	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {

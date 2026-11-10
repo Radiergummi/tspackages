@@ -64,6 +64,7 @@ func newWeb(ready func(context.Context) error) *Web {
 		func() []composer.Conflict {
 			return []composer.Conflict{{Package: "a/b", Remotes: []string{"r1", "r2"}}}
 		},
+		nil,
 		ready)
 }
 
@@ -130,7 +131,7 @@ func TestStatusFiltersScopedHealthRows(t *testing.T) {
 		{Name: "git https://h/a.git", Scoped: true, Package: "a/x", OK: true, Detail: "x"},
 		{Name: "git https://h/b.git", Scoped: true, Package: "b/x", OK: true, Detail: "x"},
 		{Name: "git https://h/unknown.git", Scoped: true, OK: false, Detail: "never indexed"},
-	}}, nil, nil, nil, nil)
+	}}, nil, nil, nil, nil, nil)
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
 	body := serve(t, w, "/", c).Body.String()
 	for _, want := range []string{"store", "h/a.git"} {
@@ -196,7 +197,7 @@ func TestStatusFiltersByReadRules(t *testing.T) {
 			movedPkg,
 			func() []composer.Conflict {
 				return []composer.Conflict{{Package: "a/x", Remotes: []string{"https://tok@h/1.git", "r2"}}, {Package: "b/x", Remotes: []string{"r3", "r4"}}}
-			}, nil)
+			}, nil, nil)
 	}
 	w := newW(movedPkg)
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
@@ -237,5 +238,25 @@ func TestMetricsExposed(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics lack %q", want)
 		}
+	}
+}
+
+func TestStatusShowsChangedDistsByReadRules(t *testing.T) {
+	w := New("h", []ecosystem.Ecosystem{fakeEco{}}, nil, nil, nil, nil,
+		func() []composer.ChangedDist {
+			return []composer.ChangedDist{
+				{Source: "packagist", Package: "a/x", Version: "1.0.0<i>", Reference: "ref-a", Pinned: "p-a", Seen: "s-a"},
+				{Source: "packagist", Package: "b/x", Version: "2.0.0", Reference: "ref-b", Pinned: "p-b", Seen: "s-b"},
+			}
+		}, nil)
+	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
+	body := serve(t, w, "/", c).Body.String()
+	for _, want := range []string{"Changed archives", "packagist", "a/x", "1.0.0&lt;i&gt;", "ref-a", "p-a", "s-a"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q", want)
+		}
+	}
+	if strings.Contains(body, "b/x") || strings.Contains(body, "ref-b") {
+		t.Error("dist the caller may not read is shown")
 	}
 }

@@ -83,7 +83,9 @@ tailscale.com).
 - URLs returned to clients point at tspackages and are opaque routes, never
   encoded upstream URLs.
 - Upstream artifact bytes are verified against the declared hash before
-  caching. Metadata is passed through except: `dist.url` is rewritten,
+  caching. Whatever the declared hash, a dist whose sha256 differs from the
+  first provenance record for its version and reference is served but
+  reported (warn log, status page). Metadata is passed through except: `dist.url` is rewritten,
   `dist` keeps only `type`, `url`, `reference` and `shasum`, and `source`,
   `notification-url` and `transport-options` are stripped. Metadata built from storage/git sources uses
   `composer.PublishableFields` (an allowlist; `notification-url` must never

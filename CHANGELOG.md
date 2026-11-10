@@ -8,6 +8,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A registry archive whose bytes differ from the ones first fetched for the
+  same version and reference is logged at warn and listed on the status page.
+  Packagist declares no checksum for most GitHub archives, so this is the
+  only check on archives fetched again. Provenance records of registry
+  archives now include the reference.
 - `-version` prints the build, `-log-format text` switches the logs from
   JSON, and `tspackages_build_info` reports the running version.
 

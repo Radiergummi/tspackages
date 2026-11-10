@@ -2,6 +2,7 @@ package composer
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -59,6 +61,17 @@ type RegistrySource struct {
 	hmu      sync.Mutex // guards the health fields
 	fetchErr error      // last metadata fetch failure; nil once one succeeds
 	stale    bool       // fetchErr was answered from stale cache
+
+	cmu     sync.Mutex
+	changed map[[3]string]ChangedDist // by package, version and reference
+}
+
+// ChangedDist is a dist whose upstream bytes differ from the ones first
+// recorded for the same version and reference. The new bytes are served;
+// Pinned and Seen are their sha256 digests.
+type ChangedDist struct {
+	Source, Package, Version, Reference string
+	Pinned, Seen                        string
 }
 
 var _ Source = (*RegistrySource)(nil)
@@ -401,7 +414,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	}
 
 	body, err := flight(ctx, &s.distFlight, refKey, func() ([]byte, error) {
-		return s.fetchAndStoreDist(ctx, pkg, version, distURL, shasum, refKey)
+		return s.fetchAndStoreDist(ctx, pkg, version, reference, distURL, shasum, refKey)
 	})
 	if err != nil {
 		return Artifact{}, err
@@ -411,7 +424,7 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 
 // fetchAndStoreDist downloads and verifies the archive, records its
 // provenance and caches it under refKey.
-func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, distURL, shasum, refKey string) ([]byte, error) {
+func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, reference, distURL, shasum, refKey string) ([]byte, error) {
 	declared := ""
 	if shasum != "" {
 		declared = "sha1:" + shasum
@@ -424,9 +437,12 @@ func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, di
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkPinned(ctx, pkg, version, reference, sha256Hex); err != nil {
+		return nil, err
+	}
 	if err := s.rec.PutProvenance(ctx, records.Provenance{
 		Ecosystem: "composer", Package: pkg, Version: version, Source: s.name, SourceType: "registry",
-		UpstreamURL: distURL, DeclaredDigest: declared, SHA1: sha1Hex, SHA256: sha256Hex,
+		UpstreamURL: distURL, Commit: reference, DeclaredDigest: declared, SHA1: sha1Hex, SHA256: sha256Hex,
 	}); err != nil {
 		return nil, fmt.Errorf("record provenance: %w", err)
 	}
@@ -483,4 +499,45 @@ func (s *RegistrySource) Health(context.Context) []metrics.Health {
 		}
 	}
 	return []metrics.Health{h}
+}
+
+// checkPinned compares sha256Hex with the first digest recorded for this
+// source, version and reference. A difference is logged and remembered for
+// the status page; the new bytes are still served.
+func (s *RegistrySource) checkPinned(ctx context.Context, pkg, version, reference, sha256Hex string) error {
+	recs, err := s.rec.ListProvenance(ctx, "composer", pkg, version)
+	if err != nil {
+		return fmt.Errorf("read provenance: %w", err)
+	}
+	var pinned *records.Provenance
+	for i, p := range recs {
+		if p.Source == s.name && p.Commit == reference && (pinned == nil || p.Created.Before(pinned.Created)) {
+			pinned = &recs[i]
+		}
+	}
+	if pinned == nil || pinned.SHA256 == sha256Hex {
+		return nil
+	}
+	s.log.Warn("composer dist changed upstream; serving the new bytes", "source", s.name, "package", pkg,
+		"version", version, "reference", reference, "pinned_sha256", pinned.SHA256, "seen_sha256", sha256Hex)
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	if s.changed == nil {
+		s.changed = map[[3]string]ChangedDist{}
+	}
+	s.changed[[3]string{pkg, version, reference}] = ChangedDist{
+		Source: s.name, Package: pkg, Version: version, Reference: reference, Pinned: pinned.SHA256, Seen: sha256Hex,
+	}
+	return nil
+}
+
+// ChangedDists returns the dists seen changing since start, sorted.
+func (s *RegistrySource) ChangedDists() []ChangedDist {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	out := slices.Collect(maps.Values(s.changed))
+	slices.SortFunc(out, func(a, b ChangedDist) int {
+		return cmp.Or(strings.Compare(a.Package, b.Package), strings.Compare(a.Version, b.Version), strings.Compare(a.Reference, b.Reference))
+	})
+	return out
 }

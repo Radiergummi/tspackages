@@ -36,6 +36,13 @@ pre,code{background:#f1f3f5;border-radius:4px;padding:.1rem .3rem}pre{padding:.6
 <tr><th>Package</th><th>Remotes</th></tr>
 {{range .Conflicts}}<tr><td>{{.Package}}</td><td>{{range .Remotes}}{{.}}<br>{{end}}</td></tr>
 {{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
+
+<h2>Changed archives</h2>
+{{if .Changed}}<p>These upstream archives changed after first being seen for the same version and reference. The new archive is served.</p>
+<table>
+<tr><th>Source</th><th>Package</th><th>Version</th><th>Reference</th><th>First sha256</th><th>Seen sha256</th></tr>
+{{range .Changed}}<tr><td>{{.Source}}</td><td>{{.Package}}</td><td>{{.Version}}</td><td><code>{{.Reference}}</code></td><td><code>{{.Pinned}}</code></td><td><code>{{.Seen}}</code></td></tr>
+{{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
 {{if .Composer}}
 <h2>Composer</h2>
 <p>Add to <code>composer.json</code>:</p>

@@ -118,3 +118,29 @@ func TestAuditValidationAndAttestation(t *testing.T) {
 		}
 	}
 }
+
+func TestListProvenance(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	other := strings.Repeat("d", 64)
+	for _, p := range []Provenance{
+		{Ecosystem: "composer", Package: "Acme/A", Version: "1.0.0", Source: "up", SHA256: sum, Commit: "r1"},
+		{Ecosystem: "composer", Package: "Acme/A", Version: "1.0.0", Source: "up", SHA256: other, Commit: "r1"},
+		{Ecosystem: "composer", Package: "Acme/A", Version: "1.0.0-rc", Source: "up", SHA256: sum},
+		{Ecosystem: "composer", Package: "Acme/AB", Version: "1.0.0", Source: "up", SHA256: sum},
+	} {
+		if err := s.PutProvenance(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListProvenance(ctx, "composer", "Acme/A", "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Commit != "r1" || got[1].Commit != "r1" || got[0].SHA256 == got[1].SHA256 {
+		t.Fatalf("got %+v", got)
+	}
+	if got, err := s.ListProvenance(ctx, "composer", "x/y", "1"); err != nil || len(got) != 0 {
+		t.Fatalf("unknown version: %v %v", got, err)
+	}
+}

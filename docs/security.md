@@ -89,7 +89,10 @@ tailnet. Read this before you deploy.
   never an encoded upstream URL. Upstream fetches go only to the source's
   `fetch_hosts` and never to private, loopback, link-local or CGNAT addresses.
 - Upstream artifacts are checked against the upstream-declared hash before
-  they are cached; a mismatch is a `502`.
+  they are cached; a mismatch is a `502`. Packagist declares none for most
+  GitHub archives, so the first SHA256 seen for a version and reference is
+  kept in the provenance records. A later fetch with other bytes is still
+  served, but logged at warn and listed on the status page.
 - Composer `source` blocks are stripped from served metadata, so
   `--prefer-source` can't reach upstream VCS locations. Only dist archives are
   served. Dist `mirrors`, `transport-options` and `notification-url` are

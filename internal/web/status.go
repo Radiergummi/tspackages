@@ -37,6 +37,7 @@ type Web struct {
 	sources   []StatusSource
 	moved     func() []pins.MovedTag
 	conflicts func() []composer.Conflict
+	changed   func() []composer.ChangedDist
 	ready     func(ctx context.Context) error
 
 	movedPkg     func(pins.MovedTag) string // package a moved tag's remote declares
@@ -46,19 +47,23 @@ type Web struct {
 // New returns the status endpoints. hostname is the fallback host for client
 // snippets when a request carries none. movedPkg names the package a moved
 // tag's remote declares, so the status page shows the tag only to callers
-// allowed to read that package; without it moved tags are hidden. A nil moved
-// or conflicts reports none, a nil ready is always ready.
-func New(hostname string, eco []ecosystem.Ecosystem, sources []StatusSource, moved func() []pins.MovedTag, movedPkg func(pins.MovedTag) string, conflicts func() []composer.Conflict, ready func(ctx context.Context) error) *Web {
+// allowed to read that package; without it moved tags are hidden. changed
+// lists dists whose upstream bytes changed. A nil moved, conflicts or changed
+// reports none, a nil ready is always ready.
+func New(hostname string, eco []ecosystem.Ecosystem, sources []StatusSource, moved func() []pins.MovedTag, movedPkg func(pins.MovedTag) string, conflicts func() []composer.Conflict, changed func() []composer.ChangedDist, ready func(ctx context.Context) error) *Web {
 	if moved == nil || movedPkg == nil {
 		moved = func() []pins.MovedTag { return nil }
 	}
 	if conflicts == nil {
 		conflicts = func() []composer.Conflict { return nil }
 	}
+	if changed == nil {
+		changed = func() []composer.ChangedDist { return nil }
+	}
 	if ready == nil {
 		ready = func(context.Context) error { return nil }
 	}
-	return &Web{hostname: hostname, eco: eco, sources: sources, moved: moved, movedPkg: movedPkg, conflicts: conflicts, ready: ready, readyTimeout: 5 * time.Second}
+	return &Web{hostname: hostname, eco: eco, sources: sources, moved: moved, movedPkg: movedPkg, conflicts: conflicts, changed: changed, ready: ready, readyTimeout: 5 * time.Second}
 }
 
 // Mount registers the routes on mux.
@@ -121,6 +126,7 @@ type pageData struct {
 	Health     []Health
 	Moved      []pins.MovedTag
 	Conflicts  []conflictView
+	Changed    []composer.ChangedDist
 	Composer   bool
 }
 
@@ -169,6 +175,11 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 			v.Remotes = append(v.Remotes, metrics.RedactRemote(r))
 		}
 		d.Conflicts = append(d.Conflicts, v)
+	}
+	for _, c := range w.changed() {
+		if allowed(c.Package) {
+			d.Changed = append(d.Changed, c)
+		}
 	}
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.Header().Set("Cache-Control", "private, no-store")
