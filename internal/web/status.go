@@ -84,7 +84,7 @@ func (w *Web) requireCaller(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// requireRule admits only callers with at least one capability rule.
+// requireRule admits only callers with at least one capability rule entry.
 func (w *Web) requireRule(h http.HandlerFunc) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
 		if c, ok := identity.FromContext(r.Context()); !ok || !hasAnyRule(c.Rules) {
@@ -184,4 +184,7 @@ type conflictView struct {
 	Remotes []string
 }
 
-func hasAnyRule(rules []authz.Rule) bool { return len(rules) > 0 }
+// hasAnyRule reports whether the rules hold at least one read or write entry.
+func hasAnyRule(rules []authz.Rule) bool {
+	return slices.ContainsFunc(rules, func(r authz.Rule) bool { return len(r.Read)+len(r.Write) > 0 })
+}

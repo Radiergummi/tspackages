@@ -94,6 +94,12 @@ func TestStatusForbiddenWithoutRules(t *testing.T) {
 	if rec := serve(t, newWeb(nil), "/", nil); rec.Code != 403 {
 		t.Fatalf("no caller: %d", rec.Code)
 	}
+	empty := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{}, {Read: []string{}}}}
+	for _, p := range []string{"/", "/readyz", "/metrics"} {
+		if rec := serve(t, newWeb(nil), p, empty); rec.Code != 403 {
+			t.Fatalf("%s with empty rules: %d", p, rec.Code)
+		}
+	}
 }
 
 func TestProbeAccess(t *testing.T) {
