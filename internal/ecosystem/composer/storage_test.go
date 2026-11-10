@@ -354,10 +354,11 @@ func dupComposerZip(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
-// flaky fails index writes while fail is set.
+// flaky fails index writes while fail is set and provenance writes while
+// failProv is set.
 type flaky struct {
 	storage.Driver
-	fail atomic.Bool
+	fail, failProv atomic.Bool
 }
 
 func (f *flaky) PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (storage.Info, error) {
@@ -365,6 +366,13 @@ func (f *flaky) PutIfMatch(ctx context.Context, key string, r io.Reader, etag st
 		return storage.Info{}, errors.New("injected index failure")
 	}
 	return f.Driver.PutIfMatch(ctx, key, r, etag)
+}
+
+func (f *flaky) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if f.failProv.Load() && strings.HasPrefix(key, "provenance/") {
+		return storage.Info{}, errors.New("injected provenance failure")
+	}
+	return f.Driver.PutIfAbsent(ctx, key, r)
 }
 
 func flakySource(t *testing.T) (*StorageSource, *flaky) {
@@ -624,6 +632,29 @@ func TestRepairRecordsPublishOnce(t *testing.T) {
 	}
 	if got := keys(t, f, "audit/"); len(got) != 1 {
 		t.Fatalf("want exactly one publish audit, got %v", got)
+	}
+}
+
+func TestRepairRecordsPublishAfterReaderRebuiltIndex(t *testing.T) {
+	s, f := flakySource(t)
+	ctx := context.Background()
+	data := pkgZip(t, fooJSON)
+	f.failProv.Store(true) // the upload dies after storing the zip
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", data); err == nil {
+		t.Fatal("want injected failure")
+	}
+	f.failProv.Store(false)
+	if vs, err := s.Versions(ctx, "matchory-internal/foo", false); err != nil || len(vs) != 1 {
+		t.Fatalf("reader rebuild: %v %v", vs, err)
+	}
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", data); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got := keys(t, f, "provenance/"); len(got) != 1 {
+		t.Fatalf("provenance = %v", got)
+	}
+	if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", data); !errors.Is(err, ErrVersionExists) {
+		t.Fatalf("third upload: %v", err)
 	}
 }
 

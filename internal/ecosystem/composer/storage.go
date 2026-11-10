@@ -176,16 +176,22 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	if err != nil {
 		return Version{}, err
 	}
-	if !added || !same {
-		return Version{}, fmt.Errorf("%w: %s %s", ErrVersionExists, pkg, v.Version)
+	exists := fmt.Errorf("%w: %s %s", ErrVersionExists, pkg, v.Version)
+	if !same {
+		return Version{}, exists
 	}
-	// Record the publish only if the interrupted original never got that far.
-	if _, err := s.rec.GetProvenance(ctx, "composer", pkg, stored.Version, stored.Reference); errors.Is(err, storage.ErrNotFound) {
+	// Without provenance the interrupted original never recorded its publish
+	// (a reader may have indexed it meanwhile): this retry completes it.
+	_, err = s.rec.GetProvenance(ctx, "composer", pkg, stored.Version, stored.Reference)
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
 		if err := s.record(ctx, caller, pkg, stored, d.sha1); err != nil {
 			return Version{}, err
 		}
-	} else if err != nil {
+	case err != nil:
 		return Version{}, err
+	case !added:
+		return Version{}, exists
 	}
 	return stored, nil
 }
@@ -327,7 +333,7 @@ func normalizedOf(v Version) string {
 }
 
 // loadIndex returns storage.ErrNotFound (wrapped) when there is no index and
-// errCorruptIndex when it cannot be decoded; the etag is set in the latter case.
+// errCorruptIndex when it cannot be decoded or lists no version; the etag is set in the latter case.
 func (s *StorageSource) loadIndex(ctx context.Context, pkg string) ([]Version, string, error) {
 	rc, info, err := s.d.Get(ctx, indexKey(pkg))
 	if err != nil {
