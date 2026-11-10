@@ -498,14 +498,18 @@ func (g *GitSource) indexRemote(ctx context.Context, m *gitmirror.Mirror) (remot
 		// records the move.
 		if commit == "" || (up != "" && up != commit) {
 			pinned, moved, err := g.pins.Pin(ctx, "composer", g.name, remote, tag, up)
-			if err != nil {
+			switch {
+			case err != nil && commit == "":
 				g.skip(ctx, "composer git: pinning tag failed", "source", g.name, "remote", remote, "tag", tag, "error", err)
 				continue
+			case err != nil: // the existing pin stands; only recording the move failed
+				g.skip(ctx, "composer git: recording a moved tag failed; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", commit, "seen", up, "error", err)
+			default:
+				if moved || commit != "" { // moved: another instance pinned it first
+					g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", pinned, "seen", up)
+				}
+				commit = pinned
 			}
-			if moved || commit != "" { // moved: another instance pinned it first
-				g.log.Warn("composer git: tag moved upstream; serving the pinned commit", "source", g.name, "remote", remote, "tag", tag, "pinned", pinned, "seen", up)
-			}
-			commit = pinned
 		}
 		l, err := g.loadFor(ctx, m, pkg, commit)
 		if err != nil {

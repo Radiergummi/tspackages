@@ -958,3 +958,38 @@ func TestP2ResponsesDoNotShareMetadata(t *testing.T) {
 		}
 	}
 }
+
+// failPinWrites fails every pin write while fail is set.
+type failPinWrites struct {
+	storage.Driver
+	fail bool
+}
+
+func (f *failPinWrites) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if f.fail && strings.HasPrefix(key, "pins/") {
+		return storage.Info{}, errors.New("store down")
+	}
+	return f.Driver.PutIfAbsent(ctx, key, r)
+}
+
+func TestMovedTagStaysServedWhenRecordingTheMoveFails(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	pinned := testutil.Git(t, src, "rev-parse", "HEAD")
+	d := &failPinWrites{Driver: fsState(t)}
+	g, _ := newGit(t, d, nil, src)
+	ctx := context.Background()
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	commitFile(t, src, "README", "x", "two")
+	testutil.Git(t, src, "tag", "-f", "v1.0.0")
+	d.fail = true
+	if err := g.Index(ctx); err != nil {
+		t.Fatal(err)
+	}
+	vs, err := g.Versions(ctx, "matchory/a", false)
+	if err != nil || len(vs) != 1 || vs[0].Version != "v1.0.0" || vs[0].Reference != pinned {
+		t.Fatalf("versions = %+v, %v", vs, err)
+	}
+}
