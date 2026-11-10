@@ -100,7 +100,7 @@ storage:
   cache: {driver: fs, path: /cache}
   state: {driver: fs, path: /state}
   stores:
-    main: {driver: s3, bucket: b, prefix: hosted/, secret_access_key: "SECRET"}
+    main: {driver: s3, bucket: b, prefix: hosted/, access_key_id: k, secret_access_key: "SECRET"}
 ecosystems:
   composer:
     sources:
@@ -151,6 +151,10 @@ func TestValidateErrors(t *testing.T) {
 		{"work_dir inside state", strings.Replace(base, "work_dir: /work", "work_dir: /state/work", 1), "storage.work_dir and storage.state must not share a location"},
 		{"work_dir contains fs store", strings.Replace(strings.Replace(base, "work_dir: /work", "work_dir: /data", 1), "main: {driver: s3, bucket: b, prefix: hosted/,", "main: {driver: fs, path: /data/hosted,", 1), "storage.work_dir and storage.stores.main must not share a location"},
 		{"work_dir overlaps state_dir", strings.Replace(base, "state_dir: /ts", "state_dir: /work/ts", 1), "storage.work_dir and tailscale.state_dir must not share a location"},
+		{"state_dir inside fs store", strings.Replace(base, "state_dir: /ts", "state_dir: /cache/ts", 1), "storage.cache and tailscale.state_dir must not share a location"},
+		{"fs store inside state_dir", strings.Replace(base, "state: {driver: fs, path: /state}", "state: {driver: fs, path: /ts/state}", 1), "storage.state and tailscale.state_dir must not share a location"},
+		{"s3 key without secret", strings.Replace(base, `, secret_access_key: "SECRET"`, "", 1), "storage.stores.main: access_key_id and secret_access_key must be set together"},
+		{"s3 secret without key", strings.Replace(base, "access_key_id: k, ", "", 1), "storage.stores.main: access_key_id and secret_access_key must be set together"},
 		{"no state_dir", strings.Replace(base, "state_dir: /ts", "hostname: r", 1), "tailscale.state_dir is required"},
 		{"registry url host not in fetch_hosts", ecoc(`      - {name: r, type: registry, url: "https://a", fetch_hosts: [b]}
 `), `url host "a" is not in fetch_hosts`},

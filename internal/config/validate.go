@@ -33,6 +33,7 @@ func ValidateWith(c *Config, opts ValidateOptions) error {
 		add("tailscale.state_dir is required") // it holds the node and TLS keys
 	}
 	errs = append(errs, validateStores(&c.Storage)...)
+	errs = append(errs, validateStateDir(c)...)
 	errs = append(errs, validateWorkDir(c)...)
 	errs = append(errs, validateLimits(&c.Limits)...)
 
@@ -62,6 +63,9 @@ func validateStores(s *Storage) []error {
 		case "s3":
 			if sc.Bucket == "" {
 				add("%s: bucket is required for the s3 driver", name)
+			}
+			if (sc.AccessKeyID == "") != (sc.SecretAccessKey == "") {
+				add("%s: access_key_id and secret_access_key must be set together", name)
 			}
 			// Keys are lowercase so they stay unique on case-insensitive stores.
 			if sc.Prefix != strings.ToLower(sc.Prefix) {
@@ -113,6 +117,32 @@ func validateWorkDir(c *Config) []error {
 		}
 		if pathContains(w, p) || pathContains(p, w) {
 			errs = append(errs, fmt.Errorf("storage.work_dir and %s must not share a location", o.name))
+		}
+	}
+	return errs
+}
+
+// validateStateDir keeps the tsnet node and TLS keys out of every fs store:
+// a cache evicting them or a store serving them would be fatal.
+func validateStateDir(c *Config) []error {
+	if c.Tailscale.StateDir == "" {
+		return nil
+	}
+	sd, err := filepath.Abs(c.Tailscale.StateDir)
+	if err != nil {
+		return nil
+	}
+	var errs []error
+	for _, n := range c.Storage.Named() {
+		if n.Config.Driver != "fs" || n.Config.Path == "" {
+			continue
+		}
+		p, err := filepath.Abs(n.Config.Path)
+		if err != nil {
+			continue
+		}
+		if pathContains(sd, p) || pathContains(p, sd) {
+			errs = append(errs, fmt.Errorf("%s and tailscale.state_dir must not share a location", n.Path))
 		}
 	}
 	return errs
