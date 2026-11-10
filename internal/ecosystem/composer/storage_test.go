@@ -153,6 +153,8 @@ func TestUploadRejects(t *testing.T) {
 		{"version mismatch", "matchory-internal/foo", "1.0.0", pkgZip(t, `{"name":"matchory-internal/foo","version":"2.0.0"}`), true, false},
 		{"not a zip", "matchory-internal/foo", "1.0.0", []byte("nope"), false, true},
 		{"padded version", "matchory-internal/foo", " 1.0.0", pkgZip(t, fooJSON), true, false},
+		{"nul in version", "matchory-internal/foo", "1.0.0\x00", pkgZip(t, fooJSON), true, false},
+		{"vertical tab in version", "matchory-internal/foo", "1.0.0\x0b", pkgZip(t, fooJSON), true, false},
 		{"alias version", "matchory-internal/foo", "1.0.0 as 2.0.0", pkgZip(t, fooJSON), true, false},
 		{"stability flag", "matchory-internal/foo", "1.0.0@beta", pkgZip(t, fooJSON), true, false},
 		{"build metadata", "matchory-internal/foo", "1.0.0+build", pkgZip(t, fooJSON), true, false},

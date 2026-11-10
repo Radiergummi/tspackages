@@ -122,7 +122,7 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, name
 	if err != nil {
 		return Version{}, rejectUpload("%v", err)
 	}
-	if version != strings.TrimSpace(version) || strings.Contains(version, " as ") || strings.ContainsAny(version, "@+") {
+	if version != strings.Trim(version, phpTrim) || strings.Contains(version, " as ") || strings.ContainsAny(version, "@+") {
 		return Version{}, rejectUpload("version %q is not a plain version string", version)
 	}
 	d := sumsOf(zipData)
