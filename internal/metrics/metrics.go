@@ -53,6 +53,11 @@ var (
 		Help: "Unix time of the oldest last successful sync among a git source's remotes (0 while one never synced).",
 	}, []string{"source"})
 
+	buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tspackages_build_info",
+		Help: "Always 1; the labels name the running build.",
+	}, []string{"version", "commit"})
+
 	rejected atomic.Pointer[func() uint64]
 )
 
@@ -60,7 +65,7 @@ func init() {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		requests, cacheHits, upstreamDuration, gitLastSync,
+		requests, cacheHits, upstreamDuration, gitLastSync, buildInfo,
 		prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Name: "tspackages_rate_limited_total",
 			Help: "Requests rejected by the per-identity rate limiter.",
@@ -91,6 +96,12 @@ func RedactRemote(remote string) string {
 
 // Registry is the registry served at /metrics.
 func Registry() *prometheus.Registry { return registry }
+
+// SetBuildInfo sets tspackages_build_info for the running build.
+func SetBuildInfo(version, commit string) {
+	buildInfo.Reset()
+	buildInfo.WithLabelValues(version, commit).Set(1)
+}
 
 // SetRejected sets the function read by tspackages_rate_limited_total.
 func SetRejected(f func() uint64) { rejected.Store(&f) }

@@ -5,15 +5,18 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/config"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/server"
 	"github.com/radiergummi/tspackages/internal/workdir"
 	"tailscale.com/tsnet"
@@ -22,15 +25,23 @@ import (
 func main() {
 	configPath := flag.String("config", "/etc/tspackages/config.yaml", "path to the configuration file")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn or error")
+	logFormat := flag.String("log-format", "json", "log line format: json or text")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
-		fmt.Fprintf(os.Stderr, "tspackages: invalid -log-level %q\n", *logLevel)
+	v, c := buildVersion()
+	if *showVersion {
+		fmt.Println("tspackages", v, c)
+		return
+	}
+	log, err := newLogger(os.Stderr, *logLevel, *logFormat)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tspackages:", err)
 		os.Exit(2)
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
+	metrics.SetBuildInfo(v, c)
+	log.Info("starting", "version", v, "commit", c, "go", runtime.Version())
 
 	if err := run(*configPath, log); err != nil {
 		log.Error("tspackages failed", "error", err)
@@ -116,6 +127,22 @@ func run(configPath string, log *slog.Logger) error {
 		hs.Close()
 	}
 	return nil
+}
+
+// newLogger returns the process logger for a -log-level and -log-format.
+func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("invalid -log-level %q", level)
+	}
+	opts := &slog.HandlerOptions{Level: l}
+	switch format {
+	case "json":
+		return slog.New(slog.NewJSONHandler(w, opts)), nil
+	case "text":
+		return slog.New(slog.NewTextHandler(w, opts)), nil
+	}
+	return nil, fmt.Errorf("invalid -log-format %q (use json or text)", format)
 }
 
 // tsnetEnv holds tsnet's credentials; it reads them itself during Up.
