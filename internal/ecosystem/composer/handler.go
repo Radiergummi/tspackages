@@ -314,6 +314,9 @@ func (c *Composer) authorize(w http.ResponseWriter, caller identity.Caller, e *e
 	cands, claimed := resolve.Candidates(c.sources, name, Match)
 	e.claimed = claimed
 	if !authz.Allowed(caller.Rules, ecoName, name, action, Match) {
+		if bad := malformedRules(caller.Rules); len(bad) > 0 {
+			c.log.Warn("ignoring malformed capability rules", "caller", caller.NodeName, "rules", bad)
+		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return nil, false
 	}

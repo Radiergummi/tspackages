@@ -1,6 +1,11 @@
 package composer
 
-import "testing"
+import (
+	"slices"
+	"testing"
+
+	"github.com/radiergummi/tspackages/internal/authz"
+)
 
 func TestNormalize(t *testing.T) {
 	ok := map[string]string{
@@ -36,10 +41,29 @@ func TestMatch(t *testing.T) {
 		{"matchory/foo", "matchory/foo", true},
 		{"matchory-*/*", "matchory-internal/x", true},
 		{"[", "a/b", false},
+		// Only "*" is special; other path.Match syntax never matches.
+		{"a/?", "a/b", false},
+		{"a/[b]", "a/b", false},
+		{`a/\b`, "a/b", false},
+		{"a", "a", false},
+		{"a/b/c", "a/b/c", false},
+		{"\u212A/x", "k/x", false},
 	}
 	for _, tc := range tests {
 		if got := Match(tc.pattern, tc.name); got != tc.want {
 			t.Errorf("Match(%q,%q) = %v", tc.pattern, tc.name, got)
 		}
+	}
+}
+
+func TestMalformedRules(t *testing.T) {
+	rules := []authz.Rule{{
+		Read:  []string{"*", "composer:a/*", "composer:A/B", "composer", "composer:a/[b]", "pypi:anything?"},
+		Write: []string{"composer:*", "composer:a/b/c", ":a/b"},
+	}}
+	got := malformedRules(rules)
+	want := []string{"composer", "composer:a/[b]", "composer:a/b/c", ":a/b"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
