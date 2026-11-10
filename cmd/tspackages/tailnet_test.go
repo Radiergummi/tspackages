@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -38,32 +37,32 @@ func TestRunOverTailnet(t *testing.T) {
 	t.Setenv("TSP_TEST_TOKEN", "secret")
 	t.Setenv("TS_AUTHKEY", "tskey-test")
 
-	var (
-		mu  sync.Mutex
-		srv *tsnet.Server
-	)
+	nodes := make(chan *tsnet.Server, 1)
 	node := func(cfg *config.Config, _ *slog.Logger) *tsnet.Server {
-		mu.Lock()
-		defer mu.Unlock()
-		srv = testutil.Node(control, cfg.Tailscale.Hostname, cfg.Tailscale.StateDir)
-		return srv
+		s := testutil.Node(control, cfg.Tailscale.Hostname, cfg.Tailscale.StateDir)
+		nodes <- s
+		return s
 	}
 	runCtx, stopRun := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- run(runCtx, p, quiet, node) }()
 
+	var srv *tsnet.Server
+	select {
+	case srv = <-nodes:
+	case err := <-done:
+		t.Fatalf("run stopped before joining the tailnet: %v", err)
+	}
+	// Up waits for the node run is starting; it is safe to call twice.
+	if _, err := srv.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ip4, _ := srv.TailscaleIPs()
 	// Serving once a peer can connect to :443.
 	for {
-		mu.Lock()
-		s := srv
-		mu.Unlock()
-		if s != nil {
-			if ip4, _ := s.TailscaleIPs(); ip4.IsValid() {
-				if c, err := laptop.Dial(ctx, "tcp", ip4.String()+":443"); err == nil {
-					c.Close()
-					break
-				}
-			}
+		if c, err := laptop.Dial(ctx, "tcp", ip4.String()+":443"); err == nil {
+			c.Close()
+			break
 		}
 		select {
 		case err := <-done:

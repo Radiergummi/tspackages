@@ -5,11 +5,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -76,4 +78,24 @@ func (w Who) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
 		Node:   &tailcfg.Node{Name: "ci.ts.net.", StableID: "nid", Tags: []string{"tag:ci"}},
 		CapMap: tailcfg.PeerCapMap{w.Cap: vals},
 	}, nil
+}
+
+// S3Env returns the S3-compatible test service from TSP_TEST_S3_ENDPOINT, with
+// credentials from TSP_TEST_S3_ACCESS_KEY and TSP_TEST_S3_SECRET_KEY
+// (minioadmin by default), and a fresh bucket name. It skips the test when
+// the endpoint is unset.
+func S3Env(t testing.TB) (endpoint, accessKey, secretKey, bucket string) {
+	t.Helper()
+	endpoint = os.Getenv("TSP_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("TSP_TEST_S3_ENDPOINT not set")
+	}
+	accessKey, secretKey = "minioadmin", "minioadmin"
+	if v := os.Getenv("TSP_TEST_S3_ACCESS_KEY"); v != "" {
+		accessKey = v
+	}
+	if v := os.Getenv("TSP_TEST_S3_SECRET_KEY"); v != "" {
+		secretKey = v
+	}
+	return endpoint, accessKey, secretKey, fmt.Sprintf("tsp-test-%d", time.Now().UnixNano())
 }

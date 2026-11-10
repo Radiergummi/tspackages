@@ -44,26 +44,39 @@ type Web struct {
 	readyTimeout time.Duration
 }
 
-// New returns the status endpoints. hostname is the fallback host for client
-// snippets when a request carries none. movedPkg names the package a moved
-// tag's remote declares, so the status page shows the tag only to callers
-// allowed to read that package; without it moved tags are hidden. changed
-// lists dists whose upstream bytes changed. A nil moved, conflicts or changed
-// reports none, a nil ready is always ready.
-func New(hostname string, eco []ecosystem.Ecosystem, sources []StatusSource, moved func() []pins.MovedTag, movedPkg func(pins.MovedTag) string, conflicts func() []composer.Conflict, changed func() []composer.ChangedDist, ready func(ctx context.Context) error) *Web {
-	if moved == nil || movedPkg == nil {
-		moved = func() []pins.MovedTag { return nil }
+// Options configures the status endpoints. Nil functions report nothing,
+// and a nil Ready is always ready.
+type Options struct {
+	Hostname   string // fallback host for client snippets when a request carries none
+	Ecosystems []ecosystem.Ecosystem
+	Sources    []StatusSource
+	Moved      func() []pins.MovedTag
+	// MovedPkg names the package a moved tag's remote declares, so the status
+	// page shows the tag only to callers allowed to read that package; without
+	// it moved tags are hidden.
+	MovedPkg  func(pins.MovedTag) string
+	Conflicts func() []composer.Conflict
+	Changed   func() []composer.ChangedDist // dists whose upstream bytes changed
+	Ready     func(ctx context.Context) error
+}
+
+// New returns the status endpoints.
+func New(o Options) *Web {
+	w := &Web{hostname: o.Hostname, eco: o.Ecosystems, sources: o.Sources, moved: o.Moved, movedPkg: o.MovedPkg,
+		conflicts: o.Conflicts, changed: o.Changed, ready: o.Ready, readyTimeout: 5 * time.Second}
+	if w.moved == nil || w.movedPkg == nil {
+		w.moved = func() []pins.MovedTag { return nil }
 	}
-	if conflicts == nil {
-		conflicts = func() []composer.Conflict { return nil }
+	if w.conflicts == nil {
+		w.conflicts = func() []composer.Conflict { return nil }
 	}
-	if changed == nil {
-		changed = func() []composer.ChangedDist { return nil }
+	if w.changed == nil {
+		w.changed = func() []composer.ChangedDist { return nil }
 	}
-	if ready == nil {
-		ready = func(context.Context) error { return nil }
+	if w.ready == nil {
+		w.ready = func(context.Context) error { return nil }
 	}
-	return &Web{hostname: hostname, eco: eco, sources: sources, moved: moved, movedPkg: movedPkg, conflicts: conflicts, changed: changed, ready: ready, readyTimeout: 5 * time.Second}
+	return w
 }
 
 // Mount registers the routes on mux.

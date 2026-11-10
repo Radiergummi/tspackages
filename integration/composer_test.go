@@ -9,7 +9,6 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -166,39 +165,21 @@ func (g *gitRepo) push(args ...string) {
 type options struct {
 	rules       string // capability rules for every caller
 	metadataTTL time.Duration
-	stores      func(t *testing.T, root string) (cache, state, hosted config.StoreConfig)
+	stores      func(t *testing.T, root string) (state, hosted config.StoreConfig)
 }
 
-func fsStores(_ *testing.T, root string) (cache, state, hosted config.StoreConfig) {
-	return config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "cache"), MaxSize: 1 << 30},
-		config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "state")},
+func fsStores(_ *testing.T, root string) (state, hosted config.StoreConfig) {
+	return config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "state")},
 		config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "hosted")}
 }
 
-// s3Store returns an s3 store config for a fresh bucket on the S3-compatible
-// service at TSP_TEST_S3_ENDPOINT (credentials from TSP_TEST_S3_ACCESS_KEY
-// and TSP_TEST_S3_SECRET_KEY, minioadmin by default), and removes the bucket
-// and its objects after the test. It skips the test when the endpoint is
-// unset.
+// s3Store returns an s3 store config for a fresh bucket on the test
+// service (see testutil.S3Env), and removes the bucket and its objects after
+// the test.
 func s3Store(t *testing.T) config.StoreConfig {
 	t.Helper()
-	endpoint := os.Getenv("TSP_TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("TSP_TEST_S3_ENDPOINT not set")
-	}
-	getenv := func(k, def string) string {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-		return def
-	}
-	c := config.StoreConfig{
-		Driver:          "s3",
-		Endpoint:        endpoint,
-		Bucket:          fmt.Sprintf("tsp-test-%d", time.Now().UnixNano()),
-		AccessKeyID:     getenv("TSP_TEST_S3_ACCESS_KEY", "minioadmin"),
-		SecretAccessKey: getenv("TSP_TEST_S3_SECRET_KEY", "minioadmin"),
-	}
+	endpoint, accessKey, secretKey, bucket := testutil.S3Env(t)
+	c := config.StoreConfig{Driver: "s3", Endpoint: endpoint, Bucket: bucket, AccessKeyID: accessKey, SecretAccessKey: secretKey}
 	ctx := context.Background()
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, "")))
@@ -230,13 +211,12 @@ func s3Store(t *testing.T) config.StoreConfig {
 }
 
 // s3Stores keeps the state store and the hosted store in one bucket under
-// separate prefixes, as examples/config.yaml does; the cache stays local.
-func s3Stores(t *testing.T, root string) (cache, state, hosted config.StoreConfig) {
+// separate prefixes, as examples/config.yaml does.
+func s3Stores(t *testing.T, _ string) (state, hosted config.StoreConfig) {
 	b := s3Store(t)
 	state, hosted = b, b
 	state.Prefix, hosted.Prefix = "state/", "hosted/"
-	cache, _, _ = fsStores(t, root)
-	return cache, state, hosted
+	return state, hosted
 }
 
 // registry is a fully wired tspackages with a git source claiming
@@ -249,13 +229,11 @@ type registry struct {
 	cfg       *config.Config
 	git       *gitRepo
 	packagist *fakePackagist
-	env       []string // for composer
 }
 
 func startRegistry(t *testing.T, o options) *registry {
 	t.Helper()
 	needTools(t)
-	waitForGit := o.rules == "" // the default rules can read matchory/a
 	if o.rules == "" {
 		o.rules = `{"read":["*"],"write":["composer:matchory-internal/*"]}`
 	}
@@ -265,12 +243,12 @@ func startRegistry(t *testing.T, o options) *registry {
 	root := t.TempDir()
 	r := &registry{t: t, root: root, git: newGitRepo(t, root), packagist: newFakePackagist(t)}
 	pu, _ := url.Parse(r.packagist.URL)
-	cache, state, hosted := o.stores(t, root)
+	state, hosted := o.stores(t, root)
 	r.cfg = &config.Config{
 		Tailscale: config.Tailscale{Hostname: "registry", Capability: capName, StateDir: filepath.Join(root, "ts")},
 		Storage: config.Storage{
 			WorkDir: filepath.Join(root, "work"),
-			Cache:   cache,
+			Cache:   config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "cache"), MaxSize: 1 << 30},
 			State:   state,
 			Stores:  map[string]config.StoreConfig{"main": hosted},
 		},
@@ -293,13 +271,6 @@ func startRegistry(t *testing.T, o options) *registry {
 	// The git loop writes below root: stop it before TempDir cleanup.
 	t.Cleanup(func() { srv.Close(); cancel(); <-loops })
 	r.URL = srv.URL
-	r.env = []string{
-		"COMPOSER_HOME=" + filepath.Join(root, "composer-home"),
-		"COMPOSER_NO_INTERACTION=1",
-	}
-	if waitForGit {
-		r.waitFor("/composer/p2/matchory/a.json", `"v1.0.0"`)
-	}
 	return r
 }
 
@@ -321,6 +292,9 @@ func (r *registry) storedArchive(commit string) []byte {
 	}
 	return b
 }
+
+// waitForGit waits until the git source has indexed matchory/a v1.0.0.
+func (r *registry) waitForGit() { r.t.Helper(); r.waitFor("/composer/p2/matchory/a.json", `"v1.0.0"`) }
 
 // get returns the status and body of a GET on the registry.
 func (r *registry) get(path string) (int, string) {
@@ -392,8 +366,7 @@ func (r *registry) composer(dir string, args ...string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "composer", append(args, "--no-interaction", "--prefer-dist")...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), r.env...)
-	cmd.Env = append(cmd.Env, "COMPOSER_CACHE_DIR="+r.t.TempDir())
+	cmd.Env = append(os.Environ(), "COMPOSER_HOME="+filepath.Join(r.root, "composer-home"), "COMPOSER_CACHE_DIR="+r.t.TempDir())
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -437,8 +410,9 @@ func TestComposerEndToEnd(t *testing.T) {
 	t.Run("s3", func(t *testing.T) { testEndToEnd(t, s3Stores) })
 }
 
-func testEndToEnd(t *testing.T, stores func(*testing.T, string) (config.StoreConfig, config.StoreConfig, config.StoreConfig)) {
+func testEndToEnd(t *testing.T, stores func(*testing.T, string) (config.StoreConfig, config.StoreConfig)) {
 	r := startRegistry(t, options{stores: stores})
+	r.waitForGit()
 	r.upload("matchory-internal/b", "1.0.0")
 	commit := testutil.Git(t, r.git.work, "rev-parse", "v1.0.0^{commit}")
 
@@ -487,6 +461,7 @@ func testEndToEnd(t *testing.T, stores func(*testing.T, string) (config.StoreCon
 // the default branch is a dev version.
 func TestComposerGitVersions(t *testing.T) {
 	r := startRegistry(t, options{})
+	r.waitForGit()
 	first := testutil.Git(t, r.git.work, "rev-parse", "v1.0.0^{commit}")
 
 	project := r.project(map[string]string{"matchory/a": "^1.0"})

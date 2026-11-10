@@ -126,23 +126,18 @@ func (s *Store) GetProvenance(ctx context.Context, ecosystem, pkg, version, sha2
 	return p, err
 }
 
-// ListProvenance returns every record of one version, one per digest.
-func (s *Store) ListProvenance(ctx context.Context, ecosystem, pkg, version string) ([]Provenance, error) {
+// ProvenanceDigests returns the sha256 digests that have a provenance
+// record for one version, from the record keys alone.
+func (s *Store) ProvenanceDigests(ctx context.Context, ecosystem, pkg, version string) ([]string, error) {
 	prefix := provPrefix(ecosystem, pkg, version)
-	var out []Provenance
+	var out []string
 	for info, err := range s.d.List(ctx, prefix) {
 		if err != nil {
 			return nil, err
 		}
-		sha256, ok := strings.CutSuffix(strings.TrimPrefix(info.Key, prefix), ".json")
-		if !ok || !digest.IsHex(sha256, 64) {
-			continue
+		if sha256, ok := strings.CutSuffix(strings.TrimPrefix(info.Key, prefix), ".json"); ok && digest.IsHex(sha256, 64) {
+			out = append(out, sha256)
 		}
-		p, err := s.GetProvenance(ctx, ecosystem, pkg, version, sha256)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
 	}
 	return out, nil
 }

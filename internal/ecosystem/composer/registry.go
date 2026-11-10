@@ -505,14 +505,22 @@ func (s *RegistrySource) Health(context.Context) []metrics.Health {
 // source, version and reference. A difference is logged and remembered for
 // the status page; the new bytes are still served.
 func (s *RegistrySource) checkPinned(ctx context.Context, pkg, version, reference, sha256Hex string) error {
-	recs, err := s.rec.ListProvenance(ctx, "composer", pkg, version)
+	digests, err := s.rec.ProvenanceDigests(ctx, "composer", pkg, version)
 	if err != nil {
 		return fmt.Errorf("read provenance: %w", err)
 	}
+	// Records are read only when another digest is recorded, which is rare.
+	if !slices.ContainsFunc(digests, func(d string) bool { return d != sha256Hex }) {
+		return nil
+	}
 	var pinned *records.Provenance
-	for i, p := range recs {
+	for _, d := range digests {
+		p, err := s.rec.GetProvenance(ctx, "composer", pkg, version, d)
+		if err != nil {
+			return fmt.Errorf("read provenance: %w", err)
+		}
 		if p.Source == s.name && p.Commit == reference && (pinned == nil || p.Created.Before(pinned.Created)) {
-			pinned = &recs[i]
+			pinned = &p
 		}
 	}
 	if pinned == nil || pinned.SHA256 == sha256Hex {

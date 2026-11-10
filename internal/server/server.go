@@ -184,7 +184,10 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		return ""
 	}
 	metrics.SetRejected(limiter.Rejected)
-	web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, movedPkg, conflicts, changed, stores.ready).Mount(mux)
+	web.New(web.Options{
+		Hostname: cfg.Tailscale.Hostname, Ecosystems: ecos, Sources: status,
+		Moved: pinStore.Moved, MovedPkg: movedPkg, Conflicts: conflicts, Changed: changed, Ready: stores.ready,
+	}).Mount(mux)
 
 	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {

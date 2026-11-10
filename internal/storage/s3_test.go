@@ -7,34 +7,20 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/radiergummi/tspackages/internal/config"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 func testS3Config(t *testing.T) config.StoreConfig {
-	endpoint := os.Getenv("TSP_TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("TSP_TEST_S3_ENDPOINT not set")
-	}
-	getenv := func(k, def string) string {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-		return def
-	}
+	endpoint, accessKey, secretKey, bucket := testutil.S3Env(t)
 	return config.StoreConfig{
-		Driver:          "s3",
-		Endpoint:        endpoint,
-		Bucket:          fmt.Sprintf("tsp-test-%d", time.Now().UnixNano()),
-		Prefix:          "pfx",
-		AccessKeyID:     getenv("TSP_TEST_S3_ACCESS_KEY", "minioadmin"),
-		SecretAccessKey: getenv("TSP_TEST_S3_SECRET_KEY", "minioadmin"),
+		Driver: "s3", Endpoint: endpoint, Bucket: bucket, Prefix: "pfx",
+		AccessKeyID: accessKey, SecretAccessKey: secretKey,
 	}
 }
 

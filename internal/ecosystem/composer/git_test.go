@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1061,8 +1060,7 @@ func TestArchiveDropsSymlinks(t *testing.T) {
 	if zr.Comment != commit {
 		t.Errorf("comment = %q, want the commit", zr.Comment)
 	}
-	s := sha1.Sum(data)
-	if shasumOf(v) != hex.EncodeToString(s[:]) {
+	if shasumOf(v) != sum1(data) {
 		t.Error("metadata shasum does not match the served archive")
 	}
 }

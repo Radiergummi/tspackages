@@ -133,8 +133,6 @@ func distMeta(base, shasum, ref string) []byte {
 }
 
 func sum1(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
-
-func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 func sum256(b []byte) string {
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
@@ -497,7 +495,7 @@ func TestDistUndeclaredChangeIsReported(t *testing.T) {
 	}
 	c := changed.ChangedDists()
 	if len(c) != 1 || c[0].Package != "acme/pkg" || c[0].Version != "1.0.0" || c[0].Reference != "r1" ||
-		c[0].Pinned != sha256Hex(first) || c[0].Seen != sha256Hex(second) {
+		c[0].Pinned != sum256(first) || c[0].Seen != sum256(second) {
 		t.Fatalf("changed = %+v", c)
 	}
 
