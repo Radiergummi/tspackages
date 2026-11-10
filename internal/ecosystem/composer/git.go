@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/metrics"
@@ -748,13 +749,22 @@ func (g *GitSource) zipBytes(ctx context.Context, m *gitmirror.Mirror, commit st
 		}
 		return nil, err
 	}
-	if _, err := g.state.PutIfAbsent(ctx, key, bytes.NewReader(w.buf.Bytes())); err != nil {
+	// Uploads may not contain symlinks; built archives leave them out.
+	data, dropped, err := archive.DropSymlinks(w.buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("archive of %s: %w", commit, err)
+	}
+	if len(dropped) > 0 {
+		g.log.Warn("left symlinks out of a git archive", "source", g.name, "remote", m.Remote(),
+			"commit", commit, "entries", dropped)
+	}
+	if _, err := g.state.PutIfAbsent(ctx, key, bytes.NewReader(data)); err != nil {
 		if errors.Is(err, storage.ErrExists) {
 			return g.readStored(ctx, key, g.maxArchive) // someone else stored it first: theirs is canonical
 		}
 		return nil, err
 	}
-	return w.buf.Bytes(), nil
+	return data, nil
 }
 
 // readStored reads key, failing with errTooLarge beyond max bytes.

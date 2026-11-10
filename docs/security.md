@@ -69,6 +69,9 @@ tailnet. Read this before you deploy.
   the status page. If the first push of a tag was malicious, the pin keeps it.
   To accept a moved tag, delete its pin; a deleted pin is **re-pinned on next
   sight** to whatever the tag points at then.
+- Archives built from git leave out symlinks, which uploads may not contain
+  either; each one left out is logged at warn. Archives built earlier are kept
+  as they are.
 - Versions that were served stay served (and byte-identical, so Composer's
   `shasum` stays valid) even if the tag is deleted upstream. A remote that is
   unreachable at startup is indexed from its local mirror, or, without one (or

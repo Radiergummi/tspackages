@@ -44,6 +44,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Archives built from git sources leave out symlinks, as uploads already
+  must. Each one left out is logged at warn. Archives built before this
+  change are served unchanged.
 - Served Composer metadata drops upstream `dist.mirrors`,
   `transport-options` and `notification-url`. Before, a registry source passed
   them through, so Composer could download from a mirror the upstream named

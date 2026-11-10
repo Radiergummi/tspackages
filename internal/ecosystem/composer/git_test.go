@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/pins"
 	"github.com/radiergummi/tspackages/internal/records"
@@ -1022,5 +1024,45 @@ func TestNumericBranchVersionNames(t *testing.T) {
 	}
 	if !maps.Equal(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
+	}
+}
+
+// A tracked symlink is left out of the built archive, which then passes the
+// same inspection as an upload; the metadata shasum matches the served bytes.
+func TestArchiveDropsSymlinks(t *testing.T) {
+	src := gitRepo(t, "matchory/a")
+	if err := os.Symlink("/etc/passwd", filepath.Join(src, "link")); err != nil {
+		t.Fatal(err)
+	}
+	commit := commitFile(t, src, "README", "r", "add a symlink")
+	testutil.Git(t, src, "tag", "v1.0.0")
+	g, _ := newGit(t, fsState(t), nil, src)
+	if err := g.Index(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v := versionsOf(t, g, "matchory/a")["v1.0.0"]
+	a, err := g.Dist(context.Background(), "matchory/a", "v1.0.0", v.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Body.Close()
+	data, _ := io.ReadAll(a.Body)
+	zr, err := archive.InspectZip(data, archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 1 << 20, MaxEntries: 100})
+	if err != nil {
+		t.Fatalf("served archive fails inspection: %v", err)
+	}
+	var names []string
+	for _, f := range zr.File {
+		names = append(names, f.Name)
+	}
+	if !slices.Contains(names, "composer.json") || !slices.Contains(names, "README") || slices.Contains(names, "link") {
+		t.Fatalf("entries: %v", names)
+	}
+	if zr.Comment != commit {
+		t.Errorf("comment = %q, want the commit", zr.Comment)
+	}
+	s := sha1.Sum(data)
+	if shasumOf(v) != hex.EncodeToString(s[:]) {
+		t.Error("metadata shasum does not match the served archive")
 	}
 }

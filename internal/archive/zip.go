@@ -149,3 +149,40 @@ func FindFile(zr *zip.Reader, name string) (*zip.File, error) {
 	}
 	return nil, ErrNotFound
 }
+
+// DropSymlinks returns data without its symlink entries and the names it
+// dropped. Data without symlinks is returned as is; otherwise the other
+// entries are copied unchanged (still compressed) in their order, with the
+// archive comment, so the result is deterministic.
+func DropSymlinks(data []byte) ([]byte, []string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, nil, reject("not a valid zip archive")
+	}
+	var dropped []string
+	for _, f := range zr.File {
+		if f.Mode()&fs.ModeSymlink != 0 {
+			dropped = append(dropped, f.Name)
+		}
+	}
+	if len(dropped) == 0 {
+		return data, nil, nil
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range zr.File {
+		if f.Mode()&fs.ModeSymlink != 0 {
+			continue
+		}
+		if err := zw.Copy(f); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := zw.SetComment(zr.Comment); err != nil {
+		return nil, nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, nil, err
+	}
+	return buf.Bytes(), dropped, nil
+}

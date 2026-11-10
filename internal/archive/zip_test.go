@@ -174,3 +174,40 @@ func FuzzInspectZip(f *testing.F) {
 		}
 	})
 }
+
+func TestDropSymlinks(t *testing.T) {
+	plain := makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "src/", mode: fs.ModeDir | 0o755})
+	out, dropped, err := DropSymlinks(plain)
+	if err != nil || len(dropped) != 0 || !bytes.Equal(out, plain) {
+		t.Fatalf("no symlinks: changed=%v dropped=%v err=%v", !bytes.Equal(out, plain), dropped, err)
+	}
+
+	in := makeZip(t,
+		entry{name: "composer.json", body: "{}"},
+		entry{name: "link", body: "/etc/passwd", mode: fs.ModeSymlink | 0o777},
+		entry{name: "bin/run", body: "#!/bin/sh", mode: 0o755},
+		entry{name: "bin/up", body: "../..", mode: fs.ModeSymlink | 0o777},
+	)
+	out, dropped, err = DropSymlinks(in)
+	if err != nil || !slices.Equal(dropped, []string{"link", "bin/up"}) {
+		t.Fatalf("dropped=%v err=%v", dropped, err)
+	}
+	zr, err := InspectZip(out, testLimits)
+	if err != nil {
+		t.Fatalf("result fails inspection: %v", err)
+	}
+	var names []string
+	for _, f := range zr.File {
+		names = append(names, f.Name+" "+f.Mode().String())
+	}
+	if !slices.Equal(names, []string{"composer.json -rw-rw-rw-", "bin/run -rwxr-xr-x"}) {
+		t.Fatalf("entries: %v", names)
+	}
+	if again, _, _ := DropSymlinks(in); !bytes.Equal(again, out) {
+		t.Fatal("not deterministic")
+	}
+
+	if _, _, err := DropSymlinks([]byte("not a zip")); err == nil {
+		t.Fatal("garbage accepted")
+	}
+}
