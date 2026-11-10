@@ -110,7 +110,7 @@ func (s *Store) read(ctx context.Context, key string) (Pin, error) {
 		return Pin{}, err
 	}
 	if err := json.Unmarshal(raw, &pf); err != nil {
-		return Pin{}, fmt.Errorf("%w %s: %v", ErrCorrupt, key, err)
+		return Pin{}, fmt.Errorf("%w %s: %w", ErrCorrupt, key, err)
 	}
 	if !digest.IsHex(pf.SHA, 40, 64) {
 		return Pin{}, fmt.Errorf("%w %s: invalid sha", ErrCorrupt, key)

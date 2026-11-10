@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -59,12 +60,7 @@ type fakePackagist struct {
 func (f *fakePackagist) saw(path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, p := range f.paths {
-		if p == path {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.paths, path)
 }
 
 func (f *fakePackagist) seen() []string {
@@ -158,7 +154,7 @@ func TestComposerEndToEnd(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := slog.New(slog.DiscardHandler)
 	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, `{"read":["*"],"write":["composer:matchory-internal/*"]}`), log, server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,64 @@
+version: "2"
+
+run:
+  build-tags: [integration, tailnet] # lint the tagged tests too
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - bodyclose       # unclosed HTTP response bodies (upstream fetches)
+    - noctx           # HTTP requests and commands without a context
+    - gosec           # security issues
+    - errorlint       # incorrect error wrapping/comparison
+    - gocritic        # broad bug/perf/style checks
+    - fatcontext      # context.WithValue/Cancel in loops
+    - durationcheck   # duration multiplication bugs
+    - nilerr          # returning nil error when err != nil
+    - musttag         # missing struct tags in marshaled types
+    - canonicalheader # non-canonical HTTP header keys
+    - exhaustive      # non-exhaustive enum switches
+    - modernize       # modern Go idioms
+    - sloglint        # consistent slog calls
+  settings:
+    errcheck:
+      exclude-functions:
+        - io.Copy
+        - fmt.Fprintf
+        - fmt.Fprint
+        - fmt.Fprintln
+        - (io.Closer).Close
+        - (*os.File).Close
+        - os.Unsetenv
+        - (net/http.ResponseWriter).Write
+    exhaustive:
+      default-signifies-exhaustive: true
+    gosec:
+      excludes:
+        - G104 # unhandled errors: errcheck covers them with finer control
+        - G115 # int64/uint64 conversions of sizes validated as non-negative
+        - G122 # WalkDir removals inside the stores' own trees; nothing there is followed
+        - G401 # SHA-1 is Composer's dist checksum (shasum); SHA-256 is computed alongside
+        - G404 # math/rand only jitters retry backoff
+        - G505 # see G401
+    gocritic:
+      disabled-checks:
+        - ifElseChain # stylistic, not a bug
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: '(.+)_test\.go'
+        linters:
+          - noctx   # httptest.NewRequest without a context is fine in tests
+          - bodyclose  # error-path Gets return no body
+          - fatcontext # handlers capture the request context for assertions
+          - musttag # test-only structs need no json tags
+          - gosec   # fixtures write files and run git with test inputs
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -116,15 +116,13 @@ func TestPinConcurrent(t *testing.T) {
 	got := make([]string, 2)
 	moved := make([]bool, 2)
 	for i := range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var err error
 			got[i], moved[i], err = s.Pin(ctx, "composer", "gh", "r", "v1", shas[i])
 			if err != nil {
 				t.Error(err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if got[0] != got[1] || moved[0] == moved[1] {

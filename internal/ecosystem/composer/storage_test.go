@@ -219,11 +219,9 @@ func TestUploadConcurrentSameVersion(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i := range errs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, errs[i] = s.Upload(ctx, caller, "matchory-internal/foo", "1.0.0", pkgZip(t, fooJSON))
-		}()
+		})
 	}
 	wg.Wait()
 	ok, exists := 0, 0
@@ -253,11 +251,9 @@ func TestUploadConcurrentDifferentVersions(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, errs[i] = s.Upload(ctx, caller, "matchory-internal/foo", fmt.Sprintf("1.%d.0", i), pkgZip(t, fooJSON))
-		}()
+		})
 	}
 	wg.Wait()
 	for _, err := range errs {
@@ -648,13 +644,11 @@ func TestConcurrentReadersShareRebuild(t *testing.T) {
 	h.lists.Store(0)
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if vs, err := s.Versions(ctx, "matchory-internal/foo", false); err != nil || len(vs) != 1 {
 				t.Errorf("%v %v", vs, err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if n := h.lists.Load(); n != 1 {

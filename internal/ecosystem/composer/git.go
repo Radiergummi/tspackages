@@ -268,7 +268,7 @@ func (g *GitSource) fallbackToPins(ctx context.Context, m *gitmirror.Mirror, cau
 	remote := m.Remote()
 	pinned, err := g.listPins(ctx, remote)
 	if err != nil {
-		return remoteResult{}, fmt.Errorf("%w; listing pins: %v", cause, err)
+		return remoteResult{}, fmt.Errorf("%w; listing pins: %v", cause, err) //nolint:errorlint // only cause is wrapped
 	}
 	type pinnedVersion struct {
 		tag, normalized, commit string

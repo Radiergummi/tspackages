@@ -265,7 +265,7 @@ func TestTokenNotInArgv(t *testing.T) {
 	b, _ := os.ReadFile(rec)
 	out := string(b)
 	var argv, env []string
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		if strings.HasPrefix(l, "ARGV: ") {
 			argv = append(argv, l)
 		} else {
@@ -403,7 +403,8 @@ func TestDirDependsOnCredentials(t *testing.T) {
 		}
 		return m.dir
 	}
-	if mk("a") == mk("b") || mk("a") == mk("") || mk("a") != mk("a") {
+	a1, a2 := mk("a"), mk("a")
+	if a1 != a2 || a1 == mk("b") || a1 == mk("") {
 		t.Error("mirror dir does not track credential identity")
 	}
 }

@@ -124,7 +124,7 @@ func New(o Options) (*Mirror, error) {
 	if st, err := os.Stat(base); err != nil {
 		return nil, err
 	} else if st.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(base, 0o700); err != nil {
+		if err := os.Chmod(base, 0o700); err != nil { //nolint:gosec // a directory: 0700 is owner-only
 			return nil, fmt.Errorf("gitmirror: chmod base dir: %w", err)
 		}
 	}
@@ -300,7 +300,7 @@ func (m *Mirror) followRemoteHead(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if rest, ok := strings.CutPrefix(line, "ref: refs/heads/"); ok {
 			branch, _, _ := strings.Cut(rest, "\t")
 			if branch == "" {
@@ -329,7 +329,7 @@ func (m *Mirror) Refs(ctx context.Context) ([]Ref, error) {
 		return nil, err
 	}
 	var refs []Ref
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if line == "" {
 			continue
 		}
@@ -382,7 +382,7 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00\n") {
 		return nil, fmt.Errorf("gitmirror: invalid path %q", path)
 	}
-	for _, seg := range strings.Split(path, "/") {
+	for seg := range strings.SplitSeq(path, "/") {
 		if seg == "" || seg == "." || seg == ".." {
 			return nil, fmt.Errorf("gitmirror: invalid path %q", path)
 		}

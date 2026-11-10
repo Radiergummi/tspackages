@@ -287,8 +287,7 @@ func (c *Composer) upload(w http.ResponseWriter, r *http.Request, caller identit
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, c.limits.MaxBytes))
 	if err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			http.Error(w, fmt.Sprintf("upload exceeds %d bytes", c.limits.MaxBytes), http.StatusRequestEntityTooLarge)
 		} else {
 			http.Error(w, "could not read request body", http.StatusBadRequest)

@@ -70,8 +70,7 @@ func NewS3(ctx context.Context, c config.StoreConfig) (Driver, error) {
 func (d *s3Driver) full(key string) *string { return aws.String(d.prefix + key) }
 
 func status(err error) int {
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*awshttp.ResponseError](err); ok {
 		return re.HTTPStatusCode()
 	}
 	return 0
@@ -87,8 +86,7 @@ func quoteETag(e string) string {
 }
 
 func errCode(err error) string {
-	var ae smithy.APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[smithy.APIError](err); ok {
 		return ae.ErrorCode()
 	}
 	return ""
@@ -174,7 +172,7 @@ func (d *s3Driver) put(ctx context.Context, key string, r io.Reader, ifNoneMatch
 	if err != nil {
 		return Info{}, err
 	}
-	for attempt := 0; attempt < maxPutAttempts; attempt++ {
+	for attempt := range maxPutAttempts {
 		if attempt > 0 {
 			wait := minBackoff + rand.N(maxBackoff-minBackoff)
 			select {

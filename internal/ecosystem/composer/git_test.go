@@ -754,7 +754,7 @@ func (r *racePin) PutIfAbsent(ctx context.Context, key string, body io.Reader) (
 	if !r.done && strings.HasPrefix(key, "pins/") {
 		r.done = true
 		other := `{"tag":"v1.0.0","sha":"` + strings.Repeat("b", 40) + `","first_seen":"2026-01-01T00:00:00Z"}`
-		if _, err := r.Driver.Put(ctx, key, strings.NewReader(other)); err != nil {
+		if _, err := r.Put(ctx, key, strings.NewReader(other)); err != nil {
 			return storage.Info{}, err
 		}
 	}

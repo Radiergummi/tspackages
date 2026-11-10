@@ -13,6 +13,7 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 // Git runs git in dir with a fixed identity, no user or system config,
@@ -21,7 +22,7 @@ import (
 func Git(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main"}, args...)
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(t.Context(), "git", full...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com",
@@ -57,13 +58,13 @@ func ZipOf(t testing.TB, files map[string]string) []byte {
 // Who is a fake identity.Whoiser: every caller is the tagged node
 // ci.ts.net (stable ID "nid", tag:ci) holding Rules under capability Cap.
 type Who struct {
-	Cap   tailcfg.PeerCapability
+	Cap   peercap.Cap
 	Rules []string
 }
 
 // NewWho returns a Who granting rules (JSON capability values) under capName.
 func NewWho(capName string, rules ...string) Who {
-	return Who{Cap: tailcfg.PeerCapability(capName), Rules: rules}
+	return Who{Cap: peercap.Cap(capName), Rules: rules}
 }
 
 func (w Who) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {

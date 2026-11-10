@@ -26,7 +26,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/upstream"
 	"github.com/radiergummi/tspackages/internal/web"
 	"github.com/radiergummi/tspackages/internal/workdir"
-	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 // Hooks are test-only escape hatches. main passes the zero value.
@@ -177,7 +177,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	metrics.SetRejected(limiter.Rejected)
 	web.New(cfg.Tailscale.Hostname, ecos, status, pinStore.Moved, movedPkg, conflicts, stores.ready).Mount(mux)
 
-	handler := identity.Middleware(who, tailcfg.PeerCapability(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
+	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {
 		var wg sync.WaitGroup
 		for _, g := range gitSources {

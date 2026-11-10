@@ -20,7 +20,7 @@ import (
 
 const testCap = "github.com/radiergummi/tspackages"
 
-var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
+var quiet = slog.New(slog.DiscardHandler)
 
 func fsConfig(t *testing.T) *config.Config {
 	t.Helper()

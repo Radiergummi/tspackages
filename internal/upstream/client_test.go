@@ -358,8 +358,7 @@ func TestErrorsRedactQuery(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "frag") {
 		t.Fatalf("err = %v", err)
 	}
-	var ue *url.Error
-	if !errors.As(err, &ue) {
+	if _, ok := errors.AsType[*url.Error](err); !ok {
 		t.Fatalf("lost cause: %v", err)
 	}
 }

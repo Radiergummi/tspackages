@@ -401,8 +401,8 @@ func (d *fsDriver) List(ctx context.Context, prefix string) iter.Seq2[Info, erro
 			return
 		}
 		start := d.root
-		if i := strings.LastIndexByte(prefix, '/'); i >= 0 {
-			start = filepath.Join(d.root, filepath.FromSlash(prefix[:i]))
+		if before, _, ok := strings.CutLast(prefix, "/"); ok {
+			start = filepath.Join(d.root, filepath.FromSlash(before))
 		}
 		// Collect keys first and sort them byte-wise: directory walk order
 		// differs from key order ("a.b" sorts before "a/b").

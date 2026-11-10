@@ -29,7 +29,7 @@ func TestRequestLimitPerIdentity(t *testing.T) {
 	l := New(config.Limits{RequestsPerSecond: 0.001, Burst: 2, UpstreamFetchesPerSecond: 10})
 	defer l.Close()
 	h := l.Middleware()(ok)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if w := do(h, "A"); w.Code != 200 {
 			t.Fatalf("req %d = %d", i, w.Code)
 		}
@@ -167,8 +167,7 @@ func TestCloseTwice(t *testing.T) {
 	l := New(config.Limits{RequestsPerSecond: 1, Burst: 1, UpstreamFetchesPerSecond: 1})
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() { defer wg.Done(); l.Close() }()
+		wg.Go(func() { ; l.Close() })
 	}
 	wg.Wait()
 	l.Close()

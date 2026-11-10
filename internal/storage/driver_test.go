@@ -77,11 +77,9 @@ func runDriverSuite(t *testing.T, d Driver) {
 		errs := make([]error, n)
 		var wg sync.WaitGroup
 		for i := range n {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				_, errs[i] = d.PutIfAbsent(ctx, "conc/k", bytes.NewReader([]byte(fmt.Sprintf("body-%d", i))))
-			}()
+			})
 		}
 		wg.Wait()
 		winner, exists := -1, 0
@@ -179,11 +177,9 @@ func runDriverSuite(t *testing.T, d Driver) {
 		errs := make([]error, n)
 		var wg sync.WaitGroup
 		for i := range n {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				_, errs[i] = d.PutIfMatch(ctx, "pimc/k", bytes.NewReader([]byte(fmt.Sprintf("w-%d", i))), base.ETag)
-			}()
+			})
 		}
 		wg.Wait()
 		winner, lost := -1, 0

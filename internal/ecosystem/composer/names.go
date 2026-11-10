@@ -43,7 +43,7 @@ func Match(pattern, name string) bool {
 func lookupName(name string) (string, error) {
 	pkg, err := Normalize(name)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+		return "", fmt.Errorf("%w: %v", resolve.ErrNotFound, err) //nolint:errorlint // ErrNotFound is never joined with another error
 	}
 	return pkg, nil
 }

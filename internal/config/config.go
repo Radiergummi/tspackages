@@ -228,6 +228,7 @@ func expand(v reflect.Value, refs map[string]bool) error {
 			errs = append(errs, expand(elem, refs))
 			v.SetMapIndex(k, elem)
 		}
+	default: // no other kind holds strings
 	}
 	return errors.Join(errs...)
 }

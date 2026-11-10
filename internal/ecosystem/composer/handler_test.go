@@ -19,10 +19,10 @@ import (
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/testutil"
-	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
-const hCap tailcfg.PeerCapability = "github.com/radiergummi/tspackages"
+const hCap peercap.Cap = "github.com/radiergummi/tspackages"
 
 type fakeSource struct {
 	name    string
@@ -75,7 +75,7 @@ const readAll = `{"read":["*"]}`
 
 func server(t *testing.T, srcs []Source, rules ...string) http.Handler {
 	t.Helper()
-	return serverLog(t, slog.New(slog.NewTextHandler(io.Discard, nil)), srcs, rules...)
+	return serverLog(t, slog.New(slog.DiscardHandler), srcs, rules...)
 }
 
 func serverLog(t *testing.T, log *slog.Logger, srcs []Source, rules ...string) http.Handler {
@@ -372,7 +372,7 @@ type logLine map[string]any
 
 func captured(buf *bytes.Buffer) []logLine {
 	var out []logLine
-	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var m logLine
 		if json.Unmarshal([]byte(l), &m) == nil {
 			out = append(out, m)
@@ -578,7 +578,7 @@ func TestUploadLogLine(t *testing.T) {
 func TestSecurityHeadersOnEarlyResponses(t *testing.T) {
 	g, _ := gitAndReg()
 	mux := http.NewServeMux()
-	New([]Source{g}, archive.Limits{MaxBytes: 1}, slog.New(slog.NewTextHandler(io.Discard, nil))).Mount(mux)
+	New([]Source{g}, archive.Limits{MaxBytes: 1}, slog.New(slog.DiscardHandler)).Mount(mux)
 	for name, w := range map[string]*httptest.ResponseRecorder{
 		"no caller": do(mux, "GET", "/composer/packages.json", nil),
 		"HEAD dist": do(server(t, []Source{g}, readAll), "HEAD", "/composer/dist/git-fake/matchory/a/1/r", nil),

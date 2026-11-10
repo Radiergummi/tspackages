@@ -185,7 +185,7 @@ var (
 )
 
 func (c *Client) checkURL(u *url.URL) error {
-	if u.Scheme != "https" && !(u.Scheme == "http" && c.allowPrivate) {
+	if u.Scheme != "https" && (u.Scheme != "http" || !c.allowPrivate) {
 		return fmt.Errorf("%w: %q", ErrSchemeNotAllowed, u.Scheme)
 	}
 	if u.User != nil {
@@ -214,8 +214,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		// The parse error quotes the whole URL; keep only its cause.
-		var ue *url.Error
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*url.Error](err); ok {
 			err = ue.Err
 		}
 		return nil, fmt.Errorf("parse upstream url: %w", err)
@@ -237,8 +236,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		var ue *url.Error
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*url.Error](err); ok {
 			// Keep the cause (errors.Is/As) but drop query/userinfo from the text.
 			if pu, perr := url.Parse(ue.URL); perr == nil {
 				ue.URL = redactURL(pu)

@@ -269,7 +269,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			if u, err := url.Parse(s.URL); s.URL != "" && (err != nil || u.Host == "") {
 				add("url %q is not a valid URL", s.URL)
 			} else if s.URL != "" {
-				if u.Scheme != "https" && !(u.Scheme == "http" && opts.AllowHTTPUpstreams) {
+				if u.Scheme != "https" && (u.Scheme != "http" || !opts.AllowHTTPUpstreams) {
 					add("url %q must use https", s.URL)
 				}
 				if !HostAllowed(s.FetchHosts, u) {

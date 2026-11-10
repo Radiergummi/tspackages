@@ -104,8 +104,7 @@ func isTimeout(err error) bool {
 
 // HTTPStatus maps a resolution error to a response status.
 func HTTPStatus(err error) int {
-	var se *SourceError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*SourceError](err); ok {
 		if se.Timeout {
 			return http.StatusGatewayTimeout
 		}

@@ -3,7 +3,6 @@ package identity
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,9 +11,10 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
-const capName tailcfg.PeerCapability = "github.com/radiergummi/tspackages"
+const capName peercap.Cap = "github.com/radiergummi/tspackages"
 
 func capMap(raw ...string) tailcfg.PeerCapMap {
 	var vals []tailcfg.RawMessage
@@ -109,7 +109,7 @@ func (f *fakeWho) WhoIs(_ context.Context, addr string) (*apitype.WhoIsResponse,
 	return f.resp, f.err
 }
 
-var quiet = slog.New(slog.NewJSONHandler(io.Discard, nil))
+var quiet = slog.New(slog.DiscardHandler)
 
 func TestMiddlewareStripsAuthorization(t *testing.T) {
 	who := &fakeWho{resp: &apitype.WhoIsResponse{

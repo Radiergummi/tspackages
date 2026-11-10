@@ -12,6 +12,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/authz"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 type Caller struct {
@@ -36,7 +37,7 @@ type Whoiser interface {
 }
 
 // FromWhoIs builds a Caller from a WhoIs response and the app capability.
-func FromWhoIs(r *apitype.WhoIsResponse, capName tailcfg.PeerCapability) (Caller, error) {
+func FromWhoIs(r *apitype.WhoIsResponse, capName peercap.Cap) (Caller, error) {
 	if r == nil || r.Node == nil {
 		return Caller{}, errors.New("whois response has no node")
 	}
@@ -76,7 +77,7 @@ func FromContext(ctx context.Context) (Caller, bool) {
 
 // Middleware strips client credentials, resolves the caller via WhoIs and
 // stores it in the request context. Any failure is a 403.
-func Middleware(w Whoiser, capName tailcfg.PeerCapability, log *slog.Logger) func(http.Handler) http.Handler {
+func Middleware(w Whoiser, capName peercap.Cap, log *slog.Logger) func(http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}

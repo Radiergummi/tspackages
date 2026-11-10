@@ -224,9 +224,7 @@ func TestCacheConcurrent(t *testing.T) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	for i := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for j := range 40 {
 				n := (i + j) % 10
 				k := fmt.Sprintf("k%d", n)
@@ -236,7 +234,7 @@ func TestCacheConcurrent(t *testing.T) {
 					rc.Close()
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -402,7 +402,7 @@ func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, di
 	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, shasum)
 	if errors.Is(err, resolve.ErrNotFound) {
 		// Listed in metadata but gone upstream: a source fault, not a miss.
-		return nil, fmt.Errorf("upstream dist missing for listed version: %v", err)
+		return nil, fmt.Errorf("upstream dist missing for listed version: %v", err) //nolint:errorlint // a listed version's missing dist is a fault, not a miss
 	}
 	if err != nil {
 		return nil, err

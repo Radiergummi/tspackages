@@ -170,7 +170,7 @@ func (s *StorageSource) repair(ctx context.Context, caller identity.Caller, pkg,
 	if err != nil {
 		// The version exists, it is just unreadable: a conflict for the client,
 		// with the reason for the server log.
-		return Version{}, fmt.Errorf("%w: stored archive unreadable: %v", ErrVersionExists, err)
+		return Version{}, fmt.Errorf("%w: stored archive unreadable: %w", ErrVersionExists, err)
 	}
 	added, err := s.addToIndex(ctx, pkg, stored)
 	if err != nil {
@@ -537,7 +537,7 @@ func highestFirst(a, b Version) int { return compareNormalized(normalizedOf(b), 
 func (s *StorageSource) Dist(ctx context.Context, name, version, reference string) (Artifact, error) {
 	normalized, err := NormalizeVersion(version)
 	if err != nil {
-		return Artifact{}, fmt.Errorf("%w: %v", resolve.ErrNotFound, err)
+		return Artifact{}, fmt.Errorf("%w: %w", resolve.ErrNotFound, err)
 	}
 	pkg, err := lookupName(name)
 	if err != nil {
