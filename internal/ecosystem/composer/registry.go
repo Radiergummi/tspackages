@@ -202,16 +202,22 @@ func (s *RegistrySource) refreshMetadata(ctx context.Context, key, pkg string, d
 }
 
 // flight runs fn once for all concurrent callers with the same key, with the
-// context of the caller that started it. A caller whose result was cut short
-// by another caller's cancellation tries again.
+// context of the caller that started it. Every caller stops waiting when its
+// own context ends; one whose result was cut short by another caller's
+// cancellation tries again.
 func flight[T any](ctx context.Context, g *singleflight.Group, key string, fn func() (T, error)) (T, error) {
 	for {
-		v, err, shared := g.Do(key, func() (any, error) { return fn() })
-		if shared && errors.Is(err, context.Canceled) && ctx.Err() == nil {
-			continue
+		select {
+		case <-ctx.Done():
+			var zero T
+			return zero, ctx.Err()
+		case r := <-g.DoChan(key, func() (any, error) { return fn() }):
+			if r.Shared && errors.Is(r.Err, context.Canceled) && ctx.Err() == nil {
+				continue
+			}
+			t, _ := r.Val.(T)
+			return t, r.Err
 		}
-		t, _ := v.(T)
-		return t, err
 	}
 }
 

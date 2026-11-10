@@ -127,7 +127,8 @@ func TestRegistryCancelledFetchNotRecorded(t *testing.T) {
 	e.src.wait = func(context.Context) error { reached = true; return nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := e.src.Versions(ctx, "acme/pkg", false); err == nil {
+	// Directly, since flight returns on a cancelled ctx without waiting for fn.
+	if _, err := e.src.refreshMetadata(ctx, e.src.metaKey("acme/pkg", false), "acme/pkg", false, false); err == nil {
 		t.Fatal("expected error")
 	}
 	if !reached {
