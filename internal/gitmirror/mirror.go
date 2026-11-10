@@ -531,7 +531,7 @@ func (m *Mirror) env() []string {
 		if m.opts.SSHKeyPath != "" {
 			cmd += " -i " + m.opts.SSHKeyPath
 		}
-		cmd += " -o IdentitiesOnly=yes -o UserKnownHostsFile=" + m.opts.KnownHostsPath +
+		cmd += " -o IdentitiesOnly=yes -o UserKnownHostsFile=" + m.opts.KnownHostsPath + " -o GlobalKnownHostsFile=/dev/null" +
 			" -o StrictHostKeyChecking=yes -o BatchMode=yes" +
 			" -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 		env = append(env, "GIT_SSH_COMMAND="+cmd)

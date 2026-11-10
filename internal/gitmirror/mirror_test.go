@@ -308,7 +308,7 @@ func TestSSHCommandEnv(t *testing.T) {
 	}
 	_ = m.Sync(context.Background())
 	b, _ := os.ReadFile(rec)
-	want := "GIT_SSH_COMMAND=ssh -F /dev/null -i /k/id -o IdentitiesOnly=yes -o UserKnownHostsFile=/k/kh -o StrictHostKeyChecking=yes -o BatchMode=yes"
+	want := "GIT_SSH_COMMAND=ssh -F /dev/null -i /k/id -o IdentitiesOnly=yes -o UserKnownHostsFile=/k/kh -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes"
 	if !strings.Contains(string(b), want) {
 		t.Errorf("env:\n%s", b)
 	}
