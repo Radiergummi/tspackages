@@ -2,18 +2,32 @@ name: CI
 
 on:
   push:
+    branches: [main]
+  # Every pull request, not only those based on main, so a stacked branch is
+  # tested before it reaches the front of the queue.
   pull_request:
+  # release.yml reruns CI on the tagged commit before it builds anything.
+  workflow_call:
 
 permissions:
   contents: read
 
+# A superseded pull request run has nothing left to report. Runs on main are
+# never cancelled, so every commit there gets a result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       TSP_TEST_S3_ENDPOINT: http://localhost:9000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -25,7 +39,7 @@ jobs:
           MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
             nohup "$(go env GOPATH)/bin/minio" server "$RUNNER_TEMP/minio-data" \
             --address :9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
-          for i in $(seq 60); do
+          for _ in $(seq 60); do
             curl -fs http://localhost:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -34,11 +48,15 @@ jobs:
           exit 1
       - run: go vet ./...
       - run: go test -race ./...
+      - run: make tailnet
 
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -48,8 +66,83 @@ jobs:
           tools: composer
       - run: go test -tags integration ./integration/...
 
-  docker:
+  lint-go:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: docker build .
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Pinned: a new release can ship stricter rules. Bump deliberately.
+          version: v2.14.0
+      # `golangci-lint run` ignores the formatters section; only `fmt` checks it.
+      - run: make fmt-check
+      - run: make vuln
+
+  lint-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The published build, pinned by digest.
+      - env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v$VERSION/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "$SHA256  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm actionlint actionlint.tar.gz
+      - run: actionlint -color
+      - run: pipx install zizmor==1.30.1
+      # Online, so an action that turns known-bad fails a run.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --config .github/zizmor.yml .github/workflows/
+
+  lint-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The published build, pinned by digest.
+      - env:
+          VERSION: 3.22.0
+          SHA256: 52f5cd0314a1b7384cac6aa102a68193977312f6ba9c9f3ae001b5deec8e3a10
+        run: |
+          curl -fsSL -o vale.tar.gz \
+            "https://github.com/vale-cli/vale/releases/download/v$VERSION/vale_${VERSION}_Linux_64-bit.tar.gz"
+          echo "$SHA256  vale.tar.gz" | sha256sum -c -
+          tar -xzf vale.tar.gz vale
+          sudo install -m 0755 vale /usr/local/bin/vale
+          rm vale vale.tar.gz
+      - run: make lint-docs VALE_FLAGS=--output=.vale/github.tmpl
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

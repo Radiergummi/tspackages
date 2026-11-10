@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing is built or published until the tagged commit passes CI.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # The release starts as a draft, so a failed job never leaves a published
+  # release with missing assets. One job creates it, so the matrix doesn't race.
+  create-release:
+    needs: [ci]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # A pre-release tag (v1.0.0-rc.1) is marked as one.
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes --prerelease="${PRERELEASE}"
+
+  # tspackages needs the git and ssh binaries and runs on Linux, so only Linux
+  # binaries are published.
+  binaries:
+    needs: [create-release]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NAME: tspackages_linux_${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # an attested build takes nothing from a cache
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA}" -o "dist/$NAME" ./cmd/tspackages
+      - name: Write the SBOM
+        run: |
+          go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0 bin \
+            -json -version "${GITHUB_REF_NAME}" -output "dist/$NAME.cdx.json" "dist/$NAME"
+      - id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ env.NAME }}
+      - id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.NAME }}
+          sbom-path: dist/${{ env.NAME }}.cdx.json
+      # The bundles go along, so the binaries verify without GitHub's
+      # attestation API (gh attestation verify --bundle).
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM: ${{ steps.sbom.outputs.bundle-path }}
+        working-directory: dist
+        run: |
+          sha256sum "$NAME" > "$NAME.sha256"
+          cp "$PROVENANCE" "$NAME.provenance.sigstore.json"
+          cp "$SBOM" "$NAME.sbom.sigstore.json"
+          gh release upload "${GITHUB_REF_NAME}" ./*
+
+  # The image is attested, so it builds without a cache: a tag run resolves
+  # caches against the default branch, which would make a cache an input to
+  # an image the tag never built.
+  docker:
+    needs: [ci]
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/radiergummi/tspackages
+          labels: |
+            org.opencontainers.image.description=A package registry that exists only on your tailnet
+            org.opencontainers.image.licenses=Apache-2.0
+          annotations: |
+            org.opencontainers.image.description=A package registry that exists only on your tailnet
+            org.opencontainers.image.licenses=Apache-2.0
+          # Only the exact version: publish-release moves the floating tags
+          # once everything else succeeded.
+          tags: |
+            type=semver,pattern={{version}}
+          flavor: latest=false
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/radiergummi/tspackages
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # Publishing makes the release immutable, so it waits for every asset.
+  publish-release:
+    needs: [binaries, docker]
+    permissions:
+      contents: write
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The floating tags point at the attested image by digest; nothing is
+      # rebuilt. A pre-release moves none of them.
+      - name: Move the image's major, minor and latest tags
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          minor="${v%.*}"
+          major="${v%%.*}"
+          image=ghcr.io/radiergummi/tspackages
+          docker buildx imagetools create -t "$image:$minor" -t "$image:$major" -t "$image:latest" "$image:$v"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
