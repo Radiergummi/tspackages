@@ -298,3 +298,20 @@ func TestEscapeSegment(t *testing.T) {
 		}
 	}
 }
+
+func FuzzEscapeSegment(f *testing.F) {
+	for _, s := range []string{"", "A", "release/2026-01", "v1.0/üß?"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		e := EscapeSegment(s)
+		if back, err := UnescapeSegment(e); err != nil || back != s {
+			t.Fatalf("%q -> %q -> %q, %v", s, e, back, err)
+		}
+		if len(e) <= MaxSegment && s != "" {
+			if err := ValidKey(e); err != nil {
+				t.Fatalf("EscapeSegment(%q) = %q: %v", s, e, err)
+			}
+		}
+	})
+}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io/fs"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,7 +19,7 @@ type entry struct {
 	mode fs.FileMode
 }
 
-func makeZip(t *testing.T, entries ...entry) []byte {
+func makeZip(t testing.TB, entries ...entry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -149,6 +150,27 @@ func TestFindFile(t *testing.T) {
 		_, err := FindFile(open(entry{name: "a/b/composer.json", body: "{}"}), "composer.json")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+// Whatever InspectZip accepts has only safe entry names and stays within
+// the limits when read.
+func FuzzInspectZip(f *testing.F) {
+	f.Add(makeZip(f, entry{name: "composer.json", body: "{}"}))
+	f.Add(makeZip(f, entry{name: "pkg/composer.json", body: "{}"}, entry{name: "pkg/a", body: "x"}))
+	f.Add([]byte("PK\x03\x04"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		zr, err := InspectZip(data, Limits{MaxBytes: 1 << 20, MaxDecompressed: 1 << 20, MaxEntries: 100})
+		if err != nil {
+			return
+		}
+		for _, file := range zr.File {
+			n := file.Name
+			if strings.HasPrefix(n, "/") || strings.Contains(n, "\\") || strings.Contains(n, "\x00") ||
+				slices.Contains(strings.Split(n, "/"), "..") {
+				t.Fatalf("accepted unsafe entry %q", n)
+			}
 		}
 	})
 }

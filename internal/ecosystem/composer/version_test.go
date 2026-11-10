@@ -10,6 +10,8 @@ var normalizeSuccess = []struct{ name, in, want string }{
 	{"none", "1.0.0", "1.0.0.0"},
 	{"none/2", "1.2.3.4", "1.2.3.4"},
 	{"parses state", "1.0.0RC1dev", "1.0.0.0-RC1-dev"},
+	{"zero stability number", "1.0.0-RC0", "1.0.0.0-RC0"},
+	{"zero stability number after dot", "1.0.0-RC.0", "1.0.0.0-RC0"},
 	{"CI parsing", "1.0.0-rC15-dev", "1.0.0.0-RC15-dev"},
 	{"delimiters", "1.0.0.RC.15-dev", "1.0.0.0-RC15-dev"},
 	{"RC uppercase", "1.0.0-rc1", "1.0.0.0-RC1"},
