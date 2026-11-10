@@ -194,7 +194,8 @@ func normPrefix(p string) string {
 func validateSources(eco string, sources []Source, stores map[string]StoreConfig, opts ValidateOptions) []error {
 	var errs []error
 	seen := map[string]bool{}
-	claimedBy := map[string]string{} // claim -> first source with it
+	type claim struct{ pattern, source string }
+	var earlier []claim // claims of the sources before s
 	unclaimed := 0
 	for _, s := range sources {
 		add := func(format string, a ...any) {
@@ -211,11 +212,23 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		for _, c := range s.Claims {
 			if !validClaim(c) {
 				add(`invalid claim %q (use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-])`, c)
+				continue
 			}
-			if first, ok := claimedBy[c]; ok && s.Type == "storage" && first != s.Name {
-				add("claim %q is already claimed by source %q; uploads would never be served", c, first)
-			} else if !ok {
-				claimedBy[c] = s.Name
+			// Uploads go to the first claiming source, so a name that an
+			// earlier source also claims could never be uploaded here.
+			if s.Type != "storage" {
+				continue
+			}
+			for _, e := range earlier {
+				if claimsOverlap(c, e.pattern) {
+					add("claim %q overlaps claim %q of earlier source %q; uploads matching both would never be served (list the storage source first)", c, e.pattern, e.source)
+					break
+				}
+			}
+		}
+		for _, c := range s.Claims {
+			if validClaim(c) {
+				earlier = append(earlier, claim{c, s.Name})
 			}
 		}
 
@@ -307,6 +320,44 @@ var claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
 // validClaim accepts "*" or exactly two lowercase segments, so a claim can
 // never be a pattern that matches no Composer name or uses path.Match classes.
 func validClaim(c string) bool { return c == "*" || claimRe.MatchString(c) }
+
+// claimsOverlap reports whether some package name matches both valid claims.
+// "*" matches every name; otherwise each claim is two segments in which only
+// "*" is special (it matches any run of characters within the segment).
+func claimsOverlap(a, b string) bool {
+	if a == "*" || b == "*" {
+		return true
+	}
+	av, an, _ := strings.Cut(a, "/")
+	bv, bn, _ := strings.Cut(b, "/")
+	return globsOverlap(av, bv) && globsOverlap(an, bn)
+}
+
+// globsOverlap reports whether some string matches both patterns, in which
+// "*" matches any run of characters and every other byte is literal.
+func globsOverlap(p, q string) bool {
+	seen := map[[2]int]bool{} // states already explored, all of them dead ends
+	var walk func(i, j int) bool
+	walk = func(i, j int) bool {
+		if seen[[2]int{i, j}] {
+			return false
+		}
+		seen[[2]int{i, j}] = true
+		switch {
+		case i == len(p) && j == len(q):
+			return true
+		case i < len(p) && p[i] == '*':
+			// The star matches nothing, or also covers q's next byte or star.
+			return walk(i+1, j) || (j < len(q) && walk(i, j+1))
+		case j < len(q) && q[j] == '*':
+			return walk(i, j+1) || (i < len(p) && walk(i+1, j))
+		case i < len(p) && j < len(q) && p[i] == q[j]:
+			return walk(i+1, j+1)
+		}
+		return false
+	}
+	return walk(0, 0)
+}
 
 // credHost normalises a credential host for comparison: lowercase, with the
 // https default port dropped.

@@ -388,16 +388,58 @@ func TestStorageClaimShadowedByEarlierSource(t *testing.T) {
 	_, err := Load(writeConfig(t, ecoc(`      - {name: g, type: git, claims: ["acme/*"], remotes: ["https://h/a.git"]}
       - {name: hosted, type: storage, store: main, claims: ["other/*", "acme/*"]}
 `)))
-	if err == nil || !strings.Contains(err.Error(), `source "hosted": claim "acme/*" is already claimed by source "g"`) {
+	if err == nil || !strings.Contains(err.Error(), `source "hosted": claim "acme/*" overlaps claim "acme/*" of earlier source "g"`) {
 		t.Fatalf("err = %v", err)
 	}
-	// A later source with the same claim is fine for the storage source; only
-	// exact strings count.
+	// Overlap is by pattern, not by string: every one of these leaves some
+	// name the storage source claims to an earlier source.
+	for _, c := range []struct{ earlier, storage string }{
+		{"acme/*", "acme/x"},
+		{"*", "acme/x"},
+		{"*/x", "acme/*"},
+		{"acme/x*", "acme/*y"},
+		{"a*b/c", "*ab/c"},
+	} {
+		_, err := Load(writeConfig(t, ecoc(`      - {name: g, type: git, claims: ["`+c.earlier+`"], remotes: ["https://h/a.git"]}
+      - {name: hosted, type: storage, store: main, claims: ["`+c.storage+`"]}
+`)))
+		if err == nil || !strings.Contains(err.Error(), "overlaps claim") {
+			t.Errorf("%s then %s: err = %v", c.earlier, c.storage, err)
+		}
+	}
+	// Later sources may overlap a storage source, and disjoint patterns pass.
 	if _, err := Load(writeConfig(t, ecoc(`      - {name: hosted, type: storage, store: main, claims: ["acme/*"]}
-      - {name: g, type: git, claims: ["acme/*", "acme/x*"], remotes: ["https://h/a.git"]}
-      - {name: h2, type: storage, store: main, claims: ["acme/x"]}
+      - {name: g, type: git, claims: ["acme/*", "acme/x*", "acmex/*"], remotes: ["https://h/a.git"]}
+      - {name: h2, type: storage, store: main, claims: ["acme-*/x", "other/a*b"]}
+      - {name: h3, type: storage, store: main, claims: ["other/a*c"]}
 `))); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClaimsOverlap(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"*", "a/b", true},
+		{"a/b", "a/b", true},
+		{"a/*", "*/b", true},
+		{"a*/b", "*a/b", true},
+		{"ab*", "*ba", true}, // "aba"
+		{"a*c/x", "ab*/x", true},
+		{"a/b", "a/c", false},
+		{"a*b/x", "a*c/x", false},
+		{"ab*/x", "ac*/x", false},
+		{"a/*", "b/*", false},
+		{"*x/y", "*z/y", false},
+	} {
+		if got := claimsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("claimsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+		if got := claimsOverlap(c.b, c.a); got != c.want {
+			t.Errorf("claimsOverlap(%q, %q) = %v, want %v", c.b, c.a, got, c.want)
+		}
 	}
 }
 
