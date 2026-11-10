@@ -504,6 +504,37 @@ func TestSourceKeyRemoved(t *testing.T) {
 	}
 }
 
+// Composer follows dist mirrors (preferred ones first) and posts install
+// notices to notification-url, so upstream values for either would send
+// clients past tspackages.
+func TestUpstreamRedirectingKeysRemoved(t *testing.T) {
+	g, r := gitAndReg()
+	v := ver("monolog/monolog", "3.0.0", false)
+	v.Package = map[string]any{
+		"name": "monolog/monolog", "version": "3.0.0", "extra": map[string]any{"k": "kept"},
+		"notification-url":  "https://notify.example/downloads/",
+		"transport-options": map[string]any{"ssl": map[string]any{"verify_peer": false}},
+		"dist": map[string]any{
+			"type": "zip", "url": "https://codeload.example/z", "reference": "abc", "shasum": "",
+			"mirrors":           []any{map[string]any{"url": "https://mirror.example/%package%", "preferred": true}},
+			"transport-options": map[string]any{"http": map[string]any{"header": []any{"X: y"}}},
+		},
+	}
+	r.pkgs["monolog/monolog"] = []Version{v}
+	w := do(server(t, []Source{g, r}, readAll), "GET", "/composer/p2/monolog/monolog.json", nil)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	for _, leak := range []string{"example/", "mirrors", "transport-options", "notification-url"} {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Errorf("response contains %q: %s", leak, w.Body)
+		}
+	}
+	if !strings.Contains(w.Body.String(), `"kept"`) || !strings.Contains(w.Body.String(), `"reference":"abc"`) {
+		t.Errorf("other fields dropped: %s", w.Body)
+	}
+}
+
 func TestClientAuthorizationStripped(t *testing.T) {
 	store, _ := newSource(t)
 	mux := http.NewServeMux()

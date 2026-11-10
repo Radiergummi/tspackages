@@ -347,19 +347,32 @@ func (c *Composer) fail(w http.ResponseWriter, r *http.Request, err error) {
 	http.Error(w, http.StatusText(status), status)
 }
 
+// servedDistKeys is what a served dist keeps. Composer would also follow mirrors
+// and transport-options, which could send clients to upstream hosts.
+var servedDistKeys = []string{"type", "url", "reference", "shasum"}
+
 // withDistURL returns a deep copy of v.Package whose dist.url points back at
-// this server.
+// this server, without the keys that make Composer contact other hosts.
 func (c *Composer) withDistURL(r *http.Request, source, name string, v Version) map[string]any {
 	pkg, _ := deepCopy(v.Package).(map[string]any)
 	if pkg == nil {
 		pkg = map[string]any{}
 	}
 	delete(pkg, "source") // never reveal upstream VCS locations
-	dist, _ := pkg["dist"].(map[string]any)
-	if dist == nil || v.Reference == "" {
+	delete(pkg, "notification-url")
+	delete(pkg, "transport-options")
+	upstreamDist, _ := pkg["dist"].(map[string]any)
+	if upstreamDist == nil || v.Reference == "" {
 		delete(pkg, "dist") // no artifact we can address; do not invent a URL or leak upstream's
 		return pkg
 	}
+	dist := make(map[string]any, len(servedDistKeys))
+	for _, k := range servedDistKeys {
+		if val, ok := upstreamDist[k]; ok {
+			dist[k] = val
+		}
+	}
+	pkg["dist"] = dist
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"

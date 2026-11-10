@@ -35,6 +35,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Served Composer metadata drops upstream `dist.mirrors`,
+  `transport-options` and `notification-url`. Before, a registry source passed
+  them through, so Composer could download from a mirror the upstream named
+  and send install notices to the upstream directly.
 - `github.com/klauspost/compress` is v1.20.2, which fixes a reachable panic on
   two-block frames (GO-2026-6865).
 

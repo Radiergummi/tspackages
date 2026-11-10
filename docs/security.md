@@ -92,7 +92,9 @@ tailnet. Read this before you deploy.
   they are cached; a mismatch is a `502`.
 - Composer `source` blocks are stripped from served metadata, so
   `--prefer-source` can't reach upstream VCS locations. Only dist archives are
-  served.
+  served. Dist `mirrors`, `transport-options` and `notification-url` are
+  stripped too, so clients download and report installs only through
+  tspackages.
 - Uploads are inspected in memory: names in the URL and the zip's
   `composer.json` must agree, entries with `..`, absolute paths or symlinks are
   rejected, and size, decompressed size and entry count are capped. Hosted
