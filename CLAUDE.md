@@ -12,10 +12,9 @@ native protocol, assembles each endpoint from ordered sources (`git`,
 identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
-Status (2026-11-09): milestone 1 (core + Composer) is done and on `main`.
-Next: milestone 2, PyPI (`storage` + `registry` sources; CI uploads with
-`twine`/`uv publish`). Later: Go (git + registry + sumdb proxy), npm, OCI,
-Maven.
+Roadmap: Composer ships first. Then PyPI (`storage` + `registry` sources; CI
+uploads with `twine`/`uv publish`), then Go (git + registry + sumdb proxy),
+npm, OCI and Maven.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -24,10 +23,12 @@ checkout. If they are missing, this file and the code are the source of truth.
 ## Commands
 
 ```sh
-go vet ./... && go test -race ./...
-go test -tags integration ./integration/...   # needs composer 2.x and git
-go build ./cmd/tspackages
-gofmt -l .                                     # must print nothing
+make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
+make integration   # real-Composer end-to-end test; needs composer 2.x and git
+make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs and grants end to end
+make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
+make build         # ./tspackages with version and commit stamped in
+go test ./internal/<pkg> -run '^$' -fuzz '^FuzzX$' -fuzztime 30s   # fuzz targets
 ```
 
 S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
@@ -49,7 +50,7 @@ tailscale.com).
 - `internal/resolve` — `Candidates`/`First`/`HTTPStatus`: the
   dependency-confusion core.
 - `internal/storage` — fs + S3 drivers, LRU cache, key rules
-  (lowercase only, `EscapeSegment`).
+  (lowercase only, segments of at most `MaxSegment` bytes, `EscapeSegment`).
 - `internal/upstream` — the only HTTP client for upstreams: host allowlist,
   dial-time private-address block, credentials per exact host, no redirects
   with credentials, digest verification.
@@ -70,12 +71,15 @@ tailscale.com).
 - Resolution: a name claimed by a source is consulted only on claiming
   sources, in order; only a definite `resolve.ErrNotFound` moves to the next
   one; any other error is a 502/504. At most one unclaimed source per
-  ecosystem; `storage` sources must have claims. Never merge versions across
-  sources. `ErrUnavailable` (conflicts, not yet indexed) must never wrap
-  `ErrNotFound`.
+  ecosystem; `storage` sources must have claims, none overlapping a claim of
+  an earlier source (uploads go to the first claiming source). Never merge
+  versions across sources. `ErrUnavailable` (conflicts, not yet indexed) must
+  never wrap `ErrNotFound`.
 - Claims are `*` or lowercase `<vendor>/<name>` patterns using `[a-z0-9_.-]`
   and `*`. Anything else is a config error, because a malformed claim would
-  silently route private names to the public source.
+  silently route private names to the public source. Composer capability
+  rules use the same grammar (case-insensitive); a malformed one matches
+  nothing.
 - URLs returned to clients point at tspackages and are opaque routes, never
   encoded upstream URLs.
 - Upstream artifact bytes are verified against the declared hash before
@@ -98,20 +102,9 @@ tailscale.com).
 - Test first for behaviour changes; tests judge protocol conformance with real
   clients where possible.
 - Comments state current behaviour, not history.
-- CI: `.github/workflows/ci.yml`; actions pinned by full SHA.
-
-## Known open items
-
-- CI is green (tests with MinIO, real-Composer integration, Docker build).
-  MinIO images can't be pulled anonymously any more, so CI builds a pinned
-  MinIO commit from source; bump that pin deliberately.
-- `main` releases the work_dir lock without waiting for background git loops
-  to stop.
-- The config check for overlapping claims is exact-string only (a git source
-  `acme/*` plus a storage source `acme/x` validates, but uploads to `acme/x`
-  then get 409).
-- Rule patterns in tailnet grants are not grammar-checked.
-- `noteFetch` in the registry source compares error strings, so errors with
-  changing text log on every failure.
-- Open decision for the owner: whether `replace`/`provide` in hosted packages
-  should be restricted to the uploader's own claims.
+- User-visible changes get a line under `Unreleased` in CHANGELOG.md.
+- Lint suppressions (`//nolint`, gosec excludes in `.golangci.yml`) carry a
+  reason.
+- CI: `.github/workflows/ci.yml`; `release.yml` runs on `v*` tags. Actions are
+  pinned by full SHA; tool versions (golangci-lint, actionlint, zizmor, Vale,
+  govulncheck) are pinned too and bumped deliberately.

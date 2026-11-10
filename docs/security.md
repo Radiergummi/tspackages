@@ -13,13 +13,13 @@ tailnet. Read this before you deploy.
 - **Subnet routers and shared proxy nodes carry their own identity.** Traffic
   through them is attributed to the router or proxy, so never grant such nodes
   registry capabilities. Requests whose `WhoIs` fails are denied.
-- Being on the tailnet is not enough: no matching capability means `403`.
+- Being on the tailnet isn't enough: no matching capability means `403`.
 - Client `Authorization` headers are stripped and never forwarded.
 - `/`, `/readyz` and `/metrics` need at least one capability rule; only
   `/healthz` answers any tailnet identity. Metrics carry source names, never
   remote URLs, and the status page shows a git remote only to callers allowed
   to read the package that remote declares.
-- tspackages must see the original connection, so it cannot sit behind
+- tspackages must see the original connection, so it can't sit behind
   Tailscale Serve or a reverse proxy.
 
 ## Secrets and state
@@ -32,10 +32,10 @@ tailnet. Read this before you deploy.
   `TS_NO_LOGS_NO_SUPPORT=1` to disable that.
 - `storage.work_dir` holds git mirrors and SSH key material, mode 0700, and is
   cleared of key files and of mirrors no longer configured at every start.
-  Run **one instance per work_dir and per state dir**; there is no high
-  availability. A second instance on the same work_dir waits up to 60 seconds
+  Run **one instance per `work_dir` and per state dir**; there is no high
+  availability. A second instance on the same `work_dir` waits up to 60 seconds
   for its lock (`<work_dir>/.lock`) and then exits; two instances sharing only
-  a state dir are not detected and will fight over indexes.
+  a state dir aren't detected and fight over indexes.
 - Tailscale credentials (`TS_AUTHKEY`, `TS_AUTH_KEY`, `TS_CLIENT_SECRET`,
   `TS_ID_TOKEN`) and every variable the config references via `${env:}` are
   removed from the environment once read, so git and ssh never inherit them
@@ -55,13 +55,14 @@ tailnet. Read this before you deploy.
 
 ## Git sources
 
-- Remotes must be **canonical URLs**: redirects are not followed
+- Remotes must be **canonical URLs**: redirects aren't followed
   (`http.followRedirects=false`), so a moved repository must be updated in the
   config.
 - Remotes must not embed credentials; use `token` (HTTPS, passed through
   `GIT_CONFIG_*`, never argv) or `ssh_key`. SSH remotes require `known_hosts`
-  and use `StrictHostKeyChecking=yes`. Prompts, `file`, `ext` and other
-  transports are disabled.
+  and use `StrictHostKeyChecking=yes`; the system's known hosts file is
+  ignored, so only the configured host keys count. Prompts, `file`, `ext` and
+  other transports are disabled.
 - **Tag pinning is trust on first use.** The first time a tag is served, its
   commit is recorded in the state store and the tag resolves to that commit
   forever, even if it is force-pushed. A move is logged at warn and listed on
@@ -90,7 +91,7 @@ tailnet. Read this before you deploy.
 - Upstream artifacts are checked against the upstream-declared hash before
   they are cached; a mismatch is a `502`.
 - Composer `source` blocks are stripped from served metadata, so
-  `--prefer-source` cannot reach upstream VCS locations. Only dist archives are
+  `--prefer-source` can't reach upstream VCS locations. Only dist archives are
   served.
 - Uploads are inspected in memory: names in the URL and the zip's
   `composer.json` must agree, entries with `..`, absolute paths or symlinks are

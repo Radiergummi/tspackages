@@ -14,7 +14,7 @@ Milestone 1 ships Composer. PyPI, Go, npm, OCI and Maven follow. Read
 - Claimed names resolve only from the sources that claim them. A private name
   never falls through to a public source.
 - Single static binary (plus `git`), no database. Runs as one tsnet node, so it
-  cannot sit behind Tailscale Serve or another reverse proxy.
+  can't sit behind Tailscale Serve or another reverse proxy.
 
 ## Quick start
 
@@ -67,10 +67,12 @@ Milestone 1 ships Composer. PyPI, Go, npm, OCI and Maven follow. Read
    `/etc/tspackages/config.yaml`. With a bind mount instead of a named volume,
    the host directories for `work_dir` and `tailscale.state_dir` must be owned
    by uid 10001 with mode 0700 (`install -d -o 10001 -m 0700 <dir>`), or
-   startup refuses them. Or build the binary: `go build ./cmd/tspackages`
-   and run `tspackages -config config.yaml`.
+   startup refuses them. Or build the binary with `make build` and run
+   `tspackages -config config.yaml`. `-log-level` (`debug`, `info`, `warn`,
+   `error`) and `-log-format` (`json`, `text`) set the logging, and
+   `tspackages -version` prints the build.
 
-3. Grant access in your tailnet policy (see below).
+3. Grant access in your tailnet policy (see [Tailnet policy](#tailnet-policy)).
 
 The node serves HTTPS on `https://<hostname>.<tailnet>.ts.net`. `/` (a status
 page), `/readyz` and `/metrics` need at least one capability rule; `/healthz`
@@ -82,13 +84,15 @@ callers who may read the package it declares.
 Sources are listed per ecosystem, in order. A claim is `*` or a lowercase
 `<vendor>/<name>` pattern of `[a-z0-9_.-]` and `*` wildcards (no `?` or `[...]`),
 matched against the lowercase package name; anything else fails validation. At most one source
-may be unclaimed (the public catch-all); `storage` sources must have claims.
+may be unclaimed (the public catch-all); `storage` sources must have claims,
+and none of them may overlap a claim of an earlier source, since uploads go to
+the first claiming source.
 
 | Type | Keys | Does |
 |------|------|------|
 | `git` | `remotes`, `branches`, `ssh_key`, `known_hosts`, `token`, `poll_interval` | Tags become versions, allowlisted branches become `dev-*`. Dist zips are built with `git archive` and kept. Package names come from each repo's `composer.json`. |
 | `storage` | `store`, `claims` | Hosts uploaded dist zips on the named store. |
-| `registry` | `url` (https), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to an upstream (Packagist). Dist URLs are rewritten to this server. |
+| `registry` | `url` (`https://` only), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to an upstream (Packagist). Dist URLs are rewritten to this server. |
 
 `ssh_key`, `known_hosts`, `token` and credentials accept `${env:NAME}` or
 `${file:/path}`. Limits (`max_upload_bytes`, `max_decompressed_bytes`,
@@ -149,17 +153,26 @@ package only ([examples/policy.hujson](examples/policy.hujson)):
 ]
 ```
 
-A rule is `<ecosystem>:<pattern>` or `*`. `read` covers metadata and
+A rule is `<ecosystem>:<pattern>` or `*`. Composer patterns use the claim
+grammar, case-insensitively; a malformed rule grants nothing and is logged
+when it leaves a request denied. `read` covers metadata and
 downloads, `write` covers publishing. Capabilities from several grants are
 unioned. The capability name is configurable (`tailscale.capability`).
 
 ## Development
 
 ```sh
-go vet ./... && go test -race ./...
-go test -tags integration ./integration/...   # needs composer and git
+make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
+make integration   # end-to-end with real Composer (needs composer 2.x and git)
+make tailnet       # real tsnet nodes against an in-process control server
+make vuln          # govulncheck, failing on reachable findings
 ```
 
-S3 tests run when `TSP_TEST_S3_ENDPOINT` points at a MinIO.
+S3 tests run when `TSP_TEST_S3_ENDPOINT` points at a MinIO. See
+[CONTRIBUTING.md](CONTRIBUTING.md) before you send a change, and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
-Licensed under Apache-2.0.
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). tspackages isn't affiliated
+with or endorsed by Tailscale Inc.
