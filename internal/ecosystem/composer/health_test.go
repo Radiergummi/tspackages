@@ -139,21 +139,28 @@ func TestRegistryCancelledFetchNotRecorded(t *testing.T) {
 	}
 }
 
-func TestRegistryLogsErrorChanges(t *testing.T) {
+func TestRegistryLogsHealthTransitions(t *testing.T) {
 	var buf bytes.Buffer
 	e := newRegEnv(t)
 	e.src.log = slog.New(slog.NewTextHandler(&buf, nil))
-	unhealthy := func() int { return strings.Count(buf.String(), "composer upstream unhealthy") }
+	count := func(msg string) int { return strings.Count(buf.String(), msg) }
 	e.f.setStatus(500)
 	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
+	e.f.setStatus(503) // a different error while unhealthy is not a transition
 	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
-	if n := unhealthy(); n != 1 {
-		t.Fatalf("same error logged %d times", n)
+	if n := count("composer upstream unhealthy"); n != 1 {
+		t.Fatalf("unhealthy logged %d times, want 1", n)
 	}
-	e.f.setStatus(503)
+	e.f.setStatus(0)
+	e.f.set("/p2/acme/pkg.json", []byte(`{"packages":{"acme/pkg":[]}}`))
 	_, _ = e.src.Versions(context.Background(), "acme/pkg", false)
-	if n := unhealthy(); n != 2 {
-		t.Fatalf("changed error logged %d times in total, want 2", n)
+	if n := count("composer upstream recovered"); n != 1 {
+		t.Fatalf("recovered logged %d times, want 1", n)
+	}
+	e.f.setStatus(500) // acme/pkg is cached now; fetch another package
+	_, _ = e.src.Versions(context.Background(), "acme/other", false)
+	if n := count("composer upstream unhealthy"); n != 2 {
+		t.Fatalf("unhealthy logged %d times after relapse, want 2", n)
 	}
 }
 

@@ -457,14 +457,17 @@ func (s *RegistrySource) noteFetch(ctx context.Context, err error, haveCache boo
 	}
 	s.hmu.Lock()
 	defer s.hmu.Unlock()
-	if err == nil {
-		s.fetchErr, s.stale = nil, false
-		return
-	}
-	if s.fetchErr == nil || s.fetchErr.Error() != err.Error() { // log changes, not repeats
+	// Log transitions only: repeats while unhealthy go to debug, so errors
+	// whose text varies per request do not flood the log.
+	switch {
+	case err == nil && s.fetchErr != nil:
+		s.log.Info("composer upstream recovered", "source", s.name)
+	case err != nil && s.fetchErr == nil:
 		s.log.Warn("composer upstream unhealthy", "source", s.name, "stale", haveCache, "error", err)
+	case err != nil:
+		s.log.Debug("composer upstream still unhealthy", "source", s.name, "stale", haveCache, "error", err)
 	}
-	s.fetchErr, s.stale = err, haveCache
+	s.fetchErr, s.stale = err, err != nil && haveCache
 }
 
 // Health is OK unless the last upstream metadata fetch failed.
