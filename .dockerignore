@@ -1,3 +1,13 @@
 .git
+.github
 .superpowers
-docs/superpowers
+.vale
+docs
+examples
+integration
+*.md
+*.test
+*.out
+cover.html
+/tspackages
+/config.yaml
