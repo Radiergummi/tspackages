@@ -8,63 +8,27 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/testutil"
-	"tailscale.com/ipn/store/mem"
-	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
-	"tailscale.com/tstest/integration"
-	"tailscale.com/tstest/integration/testcontrol"
-	"tailscale.com/types/logger"
 )
-
-func startNode(ctx context.Context, t *testing.T, controlURL, hostname string) *tsnet.Server {
-	t.Helper()
-	s := &tsnet.Server{
-		Dir:        filepath.Join(t.TempDir(), hostname),
-		ControlURL: controlURL,
-		Hostname:   hostname,
-		Store:      new(mem.Store),
-		Ephemeral:  true,
-		Logf:       logger.Discard,
-	}
-	t.Cleanup(func() { s.Close() })
-	if _, err := s.Up(ctx); err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
 
 // TestOverRealTailnet runs tspackages and a client as real tsnet nodes
 // against an in-process control server, proving that WhoIs delivers the
 // grant's capability as the identity middleware expects it, and that the
 // rules it carries decide reads and writes.
 func TestOverRealTailnet(t *testing.T) {
-	netns.SetEnabled(false) // as tsnet's own tests do
-	t.Cleanup(func() { netns.SetEnabled(true) })
-	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
-	control := &testcontrol.Server{
-		DERPMap:        derpMap,
-		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
-		MagicDNSDomain: "tail-scale.ts.net",
-		Logf:           logger.Discard,
-	}
-	control.HTTPTestServer = httptest.NewUnstartedServer(control)
-	control.HTTPTestServer.Start()
-	t.Cleanup(control.HTTPTestServer.Close)
+	control := testutil.StartControl(t)
 	control.SetGlobalAppCaps(tailcfg.PeerCapMap{testCap: {`{"read":["*"],"write":["composer:acme/a*"]}`}})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
-	registry := startNode(ctx, t, control.HTTPTestServer.URL, "registry")
-	laptop := startNode(ctx, t, control.HTTPTestServer.URL, "laptop")
+	registry := testutil.StartNode(ctx, t, control, "registry")
+	laptop := testutil.StartNode(ctx, t, control, "laptop")
 
 	lc, err := registry.LocalClient()
 	if err != nil {

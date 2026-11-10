@@ -43,13 +43,15 @@ func main() {
 	metrics.SetBuildInfo(v, c)
 	log.Info("starting", "version", v, "commit", c, "go", runtime.Version())
 
-	if err := run(*configPath, log); err != nil {
+	if err := run(context.Background(), *configPath, log, newNode); err != nil {
 		log.Error("tspackages failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath string, log *slog.Logger) error {
+// run serves until parent is done or SIGINT/SIGTERM arrives. node builds the
+// tsnet server for cfg; tests point it at a test control server.
+func run(parent context.Context, configPath string, log *slog.Logger, node func(*config.Config, *slog.Logger) *tsnet.Server) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -59,7 +61,7 @@ func run(configPath string, log *slog.Logger) error {
 		return fmt.Errorf("tsnet state dir: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// One instance per work_dir: mirrors and key files are not shared.
@@ -69,14 +71,7 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	defer unlock()
 
-	// tsnet reads its credentials (tsnetEnv) from the environment itself.
-	srv := &tsnet.Server{
-		Hostname:      cfg.Tailscale.Hostname,
-		Dir:           cfg.Tailscale.StateDir,
-		AdvertiseTags: cfg.Tailscale.Tags,
-		Logf:          logf(log, slog.LevelDebug),
-		UserLogf:      logf(log, slog.LevelInfo),
-	}
+	srv := node(cfg, log)
 	defer srv.Close()
 	if _, err := srv.Up(ctx); err != nil {
 		return fmt.Errorf("join tailnet: %w", err)
@@ -127,6 +122,18 @@ func run(configPath string, log *slog.Logger) error {
 		hs.Close()
 	}
 	return nil
+}
+
+// newNode returns the tsnet server for cfg. tsnet reads its credentials
+// (tsnetEnv) from the environment itself.
+func newNode(cfg *config.Config, log *slog.Logger) *tsnet.Server {
+	return &tsnet.Server{
+		Hostname:      cfg.Tailscale.Hostname,
+		Dir:           cfg.Tailscale.StateDir,
+		AdvertiseTags: cfg.Tailscale.Tags,
+		Logf:          logf(log, slog.LevelDebug),
+		UserLogf:      logf(log, slog.LevelInfo),
+	}
 }
 
 // newLogger returns the process logger for a -log-level and -log-format.

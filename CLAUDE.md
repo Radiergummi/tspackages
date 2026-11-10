@@ -25,7 +25,7 @@ checkout. If they are missing, this file and the code are the source of truth.
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
 make integration   # real-Composer end-to-end test; needs composer 2.x and git
-make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs and grants end to end
+make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
 go test ./internal/<pkg> -run '^$' -fuzz '^FuzzX$' -fuzztime 30s   # fuzz targets

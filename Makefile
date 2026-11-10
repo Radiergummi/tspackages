@@ -31,9 +31,9 @@ test:
 integration:
 	go test -tags integration ./integration/...
 
-## Run tspackages and a client as real tsnet nodes against an in-process control server
+## Run tspackages and a client as real tsnet nodes against an in-process control server, including main's startup and shutdown
 tailnet:
-	go test -race -tags tailnet ./internal/server
+	go test -race -tags tailnet ./internal/server ./cmd/tspackages
 
 ## Write cover.out and cover.html
 cover:
