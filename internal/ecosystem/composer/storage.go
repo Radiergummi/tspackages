@@ -344,7 +344,10 @@ func (s *StorageSource) loadIndex(ctx context.Context, pkg string) ([]Version, s
 	dec := json.NewDecoder(rc)
 	dec.UseNumber()
 	if err := dec.Decode(&idx); err != nil {
-		return nil, info.ETag, fmt.Errorf("%w for %s: %v", errCorruptIndex, pkg, err)
+		return nil, info.ETag, fmt.Errorf("%w for %s: %w", errCorruptIndex, pkg, err)
+	}
+	if len(idx.Versions) == 0 { // never written: a package without versions has no index
+		return nil, info.ETag, fmt.Errorf("%w for %s: no versions", errCorruptIndex, pkg)
 	}
 	return idx.Versions, info.ETag, nil
 }

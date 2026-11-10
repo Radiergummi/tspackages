@@ -658,6 +658,29 @@ func TestRepairRecordsPublishAfterReaderRebuiltIndex(t *testing.T) {
 	}
 }
 
+func TestEmptyIndexIsRebuilt(t *testing.T) {
+	for _, body := range []string{"{}", "null", `{"versions":null}`, `{"versions":[]}`} {
+		s, d := newSource(t)
+		ctx := context.Background()
+		for _, v := range []string{"1.0.0", "1.1.0"} {
+			if _, err := s.Upload(ctx, caller, "matchory-internal/foo", v, pkgZip(t, fooJSON)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		d.Put(ctx, "composer/matchory-internal/foo/index.json", strings.NewReader(body))
+		if vs, err := s.Versions(ctx, "matchory-internal/foo", false); err != nil || len(vs) != 2 {
+			t.Fatalf("%s: Versions = %d, %v", body, len(vs), err)
+		}
+		d.Put(ctx, "composer/matchory-internal/foo/index.json", strings.NewReader(body))
+		if _, err := s.Upload(ctx, caller, "matchory-internal/foo", "1.2.0", pkgZip(t, fooJSON)); err != nil {
+			t.Fatal(err)
+		}
+		if vs, _ := s.Versions(ctx, "matchory-internal/foo", false); len(vs) != 3 {
+			t.Fatalf("%s: upload dropped versions: %d left", body, len(vs))
+		}
+	}
+}
+
 func TestRepairWithUnreadableStoredArchive(t *testing.T) {
 	s, d := newSource(t)
 	ctx := context.Background()
