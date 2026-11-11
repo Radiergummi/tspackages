@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/relay"
@@ -172,7 +173,7 @@ func (s *RegistrySource) metadata(ctx context.Context, pkg string, dev bool) (vs
 		metrics.ObserveCacheHit(ecoName, s.name)
 		return parseCached(cached, pkg, dev)
 	}
-	res, err := flight(ctx, &s.metaFlight, key, func() (fetchedMeta, error) {
+	res, err := flight.Do(ctx, &s.metaFlight, key, func() (fetchedMeta, error) {
 		return s.refreshMetadata(ctx, key, pkg, dev, have)
 	})
 	if err != nil {
@@ -213,26 +214,6 @@ func (s *RegistrySource) refreshMetadata(ctx context.Context, key, pkg string, d
 		s.log.Warn("caching composer metadata failed", "source", s.name, "package", pkg, "error", perr)
 	}
 	return fetchedMeta{vs: vs, found: found}, nil
-}
-
-// flight runs fn once for all concurrent callers with the same key, with the
-// context of the caller that started it. Every caller stops waiting when its
-// own context ends; one whose result was cut short by another caller's
-// cancellation tries again.
-func flight[T any](ctx context.Context, g *singleflight.Group, key string, fn func() (T, error)) (T, error) {
-	for {
-		select {
-		case <-ctx.Done():
-			var zero T
-			return zero, ctx.Err()
-		case r := <-g.DoChan(key, func() (any, error) { return fn() }):
-			if r.Shared && errors.Is(r.Err, context.Canceled) && ctx.Err() == nil {
-				continue
-			}
-			t, _ := r.Val.(T)
-			return t, r.Err
-		}
-	}
 }
 
 // parseCached parses cached metadata; the not-found marker is a definite miss.

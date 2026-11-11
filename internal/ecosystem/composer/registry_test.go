@@ -23,7 +23,6 @@ import (
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
-	"golang.org/x/sync/singleflight"
 )
 
 // fakeRegistry is a mutable fake Packagist.
@@ -623,34 +622,6 @@ func TestMetadataRejectsForeignVersionName(t *testing.T) {
 	e2.clock = e2.clock.Add(time.Hour)
 	if vs, err := e2.src.Versions(context.Background(), "acme/pkg", false); err != nil || len(vs) != 1 {
 		t.Fatalf("vs=%v err=%v", vs, err)
-	}
-}
-
-func TestFlightFollowerStopsWaitingOnItsOwnCancel(t *testing.T) {
-	var g singleflight.Group
-	release := make(chan struct{})
-	defer close(release)
-	started := make(chan struct{})
-	go flight(context.Background(), &g, "k", func() (int, error) {
-		close(started)
-		<-release
-		return 1, nil
-	})
-	<-started
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := flight(ctx, &g, "k", func() (int, error) { return 2, nil })
-		done <- err
-	}()
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("err = %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("follower kept waiting for the leader")
 	}
 }
 

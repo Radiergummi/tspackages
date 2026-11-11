@@ -215,8 +215,20 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// Allowed reports whether rawURL may be fetched: an allowed scheme, a host in
+// FetchHosts and no userinfo. Addresses are still checked when dialling.
+func (c *Client) Allowed(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && c.checkURL(u) == nil
+}
+
 // Get fetches rawURL. The caller must close the response body.
 func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error) {
+	return c.GetAccept(ctx, rawURL, "")
+}
+
+// GetAccept is Get with an Accept header ("" sends none).
+func (c *Client) GetAccept(ctx context.Context, rawURL, accept string) (*http.Response, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		// The parse error quotes the whole URL; keep only its cause.
@@ -231,6 +243,9 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
 	}
 	if cr, ok := c.creds[strings.ToLower(u.Host)]; ok {
 		switch {

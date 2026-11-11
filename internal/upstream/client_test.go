@@ -498,3 +498,34 @@ func TestOpenStatus(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestGetAcceptSendsHeader(t *testing.T) {
+	var got string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Get("Accept") }))
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	resp, err := c.GetAccept(context.Background(), s.URL, "application/vnd.pypi.simple.v1+json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got != "application/vnd.pypi.simple.v1+json" {
+		t.Fatalf("Accept = %q", got)
+	}
+}
+
+func TestAllowed(t *testing.T) {
+	c := New(Options{FetchHosts: []string{"files.example.org"}})
+	for u, want := range map[string]bool{
+		"https://files.example.org/a.whl": true,
+		"https://FILES.example.org/a.whl": true,
+		"https://evil.example.org/a.whl":  false,
+		"http://files.example.org/a.whl":  false,
+		"https://u:p@files.example.org/a": false,
+		"::not a url":                     false,
+	} {
+		if got := c.Allowed(u); got != want {
+			t.Errorf("Allowed(%q) = %v", u, got)
+		}
+	}
+}
