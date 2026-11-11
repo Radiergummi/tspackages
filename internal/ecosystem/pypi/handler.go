@@ -294,9 +294,10 @@ func (p *PyPI) serve(w http.ResponseWriter, r *http.Request, e *entry, art Artif
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	if rs, ok := art.Body.(io.ReadSeeker); ok {
-		// ServeContent writes through w; a failed copy surfaces as a short body,
-		// which the declared Content-Length lets the client detect.
+	// Ranges go through ServeContent. A whole file is copied to its end: a
+	// cache hit's digest check runs on the final Read, which ServeContent's
+	// size-bounded copy never makes, and a failure must break the transfer.
+	if rs, ok := art.Body.(io.ReadSeeker); ok && r.Header.Get("Range") != "" {
 		http.ServeContent(w, r, filename, time.Time{}, rs)
 		return
 	}

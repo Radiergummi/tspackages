@@ -371,3 +371,49 @@ func TestUploadStatuses(t *testing.T) {
 		t.Errorf("shadowed uploader: %d", w.Code)
 	}
 }
+
+// eofBody is a seekable body recording whether it was read to its end, where
+// a cache hit's digest check runs.
+type eofBody struct {
+	r       *bytes.Reader // named, so bytes.Reader's WriteTo isn't promoted
+	reached *atomic.Bool
+}
+
+func (b eofBody) Seek(off int64, whence int) (int64, error) { return b.r.Seek(off, whence) }
+
+func (b eofBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.reached.Store(true)
+	}
+	return n, err
+}
+
+func (eofBody) Close() error { return nil }
+
+type eofSource struct {
+	*fakeSource
+	reached *atomic.Bool
+}
+
+func (s eofSource) File(context.Context, string, string) (Artifact, error) {
+	return Artifact{Body: eofBody{bytes.NewReader([]byte("cached bytes")), s.reached}, Size: 12}, nil
+}
+
+// TestFileSeekableReadToEnd: a whole-file response reads a seekable body to
+// EOF, so a cache hit's digest check runs; a ranged one may not.
+func TestFileSeekableReadToEnd(t *testing.T) {
+	var reached atomic.Bool
+	b := eofSource{&fakeSource{name: "b", claims: []string{"acme-*"}, projects: map[string]Project{"acme-x": project("acme-x")}}, &reached}
+	srv := httptest.NewServer(server(t, []Source{b}, readAll))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/pypi/files/b/acme-x/acme_x-1.0.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "cached bytes" || !reached.Load() {
+		t.Fatalf("body %q, read to EOF: %v", body, reached.Load())
+	}
+}
