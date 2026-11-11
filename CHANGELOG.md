@@ -8,6 +8,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A PyPI endpoint at `/pypi/simple/` (PEP 503 HTML and PEP 691 JSON) with
+  legacy uploads at `/pypi/legacy/` for `twine` and `uv publish`. Sources:
+  `storage` for uploaded wheels and sdists, `registry` for `pypi.org`
+  pass-through, and `git`, which generates deterministic sdists from tagged
+  `pyproject.toml` packages and uv workspace members, with an optional
+  per-remote tag mapping. Releases are keyed by normalised name and PEP 440
+  version and never change bytes once published. The status page lists
+  PyPI client settings, git conflicts and skipped packages.
 - A registry archive whose bytes differ from the ones first fetched for the
   same version and reference is logged at warn and listed on the status page.
   Packagist declares no checksum for most GitHub archives, so this is the

@@ -52,6 +52,12 @@ jobs:
         with:
           php-version: "8.3"
           tools: composer
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      # Pinned: the PyPI tests judge protocol conformance by these clients.
+      # Bump deliberately.
+      - run: python -m pip install uv==0.12.21 twine==7.0.0
       - uses: ./.github/actions/minio
       - run: go test -tags integration ./integration/...
 

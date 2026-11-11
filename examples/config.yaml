@@ -1,4 +1,4 @@
-# Example tspackages configuration (Composer only). Secrets are referenced,
+# Example tspackages configuration. Secrets are referenced,
 # never inlined: ${env:NAME} or ${file:/path}.
 tailscale:
   hostname: registry
@@ -38,3 +38,30 @@ ecosystems:
         # Public-only tokens: upstream metadata decides which URLs get fetched.
         download_credentials:
           api.github.com: {bearer: "${env:GITHUB_TOKEN}"}   # anonymous limit is 60 req/h
+
+  pypi:
+    sources:
+      # Storage first: its claim overlaps "matchory-*" below, and uploads go
+      # to the first claiming source.
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["matchory-internal-*"]
+      - name: matchory-git
+        type: git
+        claims: ["matchory", "matchory-*"]   # "matchory-*" alone doesn't cover "matchory"
+        remotes:
+          - git@github.com:matchory/python-sdk.git
+          - git@github.com:matchory/mono.git
+        ssh_key: ${env:DEPLOY_KEY}
+        known_hosts: ${env:KNOWN_HOSTS}
+        # Optional, per remote: which members a tag releases. Without it,
+        # every tag releases every package found at that commit.
+        tags:
+          git@github.com:matchory/mono.git:
+            "core@*": [packages/core]
+            "v*": ["*"]
+      - name: pypi
+        type: registry
+        url: https://pypi.org/simple/
+        fetch_hosts: [pypi.org, files.pythonhosted.org]

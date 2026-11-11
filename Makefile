@@ -27,7 +27,7 @@ fmt-check:
 test:
 	go test ./...
 
-## Run the end-to-end test against real Composer (needs composer 2.x and git)
+## Run the end-to-end tests against real Composer, pip, uv and twine (needs composer 2.x, git, python3 with pip, uv and twine; the PyPI tests download pinned build backends once)
 integration:
 	go test -tags integration ./integration/...
 

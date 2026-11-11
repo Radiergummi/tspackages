@@ -6,7 +6,7 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Milestone 1 ships Composer. PyPI, Go, npm, OCI and Maven follow. Read
+Composer and PyPI ship today. Go, npm, OCI and Maven follow. Read
 [docs/security.md](docs/security.md) before you deploy.
 
 - Tailscale is the only authentication. There are no tokens, no basic auth and
@@ -105,7 +105,55 @@ cache's `max_size` for the largest artifacts you expect. Composer git-built
 archives are built in memory and capped at 512MiB (or `max_artifact_bytes`,
 if lower). `max_decompressed_bytes` applies to upload inspection.
 
+## PyPI sources
+
+PyPI has the same three source types and the same resolution rules. Names
+are normalised as PEP 503 says (lowercase; runs of `-`, `_` and `.` become
+`-`) before claims, authorization and storage, so `Acme_Utils` and
+`acme.utils` are one package. A claim is `*` or a pattern of `[a-z0-9-]` and
+`*` in normalised form. `acme-*` doesn't match the bare name `acme`; claim
+both with `["acme", "acme-*"]`. Versions are compared by PEP 440 equality:
+`1.0` and `1.0.0` are one version, so a release can't be published twice
+under two spellings.
+
+| Type | Keys | Does |
+|------|------|------|
+| `git` | `remotes`, `tags`, `ssh_key`, `known_hosts`, `token`, `poll_interval` | Each tag is a release point: every package found at the tagged commit is released at the version its `pyproject.toml` declares, as an sdist tspackages generates (no build runs on the server). |
+| `storage` | `store`, `claims` | Hosts wheels and sdists uploaded with `twine` or `uv publish`. |
+| `registry` | `url` (`https://`, ending in `/simple/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to a JSON simple API index (`pypi.org`). |
+
+For `pypi.org` use `url: https://pypi.org/simple/` and
+`fetch_hosts: [pypi.org, files.pythonhosted.org]`.
+
+The `git` source finds the root `pyproject.toml`'s package and each uv
+workspace member. A package needs a static `[project] name` and `version`;
+packages with a dynamic version (`setuptools_scm`, `hatch-vcs`), without a
+`[build-system]` table or with `[tool.uv] package = false` are skipped and
+listed on the status page. Branches aren't served. Optionally, `tags` maps
+tag patterns per remote to the member directories a matching tag releases
+(`"*"` for all); with a mapping, tags matching no pattern release nothing:
+
+```yaml
+tags:
+  "git@github.com:acme/mono.git":
+    "core@*": [packages/core]
+    "v*": ["*"]
+```
+
+A release is stored once and never regenerated. If a later tag offers the
+same name and version with other content, the first sdist keeps being served
+and the status page reports the conflict as "changed without a version
+bump" with the tags involved. Releases
+whose package directory holds Git LFS files or submodules, or whose `readme`
+or `license` file is missing or lies outside the package directory, are
+refused and reported. Files generated at build time but not committed aren't
+in the sdist, and setuptools includes non-Python package data only if
+`MANIFEST.in` or `package-data` lists it. Publish such packages through a
+`storage` source.
+
 ## Client setup
+
+### Composer
 
 In `composer.json`:
 
@@ -131,6 +179,43 @@ Republishing a version is rejected with `409`, and so is an upload of a name
 that an earlier source also claims (the earlier source would shadow it on
 reads).
 
+### Python clients
+
+Point every client at the one index; tspackages already passes public names
+through to `pypi.org`. Don't add tspackages with `--extra-index-url` or as an
+extra uv index next to PyPI: mixing indexes is the classic
+dependency-confusion setup.
+
+```ini
+# pip.conf
+[global]
+index-url = https://registry.<tailnet>.ts.net/pypi/simple/
+```
+
+```toml
+# pyproject.toml or uv.toml
+[[tool.uv.index]]   # in uv.toml: [[index]]
+name = "registry"
+url = "https://registry.<tailnet>.ts.net/pypi/simple/"
+default = true
+```
+
+Upload to a `storage` source with dummy credentials (tspackages ignores
+them; the tailnet identity decides):
+
+```sh
+twine upload --repository-url https://registry.<tailnet>.ts.net/pypi/legacy/ \
+  -u tailnet -p tailnet dist/*
+uv publish --publish-url https://registry.<tailnet>.ts.net/pypi/legacy/ \
+  --username tailnet --password tailnet
+```
+
+The name and version in the form, the filename and the metadata inside the
+file must agree. An existing filename is rejected with `400 File already
+exists`, even with identical bytes (`twine upload --skip-existing` copes), and
+so is a second sdist, or a second wheel with the same tags, for a version
+already published under another spelling.
+
 ## Tailnet policy
 
 Humans read; each publishing repo gets its own CI tag with write on its own
@@ -155,8 +240,9 @@ package only ([examples/policy.hujson](examples/policy.hujson)):
 ]
 ```
 
-A rule is `<ecosystem>:<pattern>` or `*`. Composer patterns use the claim
-grammar, case-insensitively; a malformed rule grants nothing and is logged
+A rule is `<ecosystem>:<pattern>` or `*`, for example
+`pypi:acme-*`. Patterns use the ecosystem's claim grammar,
+case-insensitively; a malformed rule grants nothing and is logged
 when it leaves a request denied. `read` covers metadata and
 downloads, `write` covers publishing. Capabilities from several grants are
 unioned. The capability name is configurable (`tailscale.capability`).
@@ -165,7 +251,7 @@ unioned. The capability name is configurable (`tailscale.capability`).
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
-make integration   # end-to-end with real Composer (needs composer 2.x and git)
+make integration   # end-to-end with real Composer, pip, uv and twine
 make tailnet       # real tsnet nodes against an in-process control server
 make vuln          # govulncheck, failing on reachable findings
 ```

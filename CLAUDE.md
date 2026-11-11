@@ -12,9 +12,9 @@ native protocol, assembles each endpoint from ordered sources (`git`,
 identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
-Roadmap: Composer ships first. Then PyPI (`storage` + `registry` sources; CI
-uploads with `twine`/`uv publish`), then Go (git + registry + sumdb proxy),
-npm, OCI and Maven.
+Roadmap: Composer and PyPI (`storage`, `registry` and `git` sdists; CI
+uploads with `twine`/`uv publish`) ship; then Go (git + registry + sumdb
+proxy), npm, OCI and Maven.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -24,7 +24,7 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real-Composer end-to-end tests; need composer 2.x and git (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine end-to-end; need composer 2.x, git, python3 with pip, uv, twine (S3 variant: TSP_TEST_S3_ENDPOINT)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
@@ -59,10 +59,18 @@ tailscale.com).
   `internal/digest`, `internal/archive` (safe zip inspection),
   `internal/workdir` (private dirs + instance lock), `internal/metrics`,
   `internal/web` (status page, /healthz, /readyz, /metrics).
+- `internal/relay` — one upstream fetch per artifact, streamed to every
+  waiting client from a temp file, cached only after its digest matched.
+- `internal/flight` — per-key single-flight shared by the ecosystems.
 - `internal/ecosystem/composer` — names, Composer version parsing (port of
   composer/semver), the three sources, the HTTP handler.
+- `internal/ecosystem/pypi` — PEP 503 names, PEP 440 versions, filenames,
+  the simple API (HTML + JSON), the three sources, pyproject discovery,
+  PKG-INFO and deterministic sdists, the HTTP handler. Must not import
+  `composer` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
-- `integration/` — real-Composer end-to-end test (`-tags integration`).
+- `integration/` — end-to-end tests with real Composer, pip, uv and twine
+  (`-tags integration`).
 
 ## Invariants — do not break
 
@@ -79,11 +87,13 @@ tailscale.com).
   and `*`. Anything else is a config error, because a malformed claim would
   silently route private names to the public source. Composer capability
   rules use the same grammar (case-insensitive); a malformed one matches
-  nothing.
+  nothing. PyPI claims and rules: `*` or `[a-z0-9-]` and `*`, matched against
+  the PEP 503 normalised name.
 - URLs returned to clients point at tspackages and are opaque routes, never
   encoded upstream URLs.
 - Upstream artifact bytes are verified against the declared hash before
-  caching. Whatever the declared hash, a dist whose sha256 differs from the
+  caching: the relay streams to clients while it hashes, commits to the
+  cache only on a match, and breaks the client transfer on a mismatch. Whatever the declared hash, a dist whose sha256 differs from the
   first provenance record for its version and reference is served but
   reported (warn log, status page). Metadata is passed through except: `dist.url` is rewritten,
   `dist` keeps only `type`, `url`, `reference` and `shasum`, and `source`,
@@ -95,7 +105,13 @@ tailscale.com).
   even if the tag disappears upstream or the mirror is lost.
 - Hosted artifacts are immutable; indexes are rebuildable from them and
   written with `If-Match`.
-- Uploads are content-bound: the name in `composer.json` must match the URL.
+- Uploads are content-bound: the name in `composer.json` must match the URL;
+  a PyPI upload's form, filename and inner metadata must agree.
+- PyPI keys are (PEP 503 normalised name, canonical PEP 440 version).
+  A release has at most one sdist and one wheel per tag set; a published
+  file never changes bytes. Git-generated sdists live in the state store,
+  are built once and never regenerated (a change without a version bump is
+  reported, not served).
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

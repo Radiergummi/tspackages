@@ -91,8 +91,10 @@ tailnet. Read this before you deploy.
 - Artifact URLs returned to clients point at tspackages and are opaque routes,
   never an encoded upstream URL. Upstream fetches go only to the source's
   `fetch_hosts` and never to private, loopback, link-local or CGNAT addresses.
-- Upstream artifacts are checked against the upstream-declared hash before
-  they are cached; a mismatch is a `502`. Packagist declares none for most
+- Upstream artifacts stream to clients while they download and are checked
+  against the upstream-declared hash before they are cached. On a mismatch
+  nothing is cached and the client's transfer is broken off, so it never
+  looks like a complete file. Packagist declares none for most
   GitHub archives, so the first SHA256 seen for a version and reference is
   kept in the provenance records. A later fetch with other bytes is still
   served, but logged at warn and listed on the status page.
@@ -105,3 +107,38 @@ tailnet. Read this before you deploy.
   `composer.json` must agree, entries with `..`, absolute paths or symlinks are
   rejected, and size, decompressed size and entry count are capped. Hosted
   artifacts are immutable.
+
+## PyPI
+
+- Names are normalised (PEP 503) before claim matching, authorization and
+  storage, so `Acme_Utils` can't slip past an `acme-*` claim. Claims and
+  `pypi:` rules accept only `[a-z0-9-]` and `*`; anything else is a config
+  error, or a rule that grants nothing. `acme-*` doesn't cover `acme`.
+- Configure clients with tspackages as their **only** index. An extra index
+  next to it (`--extra-index-url`, a second uv index) lets pip and uv pick a
+  public package that shadows a private name.
+- A published release never changes bytes: versions are compared by PEP 440
+  equality (`1.0` is `1.0.0`), an upload of an existing filename, a second
+  sdist or a second wheel with the same tags is rejected, and a git release
+  that changed without a version bump keeps its first sdist. This keeps
+  hash-pinned lock files (`uv.lock`, `pip --require-hashes`) valid.
+- Uploads are content-bound: the form's name and version, the filename and
+  the metadata inside the wheel or sdist must agree. Sdists get the same
+  path, symlink, size and entry-count checks as zips.
+- **Back up the state store.** It holds the sdists generated from git.
+  Regenerating them after a loss reproduces the same bytes only while the
+  generator's format is unchanged and the same tagged commit wins, so lock
+  files pinned to the old hashes may break.
+- The git source runs no repository code: it reads `pyproject.toml` and
+  builds the sdist itself. Git LFS files, submodules and `readme` or
+  `license` files outside the package directory make a release refused, not
+  served broken. When several tags offer a release that isn't stored yet,
+  the one whose commit is an ancestor of the others wins (commit times are
+  author-controlled and ignored); on divergent histories the release is
+  withheld until an operator removes the extra tags or maps them.
+- Uploaded PEP 740 attestations are stored and recorded in provenance but
+  not served: nothing verifies them yet, and unverified publisher claims
+  could mislead the tools that read them. Provenance from the `registry`
+  source is passed through.
+- Upstream file entries without a SHA256 are dropped from served pages, so
+  nothing upstream is served unverified.

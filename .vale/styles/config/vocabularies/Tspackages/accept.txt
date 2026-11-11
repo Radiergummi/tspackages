@@ -6,6 +6,7 @@
 (?i)loopback
 (?i)repo's
 (?i)repos?
+(?i)sdists?
 (?i)stderr
 (?i)stdout
 (?i)subnet
@@ -28,6 +29,7 @@ npm
 OAuth
 Packagist
 PyPI
+setuptools
 SHA-?(?:1|256)
 Tailscale(?:'s)?
 TLS
@@ -36,5 +38,6 @@ tsnet
 tspackages
 tspackages'
 uid
+uv
 WhoIs
 zizmor
