@@ -1,0 +1,230 @@
+package pypi
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"path"
+	"slices"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+	"github.com/radiergummi/tspackages/internal/resolve"
+)
+
+// Skip reasons, shown on the status page.
+const (
+	skipNoProject    = "no [project] table"
+	skipDynamic      = "version is dynamic; publish it through a storage source"
+	skipBadVersion   = "invalid version"
+	skipNotPackage   = "not a package (tool.uv.package = false or no [build-system])"
+	skipBadName      = "name missing or invalid"
+	skipOutsideFile  = "readme or license file is outside the package directory, so the sdist cannot build"
+	skipMissingFile  = "readme or license file does not exist"
+	skipBadPyproject = "pyproject.toml does not parse"
+)
+
+// Package is a Python project found in a repository at one commit, read from
+// its pyproject.toml without running anything.
+type Package struct {
+	Dir     string  // "" for the repository root
+	Name    string  // normalised
+	Version Version // valid when Skip is ""
+	Project map[string]any
+	Readme  string   // repository path of the readme file, "" if none
+	Exclude []string // workspace member directories, for a workspace root
+	Skip    string   // why the package cannot be served; "" = servable
+}
+
+// DiscoverPackages finds the packages of a repository: the root
+// pyproject.toml's project and, for a uv workspace, each member directory
+// (from dirs, every directory in the tree) with a pyproject.toml that has a
+// [project] table. read returns a file's content or an error wrapping
+// resolve.ErrNotFound. A repository without a root pyproject.toml has none.
+func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]Package, error) {
+	rootDoc, err := readPyproject(read, "pyproject.toml")
+	if errors.Is(err, resolve.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var members []string
+	if ws, ok := table(rootDoc, "tool", "uv", "workspace"); ok {
+		include, exclude := stringList(ws["members"]), stringList(ws["exclude"])
+		for _, d := range dirs {
+			if matchAny(include, d) && !matchAny(exclude, d) {
+				members = append(members, d)
+			}
+		}
+	}
+	var memberPkgs []Package
+	var memberDirs []string // directories that are members: they hold a pyproject.toml
+	for _, d := range members {
+		doc, err := readPyproject(read, d+"/pyproject.toml")
+		switch {
+		case errors.Is(err, resolve.ErrNotFound):
+			continue // a matched directory that is not a project
+		case err != nil:
+			memberDirs = append(memberDirs, d)
+			memberPkgs = append(memberPkgs, Package{Dir: d, Skip: skipBadPyproject})
+			continue
+		}
+		memberDirs = append(memberDirs, d)
+		if _, ok := doc["project"]; ok {
+			memberPkgs = append(memberPkgs, evaluate(read, d, doc))
+		}
+	}
+	var pkgs []Package
+	if _, ok := rootDoc["project"]; ok {
+		root := evaluate(read, "", rootDoc)
+		root.Exclude = memberDirs
+		pkgs = append(pkgs, root)
+	}
+	return append(pkgs, memberPkgs...), nil
+}
+
+func readPyproject(read func(string) ([]byte, error), p string) (map[string]any, error) {
+	b, err := read(p)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("%s: %w", p, err)
+	}
+	return doc, nil
+}
+
+// evaluate reads one package's [project] table and decides whether it can be
+// served.
+func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any) Package {
+	p := Package{Dir: dir}
+	proj, ok := doc["project"].(map[string]any)
+	if !ok {
+		p.Skip = skipNoProject
+		return p
+	}
+	p.Project = proj
+	rawName, _ := proj["name"].(string)
+	name, err := Normalize(rawName)
+	if err != nil {
+		p.Skip = skipBadName
+		return p
+	}
+	p.Name = name
+	if uv, ok := table(doc, "tool", "uv"); ok {
+		if pkg, ok := uv["package"].(bool); ok && !pkg {
+			p.Skip = skipNotPackage
+			return p
+		}
+	}
+	if _, ok := doc["build-system"]; !ok {
+		p.Skip = skipNotPackage
+		return p
+	}
+	rawVersion, ok := proj["version"].(string)
+	if !ok {
+		if slices.Contains(stringList(proj["dynamic"]), "version") {
+			p.Skip = skipDynamic
+		} else {
+			p.Skip = skipBadVersion
+		}
+		return p
+	}
+	if p.Version, err = ParseVersion(rawVersion); err != nil {
+		p.Skip = skipBadVersion
+		return p
+	}
+	for _, f := range referencedFiles(proj) {
+		repo, inside := inDir(dir, f)
+		if !inside {
+			p.Skip = skipOutsideFile
+			return p
+		}
+		if _, err := read(repo); err != nil {
+			p.Skip = skipMissingFile
+			return p
+		}
+	}
+	if f := readmeFile(proj); f != "" {
+		p.Readme, _ = inDir(dir, f)
+	}
+	return p
+}
+
+// referencedFiles are the files [project] names by path: the readme and an
+// old-style license file.
+func referencedFiles(proj map[string]any) []string {
+	var out []string
+	if f := readmeFile(proj); f != "" {
+		out = append(out, f)
+	}
+	if lic, ok := proj["license"].(map[string]any); ok {
+		if f, ok := lic["file"].(string); ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func readmeFile(proj map[string]any) string {
+	switch r := proj["readme"].(type) {
+	case string:
+		return r
+	case map[string]any:
+		f, _ := r["file"].(string)
+		return f
+	}
+	return ""
+}
+
+// inDir resolves a path written relative to dir and reports whether it stays
+// inside dir.
+func inDir(dir, rel string) (string, bool) {
+	if path.IsAbs(rel) {
+		return "", false
+	}
+	joined := path.Join(dir, rel)
+	if dir == "" {
+		return joined, joined != ".." && !strings.HasPrefix(joined, "../")
+	}
+	return joined, strings.HasPrefix(joined, dir+"/")
+}
+
+func table(doc map[string]any, keys ...string) (map[string]any, bool) {
+	cur := doc
+	for _, k := range keys {
+		next, ok := cur[k].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return cur, true
+}
+
+func stringList(v any) []string {
+	items, _ := v.([]any)
+	var out []string
+	for _, it := range items {
+		if s, ok := it.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// matchAny matches a directory against workspace globs (path.Match per
+// pattern; "**" is not supported and matches nothing).
+func matchAny(globs []string, dir string) bool {
+	for _, g := range globs {
+		if strings.Contains(g, "**") {
+			continue
+		}
+		if ok, err := path.Match(strings.TrimSuffix(g, "/"), dir); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
