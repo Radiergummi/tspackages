@@ -84,12 +84,14 @@ type countingReader struct {
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	if c.n >= c.max {
-		// One byte more tells "exactly max" from "over max".
+		// One byte more tells "exactly max" from "over max". Nothing past the
+		// limit is passed on: an empty probe returns its own result.
 		var one [1]byte
-		if n, _ := c.r.Read(one[:]); n > 0 {
+		n, err := c.r.Read(one[:])
+		if n > 0 {
 			return 0, errOverLimit
 		}
-		return c.r.Read(p)
+		return 0, err
 	}
 	if int64(len(p)) > c.max-c.n {
 		p = p[:c.max-c.n]

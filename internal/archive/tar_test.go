@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
@@ -87,4 +88,29 @@ func gzipOf(t *testing.T, b []byte) []byte {
 	gz.Write(b)
 	gz.Close()
 	return buf.Bytes()
+}
+
+// chunks returns one chunk per Read; an empty chunk is a (0, nil) Read.
+type chunks []string
+
+func (c *chunks) Read(p []byte) (int, error) {
+	if len(*c) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, (*c)[0])
+	(*c)[0] = (*c)[0][n:]
+	if (*c)[0] == "" {
+		*c = (*c)[1:]
+	}
+	return n, nil
+}
+
+// A reader that pauses with (0, nil) at the limit must not let the bytes after
+// the pause through uncounted.
+func TestCountingReaderPauseAtLimit(t *testing.T) {
+	c := &countingReader{r: &chunks{"0123", "", "456789"}, max: 4}
+	b, err := io.ReadAll(c)
+	if !errors.Is(err, errOverLimit) || len(b) > 4 {
+		t.Fatalf("read %q, err %v", b, err)
+	}
 }
