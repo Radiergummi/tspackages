@@ -49,6 +49,12 @@ type Driver interface {
 	List(ctx context.Context, prefix string) iter.Seq2[Info, error]
 }
 
+// RangeGetter is a Driver that reads part of an object: n bytes from off, or
+// to the end when n < 0. A missing key is ErrNotFound.
+type RangeGetter interface {
+	GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, error)
+}
+
 var segmentRE = regexp.MustCompile(`^[a-z0-9._~+-]+$`)
 
 // ValidKey reports whether key is a "/"-separated path of safe segments.

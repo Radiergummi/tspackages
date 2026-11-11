@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -191,5 +192,42 @@ func TestFSIsOwnerOnly(t *testing.T) {
 		if got := fi.Mode().Perm(); got != want {
 			t.Errorf("%s: mode %o, want %o", p, got, want)
 		}
+	}
+}
+
+func TestFSGetRange(t *testing.T) {
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	testGetRange(t, d)
+}
+
+func testGetRange(t *testing.T, d Driver) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := d.Put(ctx, "k", strings.NewReader("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	rg, ok := d.(RangeGetter)
+	if !ok {
+		t.Fatalf("%T is not a RangeGetter", d)
+	}
+	for _, c := range []struct {
+		off, n int64
+		want   string
+	}{{2, 3, "234"}, {7, -1, "789"}, {0, -1, "0123456789"}} {
+		rc, err := rg.GetRange(ctx, "k", c.off, c.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(b) != c.want {
+			t.Errorf("GetRange(%d, %d) = %q, want %q", c.off, c.n, b, c.want)
+		}
+	}
+	if _, err := rg.GetRange(ctx, "missing", 0, 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing key: %v", err)
 	}
 }

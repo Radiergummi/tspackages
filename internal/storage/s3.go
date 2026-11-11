@@ -205,12 +205,104 @@ func (d *s3Driver) put(ctx context.Context, key string, r io.Reader, ifNoneMatch
 	return Info{}, errConflict
 }
 
+// multipartThreshold is the size above which Put uploads a seekable body in
+// parts of multipartPartSize instead of buffering it.
+const (
+	multipartThreshold = 64 << 20
+	multipartPartSize  = 16 << 20
+)
+
+// sizedReaderAt is a body Put can split into parts without buffering, such as
+// an *os.File.
+type sizedReaderAt interface {
+	io.ReaderAt
+	io.Seeker
+}
+
 func (d *s3Driver) Put(ctx context.Context, key string, r io.Reader) (Info, error) {
+	if ra, ok := r.(sizedReaderAt); ok {
+		start, err := ra.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return Info{}, err
+		}
+		end, err := ra.Seek(0, io.SeekEnd)
+		if err != nil {
+			return Info{}, err
+		}
+		if _, err := ra.Seek(start, io.SeekStart); err != nil {
+			return Info{}, err
+		}
+		if end-start > multipartThreshold {
+			info, err := d.putMultipart(ctx, key, io.NewSectionReader(ra, start, end-start))
+			if err != nil {
+				return Info{}, fmt.Errorf("storage: put %q: %w", key, err)
+			}
+			return info, nil
+		}
+	}
 	info, err := d.put(ctx, key, r, "", "")
 	if err != nil {
 		return Info{}, fmt.Errorf("storage: put %q: %w", key, err)
 	}
 	return info, nil
+}
+
+// putMultipart uploads body in parts, each read from body as it is sent, and
+// aborts the upload on failure so no parts are left behind.
+func (d *s3Driver) putMultipart(ctx context.Context, key string, body *io.SectionReader) (Info, error) {
+	if err := ValidKey(key); err != nil {
+		return Info{}, err
+	}
+	created, err := d.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &d.bucket, Key: d.full(key)})
+	if err != nil {
+		return Info{}, err
+	}
+	abort := func() {
+		// A fresh context: the upload must be aborted even if ctx is done.
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		_, _ = d.client.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{Bucket: &d.bucket, Key: d.full(key), UploadId: created.UploadId}) // best effort; a bucket lifecycle rule cleans up the rest
+	}
+	var parts []types.CompletedPart
+	for off, n := int64(0), int32(1); off < body.Size(); off, n = off+multipartPartSize, n+1 {
+		size := min(multipartPartSize, body.Size()-off)
+		out, err := d.client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: &d.bucket, Key: d.full(key), UploadId: created.UploadId, PartNumber: aws.Int32(n),
+			Body: io.NewSectionReader(body, off, size), ContentLength: aws.Int64(size),
+		})
+		if err != nil {
+			abort()
+			return Info{}, err
+		}
+		parts = append(parts, types.CompletedPart{ETag: out.ETag, PartNumber: aws.Int32(n)})
+	}
+	done, err := d.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: &d.bucket, Key: d.full(key), UploadId: created.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	})
+	if err != nil {
+		abort()
+		return Info{}, err
+	}
+	return Info{Key: key, Size: body.Size(), ETag: cleanETag(done.ETag), ModTime: time.Now().UTC()}, nil
+}
+
+func (d *s3Driver) GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	if err := ValidKey(key); err != nil {
+		return nil, err
+	}
+	rng := fmt.Sprintf("bytes=%d-", off)
+	if n >= 0 {
+		rng = fmt.Sprintf("bytes=%d-%d", off, off+n-1)
+	}
+	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &d.bucket, Key: d.full(key), Range: &rng})
+	if err != nil {
+		if isNoSuchKey(err) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("storage: get %q: %w", key, err)
+	}
+	return out.Body, nil
 }
 
 func (d *s3Driver) PutIfAbsent(ctx context.Context, key string, r io.Reader) (Info, error) {

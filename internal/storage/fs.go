@@ -219,6 +219,25 @@ func (d *fsDriver) Get(ctx context.Context, key string) (io.ReadCloser, Info, er
 	return f, info, nil
 }
 
+func (d *fsDriver) GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	rc, _, err := d.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	f := rc.(*os.File)
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if n < 0 {
+		return f, nil
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(f, n), f}, nil
+}
+
 func (d *fsDriver) Stat(ctx context.Context, key string) (Info, error) {
 	rc, info, err := d.Get(ctx, key)
 	if err != nil {

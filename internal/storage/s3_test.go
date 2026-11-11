@@ -2,11 +2,16 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +29,9 @@ func testS3Config(t *testing.T) config.StoreConfig {
 	}
 }
 
-func TestS3(t *testing.T) {
+// newTestS3 returns a driver on a fresh bucket, emptied and removed after the test.
+func newTestS3(t *testing.T) Driver {
+	t.Helper()
 	ctx := context.Background()
 	cfg := testS3Config(t)
 	d, err := NewS3(ctx, cfg)
@@ -51,8 +58,10 @@ func TestS3(t *testing.T) {
 			t.Logf("cleanup bucket: %v", err)
 		}
 	})
-	runDriverSuite(t, d)
+	return d
 }
+
+func TestS3(t *testing.T) { runDriverSuite(t, newTestS3(t)) }
 
 func TestS3MissingBucket(t *testing.T) {
 	ctx := context.Background()
@@ -159,3 +168,51 @@ func TestS3ConditionalConflicts(t *testing.T) {
 		t.Fatal("Put with a cancelled context succeeded")
 	}
 }
+
+// A large body from a file is uploaded in parts without being buffered.
+func TestS3PutLargeStreams(t *testing.T) {
+	d := newTestS3(t)
+	ctx := context.Background()
+	f, err := os.CreateTemp(t.TempDir(), "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.New()
+	rnd := rand.New(rand.NewPCG(1, 2))
+	buf := make([]byte, 1<<20)
+	for range 200 {
+		for i := range buf {
+			buf[i] = byte(rnd.Uint32())
+		}
+		f.Write(buf)
+		h.Write(buf)
+	}
+	want := hex.EncodeToString(h.Sum(nil))
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := d.Put(ctx, "big", f); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc); grew > 64<<20 {
+		t.Errorf("heap grew by %d MiB during Put", grew>>20)
+	}
+	rc, _, err := d.Get(ctx, "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	h.Reset()
+	if _, err := io.Copy(h, rc); err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		t.Fatalf("sha256 %s, want %s", got, want)
+	}
+}
+
+func TestS3GetRange(t *testing.T) { testGetRange(t, newTestS3(t)) }
