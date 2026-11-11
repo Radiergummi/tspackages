@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -102,8 +103,36 @@ func TestSkipReasons(t *testing.T) {
 	if pkgs := discover(t, tree{"pyproject.toml": "[tool.x]\na = 1\n" + buildSystem}); len(pkgs) != 0 {
 		t.Errorf("a root without [project] is not a package: %+v", pkgs)
 	}
-	if _, err := DiscoverPackages(tree{"pyproject.toml": "not = toml = at all"}.read, nil); err == nil {
-		t.Error("broken root pyproject accepted")
+	// A broken root pyproject.toml is content, reported like other refusals.
+	if pkgs := discover(t, tree{"pyproject.toml": "not = toml = at all"}); len(pkgs) != 1 || pkgs[0].Skip != skipBadPyproject {
+		t.Errorf("broken root pyproject: %+v", pkgs)
+	}
+}
+
+// TestDiscoverReadErrors: a file that cannot be read is an error, not a
+// refusal; a referenced file that is not a regular file is refused.
+func TestDiscoverReadErrors(t *testing.T) {
+	src := "[project]\nname = \"a\"\nversion = \"1\"\nreadme = \"README.md\"\n" + buildSystem
+	failing := func(fail string, err error) func(string) ([]byte, error) {
+		return func(p string) ([]byte, error) {
+			if p == fail {
+				return nil, err
+			}
+			return tree{"pyproject.toml": src}.read(p)
+		}
+	}
+	for _, p := range []string{"pyproject.toml", "README.md"} {
+		if pkgs, err := DiscoverPackages(failing(p, fmt.Errorf("git cat-file: exit status 128")), nil); err == nil {
+			t.Errorf("unreadable %s: %+v", p, pkgs)
+		}
+	}
+	pkgs, err := DiscoverPackages(failing("README.md", fmt.Errorf("%w: README.md", errNotRegular)), nil)
+	if err != nil || len(pkgs) != 1 || !strings.Contains(pkgs[0].Skip, "regular file") {
+		t.Errorf("symlinked readme: %+v %v", pkgs, err)
+	}
+	pkgs, err = DiscoverPackages(failing("README.md", fmt.Errorf("x: %w", gitmirror.ErrTooLarge)), nil)
+	if err != nil || len(pkgs) != 1 || !strings.Contains(pkgs[0].Skip, "larger than") {
+		t.Errorf("large readme: %+v %v", pkgs, err)
 	}
 }
 

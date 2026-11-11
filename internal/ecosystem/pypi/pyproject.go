@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -21,6 +22,8 @@ const (
 	skipBadName      = "name missing or invalid"
 	skipOutsideFile  = "readme or license file is outside the package directory, so the sdist cannot build"
 	skipMissingFile  = "readme or license file does not exist"
+	skipNotRegular   = "readme or license file is not a regular file (a symlink?), so the sdist cannot hold it"
+	skipLargeFile    = "readme or license file is larger than 1 MiB"
 	skipBadPyproject = "pyproject.toml does not parse"
 )
 
@@ -36,17 +39,29 @@ type Package struct {
 	Skip    string   // why the package cannot be served; "" = servable
 }
 
+// errNotRegular is what a DiscoverPackages read returns for a path that is
+// not a regular file (a symlink); such a file is refused, not read.
+var errNotRegular = errors.New("not a regular file")
+
+// errBadPyproject marks a pyproject.toml that does not parse.
+var errBadPyproject = errors.New("pyproject.toml does not parse")
+
 // DiscoverPackages finds the packages of a repository: the root
 // pyproject.toml's project and, for a uv workspace, each member directory
 // (from dirs, every directory in the tree) with a pyproject.toml that has a
-// [project] table. read returns a file's content or an error wrapping
-// resolve.ErrNotFound. A repository without a root pyproject.toml has none.
+// [project] table. read returns a file's content, an error wrapping
+// resolve.ErrNotFound, errNotRegular or gitmirror.ErrTooLarge, or any other
+// error, which fails the discovery (content problems are Package.Skip
+// instead). A repository
+// without a root pyproject.toml has none.
 func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]Package, error) {
 	rootDoc, err := readPyproject(read, "pyproject.toml")
-	if errors.Is(err, resolve.ErrNotFound) {
+	switch {
+	case errors.Is(err, resolve.ErrNotFound):
 		return nil, nil
-	}
-	if err != nil {
+	case errors.Is(err, errBadPyproject):
+		return []Package{{Skip: skipBadPyproject}}, nil
+	case err != nil:
 		return nil, err
 	}
 	var members []string
@@ -65,19 +80,28 @@ func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]
 		switch {
 		case errors.Is(err, resolve.ErrNotFound):
 			continue // a matched directory that is not a project
-		case err != nil:
+		case errors.Is(err, errBadPyproject):
 			memberDirs = append(memberDirs, d)
 			memberPkgs = append(memberPkgs, Package{Dir: d, Skip: skipBadPyproject})
 			continue
+		case err != nil:
+			return nil, err
 		}
 		memberDirs = append(memberDirs, d)
 		if _, ok := doc["project"]; ok {
-			memberPkgs = append(memberPkgs, evaluate(read, d, doc))
+			p, err := evaluate(read, d, doc)
+			if err != nil {
+				return nil, err
+			}
+			memberPkgs = append(memberPkgs, p)
 		}
 	}
 	var pkgs []Package
 	if _, ok := rootDoc["project"]; ok {
-		root := evaluate(read, "", rootDoc)
+		root, err := evaluate(read, "", rootDoc)
+		if err != nil {
+			return nil, err
+		}
 		root.Exclude = memberDirs
 		pkgs = append(pkgs, root)
 	}
@@ -86,42 +110,45 @@ func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]
 
 func readPyproject(read func(string) ([]byte, error), p string) (map[string]any, error) {
 	b, err := read(p)
+	if errors.Is(err, errNotRegular) || errors.Is(err, gitmirror.ErrTooLarge) {
+		return nil, fmt.Errorf("%s: %w: %w", p, errBadPyproject, err)
+	}
 	if err != nil {
 		return nil, err
 	}
 	var doc map[string]any
 	if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
-		return nil, fmt.Errorf("%s: %w", p, err)
+		return nil, fmt.Errorf("%s: %w: %w", p, errBadPyproject, err)
 	}
 	return doc, nil
 }
 
 // evaluate reads one package's [project] table and decides whether it can be
-// served.
-func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any) Package {
+// served; an error is a file that could not be read.
+func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any) (Package, error) {
 	p := Package{Dir: dir}
 	proj, ok := doc["project"].(map[string]any)
 	if !ok {
 		p.Skip = skipNoProject
-		return p
+		return p, nil
 	}
 	p.Project = proj
 	rawName, _ := proj["name"].(string)
 	name, err := Normalize(rawName)
 	if err != nil {
 		p.Skip = skipBadName
-		return p
+		return p, nil
 	}
 	p.Name = name
 	if uv, ok := table(doc, "tool", "uv"); ok {
 		if pkg, ok := uv["package"].(bool); ok && !pkg {
 			p.Skip = skipNotPackage
-			return p
+			return p, nil
 		}
 	}
 	if _, ok := doc["build-system"]; !ok {
 		p.Skip = skipNotPackage
-		return p
+		return p, nil
 	}
 	rawVersion, ok := proj["version"].(string)
 	if !ok {
@@ -130,27 +157,36 @@ func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any)
 		} else {
 			p.Skip = skipBadVersion
 		}
-		return p
+		return p, nil
 	}
 	if p.Version, err = ParseVersion(rawVersion); err != nil {
 		p.Skip = skipBadVersion
-		return p
+		return p, nil
 	}
 	for _, f := range referencedFiles(proj) {
 		repo, inside := inDir(dir, f)
 		if !inside {
 			p.Skip = skipOutsideFile
-			return p
+			return p, nil
 		}
-		if _, err := read(repo); err != nil {
+		switch _, err := read(repo); {
+		case errors.Is(err, resolve.ErrNotFound):
 			p.Skip = skipMissingFile
-			return p
+			return p, nil
+		case errors.Is(err, errNotRegular):
+			p.Skip = skipNotRegular
+			return p, nil
+		case errors.Is(err, gitmirror.ErrTooLarge):
+			p.Skip = skipLargeFile
+			return p, nil
+		case err != nil:
+			return Package{}, err
 		}
 	}
 	if f := readmeFile(proj); f != "" {
 		p.Readme, _ = inDir(dir, f)
 	}
-	return p
+	return p, nil
 }
 
 // referencedFiles are the files [project] names by path: the readme and an

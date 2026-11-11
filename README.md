@@ -146,8 +146,10 @@ same name and version with other content, the first sdist keeps being served
 and the status page reports the conflict as "changed without a version
 bump" with the tags involved. Releases
 whose package directory holds Git LFS files or submodules, or whose `readme`
-or `license` file is missing or lies outside the package directory, are
-refused and reported. Files generated at build time but not committed aren't
+or `license` file is missing, a symlink, larger than 1MiB or outside the
+package directory, are refused and reported. While a remote has never been
+indexed, or a tag could not be read, a name the source doesn't know answers
+`502` instead of moving on to the next source. Files generated at build time but not committed aren't
 in the sdist, and setuptools includes non-Python package data only if
 `MANIFEST.in` or `package-data` lists it. Publish such packages through a
 `storage` source.

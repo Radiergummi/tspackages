@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -453,5 +454,132 @@ func TestOversizedPackageRefused(t *testing.T) {
 	}
 	if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, "larger than") {
 		t.Fatalf("skipped = %+v", s)
+	}
+}
+
+// TestRemoteNeverIndexedIsUnavailable: while a remote has never been indexed,
+// a name it might declare is unavailable, not missing, so a later claiming
+// source isn't asked for it.
+func TestRemoteNeverIndexedIsUnavailable(t *testing.T) {
+	a := newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	a.tag("v1")
+	missing := filepath.Join(t.TempDir(), "later")
+	g := newGitEnv(t).source(t, nil, a.dir, missing)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
+		t.Fatalf("core = %v", got)
+	}
+	if _, err := g.Project(context.Background(), "acme-api"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("a name of the unindexed remote: %v", err)
+	}
+	if err := os.MkdirAll(missing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &repo{t: t, dir: missing}
+	testutil.Git(t, b.dir, "init", "-q")
+	b.write(map[string]string{"pyproject.toml": pyproject("acme-api", "1.0.0")})
+	b.tag("v1")
+	index(t, g)
+	if got := versionsOf(t, g, "acme-api"); len(got) != 1 {
+		t.Fatalf("api = %v", got)
+	}
+	if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("once every remote is indexed: %v", err)
+	}
+}
+
+// TestUnreadableTagIsUnavailable: a tag that cannot be read makes unknown
+// names unavailable for that pass instead of missing.
+func TestUnreadableTagIsUnavailable(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	r.tag("v1")
+	m, err := gitmirror.New(gitmirror.Options{Remote: r.dir, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Lose the tagged commit's tree from the mirror: the tag lists, its
+	// tree does not read.
+	tree := testutil.Git(t, r.dir, "rev-parse", "v1^{tree}")
+	packs, _ := filepath.Glob(filepath.Join(m.Dir(), "objects", "pack", "*.pack"))
+	for _, p := range packs {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range []string{p, strings.TrimSuffix(p, ".pack") + ".idx", strings.TrimSuffix(p, ".pack") + ".rev"} {
+			os.Remove(f)
+		}
+		cmd := exec.Command("git", "unpack-objects", "-q")
+		cmd.Dir, cmd.Stdin = m.Dir(), bytes.NewReader(b)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("unpack-objects: %v %s", err, out)
+		}
+	}
+	if err := os.Remove(filepath.Join(m.Dir(), "objects", tree[:2], tree[2:])); err != nil {
+		t.Fatal(err)
+	}
+	// The remote is gone too, so the pass indexes the local mirror.
+	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
+		t.Fatal(err)
+	}
+	env := newGitEnv(t)
+	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Index(context.Background())
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("a name at an unreadable tag: %v", err)
+	}
+}
+
+// TestSymlinkedReadmeRefused: a readme that is a symlink would be read as its
+// target path and left out of the sdist, so the release is refused.
+func TestSymlinkedReadmeRefused(t *testing.T) {
+	r := newRepo(t)
+	if err := os.Symlink("docs/README.md", filepath.Join(r.dir, "README.md")); err != nil {
+		t.Fatal(err)
+	}
+	r.write(map[string]string{
+		"pyproject.toml": strings.Replace(pyproject("acme-core", "1.0.0"), "[project]\n", "[project]\nreadme = \"README.md\"\n", 1),
+		"docs/README.md": "# Acme\n",
+	})
+	r.tag("v1")
+	g := newGitEnv(t).source(t, nil, r.dir)
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("served: %v", err)
+	}
+	if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, "regular file") {
+		t.Fatalf("skipped = %+v", s)
+	}
+}
+
+// TestFailedRemoteKeepsItsLastScan: a remote that fails a pass after being
+// indexed still counts, so a name it shares with another remote stays
+// withheld.
+func TestFailedRemoteKeepsItsLastScan(t *testing.T) {
+	a, b := newRepo(t), newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	a.tag("v1")
+	b.write(map[string]string{"pyproject.toml": pyproject("acme-core", "2.0.0")})
+	b.tag("v2")
+	g := newGitEnv(t).source(t, nil, a.dir, b.dir)
+	index(t, g)
+	// b's remote and its mirror's objects are gone: its refs no longer read.
+	if err := os.Rename(b.dir, b.dir+"-gone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(g.mirrors[1].Dir(), "objects")); err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v", err)
 	}
 }

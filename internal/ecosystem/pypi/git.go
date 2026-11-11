@@ -2,6 +2,7 @@ package pypi
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,6 +81,10 @@ type gitIndex struct {
 	pending   map[string]bool      // names with a version withheld for divergent histories or not built
 	conflicts []Conflict
 	skipped   []Skipped
+	// complete: every remote has been indexed at least once and every tag
+	// of this pass was read. Until then a name the index lacks may still
+	// exist, so it is unavailable rather than not found.
+	complete bool
 }
 
 // GitSource serves every tagged release of configured repositories as a
@@ -101,7 +106,7 @@ type GitSource struct {
 	smu      sync.Mutex             // guards stored
 	stored   map[string]release     // sidecars by key; they never change
 	idx      atomic.Pointer[gitIndex]
-	indexed  atomic.Bool
+	lastScan map[string]scan // each remote's last successful scan; guarded by mu
 
 	hmu    sync.Mutex
 	health map[string]error // last pass outcome per remote
@@ -124,7 +129,7 @@ func NewGitSource(name string, claims []string, mirrors []*gitmirror.Mirror, tag
 	}
 	g := &GitSource{
 		name: name, claims: claims, mirrors: mirrors, tags: tags, state: state, rec: rec, poll: poll, log: log, maxBytes: maxBytes,
-		byCommit: map[string][]candidate{}, stored: map[string]release{}, health: map[string]error{},
+		byCommit: map[string][]candidate{}, stored: map[string]release{}, health: map[string]error{}, lastScan: map[string]scan{},
 	}
 	g.idx.Store(&gitIndex{releases: map[string][]release{}, withheld: map[string]bool{}})
 	// Serve what is stored at once; a pass adds to it.
@@ -165,19 +170,25 @@ func (g *GitSource) Index(ctx context.Context) error {
 	defer g.mu.Unlock()
 	var cands []candidate
 	var skipped []Skipped
+	complete := true
 	for _, m := range g.mirrors {
-		cs, sk, err := g.scanRemote(ctx, m)
+		cs, sk, unread, err := g.scanRemote(ctx, m)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		g.hmu.Lock()
-		g.health[m.Remote()] = err
+		g.health[m.Remote()] = cmp.Or(err, unread)
 		g.hmu.Unlock()
 		if err != nil {
-			g.log.Warn("pypi git: indexing a remote failed; its stored releases stay served", "source", g.name, "remote", m.Remote(), "error", err)
-			continue
+			// Its last scan stands in, so what it declared stays withheld
+			// or pending rather than turning into a miss.
+			g.log.Warn("pypi git: indexing a remote failed; its last scan stands", "source", g.name, "remote", m.Remote(), "error", err)
+		} else {
+			g.lastScan[m.Remote()] = scan{cs, sk, unread}
 		}
-		cands, skipped = append(cands, cs...), append(skipped, sk...)
+		last, ok := g.lastScan[m.Remote()]
+		cands, skipped = append(cands, last.cands...), append(skipped, last.skipped...)
+		complete = complete && ok && last.unread == nil
 	}
 	stored, err := g.loadStored(ctx)
 	if err != nil {
@@ -194,27 +205,33 @@ func (g *GitSource) Index(ctx context.Context) error {
 	slices.SortFunc(skipped, func(a, b Skipped) int {
 		return strings.Compare(a.Remote+a.Tag+a.Dir, b.Remote+b.Tag+b.Dir)
 	})
-	g.idx.Store(&gitIndex{releases: stored, withheld: withheld, pending: pending, conflicts: conflicts, skipped: skipped})
-	g.indexed.Store(true)
+	g.idx.Store(&gitIndex{releases: stored, withheld: withheld, pending: pending, conflicts: conflicts, skipped: skipped, complete: complete})
 	metrics.SetGitLastSync(g.name, time.Now())
 	return nil
 }
 
+// scan is what scanRemote found at a remote's tags.
+type scan struct {
+	cands   []candidate
+	skipped []Skipped
+	unread  error // a tag that could not be read
+}
+
 // scanRemote syncs a mirror and returns the candidates at its tags. An
 // unreachable remote is indexed from its local mirror when there is one.
-func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) ([]candidate, []Skipped, error) {
+// unread is the error of a tag that could not be read; the other tags are
+// still returned.
+func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands []candidate, skipped []Skipped, unread, err error) {
 	if err := m.Sync(ctx); err != nil {
 		if m.LastSync().IsZero() {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		g.log.Warn("pypi git sync failed; indexing the local mirror", "source", g.name, "remote", m.Remote(), "error", err)
 	}
 	refs, err := m.Refs(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	var cands []candidate
-	var skipped []Skipped
 	for _, ref := range refs {
 		if !ref.IsTag {
 			continue
@@ -226,6 +243,7 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) ([]cand
 		found, err := g.discover(ctx, m, ref.Commit)
 		if err != nil {
 			g.log.Warn("pypi git: reading a tag failed", "source", g.name, "remote", m.Remote(), "tag", ref.Short, "error", err)
+			unread = fmt.Errorf("tag %s: %w", ref.Short, err)
 			continue
 		}
 		for _, c := range found {
@@ -244,7 +262,7 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) ([]cand
 			cands = append(cands, c)
 		}
 	}
-	return cands, skipped, nil
+	return cands, skipped, unread, nil
 }
 
 // mapping returns the directories a tag releases under the remote's tag
@@ -280,7 +298,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		return nil, err
 	}
 	dirSet := map[string]bool{}
+	modes := map[string]string{}
 	for _, e := range tree {
+		modes[e.Path] = e.Mode
 		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
 			dirSet[d] = true
 		}
@@ -290,7 +310,14 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		dirs = append(dirs, d)
 	}
 	slices.Sort(dirs)
-	read := func(p string) ([]byte, error) { return m.ReadFile(ctx, commit, p) }
+	read := func(p string) ([]byte, error) {
+		// git reads a symlink as its target path, and the sdist leaves
+		// symlinks out.
+		if mode, ok := modes[p]; ok && mode != "100644" && mode != "100755" {
+			return nil, fmt.Errorf("%s: %w", p, errNotRegular)
+		}
+		return m.ReadFile(ctx, commit, p)
+	}
 	pkgs, err := DiscoverPackages(read, dirs)
 	if err != nil {
 		return nil, err
@@ -607,8 +634,8 @@ func (g *GitSource) Project(_ context.Context, name string) (Project, error) {
 	}
 	rs := idx.releases[name]
 	if len(rs) == 0 {
-		if !g.indexed.Load() {
-			return Project{}, fmt.Errorf("%w: %s (not indexed yet)", ErrUnavailable, name)
+		if !idx.complete {
+			return Project{}, fmt.Errorf("%w: %s (not every remote and tag is indexed yet)", ErrUnavailable, name)
 		}
 		if idx.pending[name] {
 			return Project{}, fmt.Errorf("%w: %s has a release withheld for divergent histories or not built yet", ErrUnavailable, name)

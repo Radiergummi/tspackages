@@ -373,8 +373,11 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/heads/"), nil
 }
 
+// ErrTooLarge is wrapped by ReadFile for a file over its 1 MiB limit.
+var ErrTooLarge = errors.New("file over the read limit")
+
 // ReadFile returns the content of the regular file path at commit. A missing
-// path or commit wraps resolve.ErrNotFound; files over 1 MiB are an error
+// path or commit wraps resolve.ErrNotFound; files over 1 MiB wrap ErrTooLarge
 // (this is for small manifests such as composer.json and go.mod).
 func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, error) {
 	if err := checkCommit(commit); err != nil {
@@ -412,7 +415,7 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 		return nil, fmt.Errorf("gitmirror: unexpected cat-file output %q", lines[1])
 	}
 	if size > maxReadFile {
-		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes, over the %d byte limit", commit, path, size, maxReadFile)
+		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes: %w of %d bytes", commit, path, size, ErrTooLarge, maxReadFile)
 	}
 	return m.git(ctx, m.dir, nil, nil, "cat-file", "blob", commit+":"+path)
 }
