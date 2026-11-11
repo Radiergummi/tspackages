@@ -520,7 +520,9 @@ at all: connections fail, usually by timing out. Installs that need metadata
 or an archive fail, and so do publishes.
 
 Right after a start, names claimed by a Composer git source answer `502`
-until the first index pass. A PyPI git source serves its stored releases at
+until the first index pass, and a claimed name the source doesn't serve
+keeps answering `502` until every one of its remotes has been indexed once
+(a remote with pinned tags counts as soon as its pins are served). A PyPI git source serves its stored releases at
 once, but builds no new release, and answers `502` for a name without a
 stored release instead of letting a later source answer, until every one of
 its remotes has been synced and scanned since startup and every tag was
@@ -528,7 +530,7 @@ read. A remote that can't be reached after a restart holds that state until
 it can, even with a local mirror; watch for
 `pypi git: indexing a remote failed` and
 `tspackages_git_last_sync_timestamp_seconds{ecosystem="pypi"}` staying at
-`0`.
+`0`, or absent before the first pass ends: alert on `absent()` as well.
 
 To keep that window small and harmless:
 
