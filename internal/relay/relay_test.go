@@ -379,3 +379,39 @@ func TestStalledUpstreamFails(t *testing.T) {
 	}
 	emptyDir(t, tmp)
 }
+
+// TestOpenAfterCommitDuringMissDoesNotRefetch: a reader whose cache lookup
+// missed while the download was still committing must not start a second
+// fetch once the download has left the in-flight set.
+func TestOpenAfterCommitDuringMissDoesNotRefetch(t *testing.T) {
+	r, _, _ := newRelay(t)
+	body := []byte("committed while the second reader looked")
+	var calls atomic.Int32
+	fetch := bytesFetch(body, &calls)
+	ctx := context.Background()
+
+	first, _, _, err := r.Open(ctx, "k", digestOf(body), fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The second reader misses the cache, then waits until the first
+	// download has committed and left the in-flight set.
+	r.afterMiss = func() {
+		r.afterMiss = nil
+		if _, err := io.ReadAll(first); err != nil {
+			t.Error(err)
+		}
+		first.Close()
+	}
+	second, _, _, err := r.Open(ctx, "k", digestOf(body), fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if got, err := io.ReadAll(second); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("second reader: %q, %v", got, err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("upstream fetched %d times", n)
+	}
+}

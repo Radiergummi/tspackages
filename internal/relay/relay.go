@@ -60,6 +60,9 @@ type Relay struct {
 
 	mu       sync.Mutex
 	inflight map[string]*download
+	finished uint64 // downloads that left inflight after starting to stream
+
+	afterMiss func() // test hook: runs after Open's first cache miss
 }
 
 // New returns a Relay keeping downloads in progress in tmpDir, which it
@@ -94,22 +97,41 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 // drops the entry. The returned size is -1 when unknown; hit reports a cache
 // hit.
 func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (body io.ReadCloser, size int64, hit bool, err error) {
-	if rc, size, err := r.cache.Open(ctx, key); err == nil {
-		return r.verifying(rc, key, want), size, true, nil
-	} else if !errors.Is(err, storage.ErrNotFound) {
-		return nil, 0, false, err
-	}
+	var dl *download
+	joined := false
+	// A download that finished between the cache miss and the in-flight
+	// check has committed (or failed) and left the in-flight set: look in the
+	// cache once more before starting a second fetch. Cache misses wait out a
+	// commit in progress, so this window spans the whole cache write.
+	for retried := false; ; retried = true {
+		r.mu.Lock()
+		gen := r.finished
+		r.mu.Unlock()
+		if rc, size, err := r.cache.Open(ctx, key); err == nil {
+			return r.verifying(rc, key, want), size, true, nil
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return nil, 0, false, err
+		}
+		if r.afterMiss != nil {
+			r.afterMiss()
+		}
 
-	r.mu.Lock()
-	dl, joined := r.inflight[key]
-	if joined {
-		dl.readers++
-	} else {
-		dl = &download{key: key, readers: 1, ready: make(chan struct{})}
-		dl.cond = sync.NewCond(&dl.mu)
-		r.inflight[key] = dl
+		r.mu.Lock()
+		dl, joined = r.inflight[key]
+		if !joined && r.finished != gen && !retried {
+			r.mu.Unlock()
+			continue
+		}
+		if joined {
+			dl.readers++
+		} else {
+			dl = &download{key: key, readers: 1, ready: make(chan struct{})}
+			dl.cond = sync.NewCond(&dl.mu)
+			r.inflight[key] = dl
+		}
+		r.mu.Unlock()
+		break
 	}
-	r.mu.Unlock()
 	if !joined {
 		go r.run(context.WithoutCancel(ctx), dl, want, fetch, onCommit)
 	}
@@ -188,6 +210,7 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	// Commit or not, the key is free for a new fetch from here on.
 	r.mu.Lock()
 	delete(r.inflight, dl.key)
+	r.finished++
 	r.mu.Unlock()
 	dl.mu.Lock()
 	dl.done, dl.err = true, err
