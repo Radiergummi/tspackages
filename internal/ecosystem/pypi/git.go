@@ -79,8 +79,8 @@ type candidate struct {
 	remote   *gitmirror.Mirror
 	tag      string
 	commit   string
-	identity string
-	refused  string
+	identity string // set for a release: name and version are known
+	refused  string // why the release cannot be served, or ""
 }
 
 // gitIndex is what a pass publishes.
@@ -260,6 +260,9 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands 
 		return nil, nil, nil, err
 	}
 	for _, ref := range refs {
+		if ctx.Err() != nil {
+			return nil, nil, nil, ctx.Err()
+		}
 		if !ref.IsTag {
 			continue
 		}
@@ -278,15 +281,15 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands 
 				continue
 			}
 			c.tag = ref.Short
-			reason := c.pkg.Skip
-			if reason == "" {
-				reason = c.refused
-			}
+			reason := cmp.Or(c.refused, c.pkg.Skip)
 			if reason != "" {
 				skipped = append(skipped, Skipped{Remote: metrics.RedactRemote(m.Remote()), Tag: ref.Short, Dir: c.pkg.Dir, Package: c.pkg.Name, Reason: reason})
-				continue
 			}
-			cands = append(cands, c)
+			// A refused candidate still takes part in resolution: when it
+			// is a version's earliest tag, the version is refused.
+			if c.identity != "" {
+				cands = append(cands, c)
+			}
 		}
 	}
 	return cands, skipped, unread, nil
@@ -328,6 +331,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	modes := map[string]string{}
 	for _, e := range tree {
 		modes[e.Path] = e.Mode
+		if !cleanTreePath(e.Path) {
+			continue // refused by RefuseTree for the package holding it
+		}
 		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
 			dirSet[d] = true
 		}
@@ -337,19 +343,20 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		dirs = append(dirs, d)
 	}
 	slices.Sort(dirs)
-	// Every file is in the tree, so its content decides the outcome
-	// before git is asked: a symlink would be read as its target path (and
-	// the sdist leaves symlinks out); git refuses a path with a newline or
-	// NUL, and archiving a directory that starts with "-".
+	// Every file is in the tree, so its path and mode decide the outcome
+	// before git is asked: ReadFile refuses a path that is not clean or holds
+	// a newline or NUL, ArchiveTar a directory that starts with "-", and a
+	// symlink would be read as its target path (the sdist leaves symlinks
+	// out). Whatever ReadFile still fails on is not the content's doing.
 	read := func(p string) ([]byte, error) {
 		mode, ok := modes[p]
 		switch {
+		case !cleanTreePath(p) || strings.HasPrefix(p, "-") || strings.ContainsAny(p, "\x00\n"):
+			return nil, fmt.Errorf("%q: %w", p, errBadPath)
 		case !ok:
 			return nil, fmt.Errorf("%s: %w", p, resolve.ErrNotFound)
 		case mode != "100644" && mode != "100755":
 			return nil, fmt.Errorf("%s: %w", p, errNotRegular)
-		case strings.HasPrefix(p, "-") || strings.ContainsAny(p, "\x00\n"):
-			return nil, fmt.Errorf("%q: %w", p, errBadPath)
 		}
 		return m.ReadFile(ctx, commit, p)
 	}
@@ -360,7 +367,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	var out []candidate
 	for _, p := range pkgs {
 		c := candidate{pkg: p, remote: m, commit: commit}
-		if p.Skip == "" {
+		// A package with a name and version is a release candidate, even
+		// when it is refused: the earliest tag of a version decides.
+		if p.Name != "" && len(p.Version.release) > 0 {
 			var entries, attrs []gitmirror.TreeEntry
 			for _, e := range tree {
 				if inPackage(e.Path, p.Dir) && !excluded(e.Path, p.Exclude) {
@@ -369,12 +378,14 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 					attrs = append(attrs, e) // an ancestor directory's attributes
 				}
 			}
-			c.refused = RefuseTree(entries)
+			c.refused = cmp.Or(p.Skip, RefuseTree(entries))
 			if c.refused == "" && !keysFit(SdistFilename(p.Name, p.Version)) {
 				c.refused = "name and version are too long for the store's keys"
 			}
-			if c.refused == "" && usesLFS(read, append(slices.Clone(attrs), entries...)) {
-				c.refused = "uses Git LFS (filter=lfs), which an sdist cannot resolve"
+			if c.refused == "" {
+				if c.refused, err = lfsRefusal(read, append(slices.Clone(attrs), entries...)); err != nil {
+					return nil, err // unread this pass, and not cached
+				}
 			}
 			c.identity = Identity(entries, nil, attrs)
 		}
@@ -384,18 +395,28 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	return slices.Clone(out), nil
 }
 
-// usesLFS reports whether any of the .gitattributes files among entries
-// routes files through Git LFS.
-func usesLFS(read func(string) ([]byte, error), entries []gitmirror.TreeEntry) bool {
+// lfsRefusal returns why the package is refused when one of the
+// .gitattributes files among entries routes files through Git LFS or
+// cannot be checked, or "". git ignores a symlinked .gitattributes, and so
+// does this. An error is a read that failed.
+func lfsRefusal(read func(string) ([]byte, error), entries []gitmirror.TreeEntry) (string, error) {
 	for _, e := range entries {
 		if path.Base(e.Path) != ".gitattributes" {
 			continue
 		}
-		if b, err := read(e.Path); err == nil && bytes.Contains(b, []byte("filter=lfs")) {
-			return true
+		b, err := read(e.Path)
+		switch {
+		case errors.Is(err, errNotRegular):
+			continue
+		case errors.Is(err, gitmirror.ErrTooLarge), errors.Is(err, errBadPath):
+			return fmt.Sprintf("%q cannot be checked for Git LFS (over 1MiB or an unreadable path)", e.Path), nil
+		case err != nil:
+			return "", err
+		case bytes.Contains(b, []byte("filter=lfs")):
+			return "uses Git LFS (filter=lfs), which an sdist cannot resolve", nil
 		}
 	}
-	return false
+	return "", nil
 }
 
 func inPackage(p, dir string) bool { return dir == "" || strings.HasPrefix(p, dir+"/") }
@@ -412,6 +433,9 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 		byName[c.pkg.Name] = append(byName[c.pkg.Name], c)
 	}
 	for _, name := range sortedKeys(byName) {
+		if ctx.Err() != nil {
+			return conflicts, withheld, pending, refused
+		}
 		cs := byName[name]
 		remotes := uniq(cs, func(c candidate) string { return c.remote.Remote() })
 		if len(remotes) > 1 {
@@ -465,13 +489,20 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 	if !complete {
 		return nil, nil, true
 	}
-	winner := g.earliest(ctx, cs)
+	winner, err := g.earliest(ctx, cs)
+	if err != nil {
+		g.log.Warn("pypi git: deciding the earliest tag failed", "source", g.name, "package", name, "version", cs[0].pkg.Version.String(), "error", err)
+		return nil, nil, true
+	}
 	if winner == nil {
 		var tags []string
 		for _, c := range cs {
 			tags = append(tags, c.tag)
 		}
 		return &Conflict{Package: name, Version: cs[0].pkg.Version.String(), Kind: ConflictDivergent, Tags: tags}, nil, false
+	}
+	if winner.refused != "" {
+		return nil, nil, false // the version is refused; scanRemote reported it
 	}
 	if err := g.build(ctx, *winner); err != nil {
 		if re, ok := errors.AsType[*RefusedError](err); ok {
@@ -524,8 +555,9 @@ func differing(name string, cs []candidate, served, kind string) *Conflict {
 
 // earliest returns the candidate whose commit is an ancestor of every other
 // candidate's commit (ties: the first tag by name), or nil when the
-// candidates with differing contents have no common first.
-func (g *GitSource) earliest(ctx context.Context, cs []candidate) *candidate {
+// candidates with differing contents have no common first. An error is an
+// ancestry git could not decide.
+func (g *GitSource) earliest(ctx context.Context, cs []candidate) (*candidate, error) {
 	for i := range cs {
 		first := true
 		for j := range cs {
@@ -533,20 +565,23 @@ func (g *GitSource) earliest(ctx context.Context, cs []candidate) *candidate {
 				continue
 			}
 			ok, err := cs[i].remote.IsAncestor(ctx, cs[i].commit, cs[j].commit)
-			if err != nil || !ok {
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
 				first = false
 				break
 			}
 		}
 		if first {
-			return &cs[i]
+			return &cs[i], nil
 		}
 	}
 	// No common first commit: fine if every candidate has the same content.
 	if len(uniq(cs, func(c candidate) string { return c.identity })) == 1 {
-		return &cs[0]
+		return &cs[0], nil
 	}
-	return nil
+	return nil, nil
 }
 
 // build generates the sdist of a candidate and stores it: the sidecar is
@@ -690,7 +725,10 @@ func (g *GitSource) cacheRelease(key string, r release) {
 
 // Project lists the stored releases of name.
 func (g *GitSource) Project(_ context.Context, name string) (Project, error) {
-	idx := g.idx.Load()
+	return g.idx.Load().project(name)
+}
+
+func (idx *gitIndex) project(name string) (Project, error) {
 	if idx.withheld[name] {
 		return Project{}, fmt.Errorf("%w: %s is declared by several repositories", ErrUnavailable, name)
 	}
@@ -715,11 +753,12 @@ func (g *GitSource) Project(_ context.Context, name string) (Project, error) {
 	return p, nil
 }
 
-func (g *GitSource) lookup(ctx context.Context, name, filename string) (release, error) {
-	if _, err := g.Project(ctx, name); err != nil {
+func (g *GitSource) lookup(name, filename string) (release, error) {
+	idx := g.idx.Load()
+	if _, err := idx.project(name); err != nil {
 		return release{}, err // withheld, not indexed yet or unknown
 	}
-	for _, r := range g.idx.Load().releases[name] {
+	for _, r := range idx.releases[name] {
 		if r.Filename == filename {
 			return r, nil
 		}
@@ -741,7 +780,7 @@ func (g *GitSource) open(ctx context.Context, key string) (Artifact, error) {
 
 // File streams a release's sdist.
 func (g *GitSource) File(ctx context.Context, name, filename string) (Artifact, error) {
-	r, err := g.lookup(ctx, name, filename)
+	r, err := g.lookup(name, filename)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -750,7 +789,7 @@ func (g *GitSource) File(ctx context.Context, name, filename string) (Artifact, 
 
 // Metadata streams a release's PKG-INFO when its dependencies are static.
 func (g *GitSource) Metadata(ctx context.Context, name, filename string) (Artifact, error) {
-	r, err := g.lookup(ctx, name, filename)
+	r, err := g.lookup(name, filename)
 	if err != nil {
 		return Artifact{}, err
 	}

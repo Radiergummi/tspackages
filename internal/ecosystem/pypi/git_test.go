@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/metrics"
@@ -500,7 +503,7 @@ func TestUnreadableTagIsUnavailable(t *testing.T) {
 	r := newRepo(t)
 	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
 	r.tag("v1")
-	m := mirrorWithoutTree(t, r, "v1")
+	m := mirrorWithout(t, r, testutil.Git(t, r.dir, "rev-parse", "v1^{tree}"))
 	env := newGitEnv(t)
 	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
 	if err != nil {
@@ -512,10 +515,10 @@ func TestUnreadableTagIsUnavailable(t *testing.T) {
 	}
 }
 
-// mirrorWithoutTree returns a synced mirror of r that lost the root tree of
-// rev (the tag lists, its tree does not read), with r's remote gone, so a
-// pass indexes the local mirror.
-func mirrorWithoutTree(t *testing.T, r *repo, rev string) *gitmirror.Mirror {
+// mirrorWithout returns a synced mirror of r that lost object (say, a tag's
+// root tree: the tag lists, its tree does not read), with r's remote gone, so
+// a pass indexes the local mirror.
+func mirrorWithout(t *testing.T, r *repo, object string) *gitmirror.Mirror {
 	t.Helper()
 	m, err := gitmirror.New(gitmirror.Options{Remote: r.dir, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
 	if err != nil {
@@ -524,7 +527,6 @@ func mirrorWithoutTree(t *testing.T, r *repo, rev string) *gitmirror.Mirror {
 	if err := m.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	tree := testutil.Git(t, r.dir, "rev-parse", rev+"^{tree}")
 	packs, _ := filepath.Glob(filepath.Join(m.Dir(), "objects", "pack", "*.pack"))
 	for _, p := range packs {
 		b, err := os.ReadFile(p)
@@ -540,7 +542,7 @@ func mirrorWithoutTree(t *testing.T, r *repo, rev string) *gitmirror.Mirror {
 			t.Fatalf("unpack-objects: %v %s", err, out)
 		}
 	}
-	if err := os.Remove(filepath.Join(m.Dir(), "objects", tree[:2], tree[2:])); err != nil {
+	if err := os.Remove(filepath.Join(m.Dir(), "objects", object[:2], object[2:])); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
@@ -608,7 +610,7 @@ func TestUnreadEarliestTagBuildsNothing(t *testing.T) {
 	testutil.Git(t, r.dir, "checkout", "-q", "--orphan", "other")
 	r.write(map[string]string{"a.py": "second"})
 	r.tag("v1-again")
-	m := mirrorWithoutTree(t, r, "v1")
+	m := mirrorWithout(t, r, testutil.Git(t, r.dir, "rev-parse", "v1^{tree}"))
 	env := newGitEnv(t)
 	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
 	if err != nil {
@@ -883,4 +885,174 @@ func TestContentProblemsAreRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// gitStdin runs git in dir with in on stdin and returns its trimmed output.
+func gitStdin(t *testing.T, dir, in string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@example.com", "GIT_CONFIG_GLOBAL=/dev/null")
+	cmd.Stdin = strings.NewReader(in)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// tagTree tags a commit of tree in r as tag.
+func tagTree(t *testing.T, r *repo, tree, tag string) {
+	t.Helper()
+	c := gitStdin(t, r.dir, "", "commit-tree", "-m", "x", tree)
+	testutil.Git(t, r.dir, "update-ref", "refs/tags/"+tag, c)
+}
+
+func unhex(s string) string {
+	b, _ := hex.DecodeString(s)
+	return string(b)
+}
+
+// TestMalformedTreePaths: trees that fsck would reject (an entry named
+// "/x" or "..") end in a refusal or are ignored; they neither hang a pass,
+// leave a tag unread forever nor reach an sdist.
+func TestMalformedTreePaths(t *testing.T) {
+	t.Run("leading slash", func(t *testing.T) {
+		r := newRepo(t)
+		r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+		blob := gitStdin(t, r.dir, "hi\n", "hash-object", "-w", "--stdin")
+		root := testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")
+		raw := "100644 /x\x00" + unhex(blob) + "100644 pyproject.toml\x00" + unhex(root)
+		tagTree(t, r, gitStdin(t, r.dir, raw, "hash-object", "-t", "tree", "-w", "--stdin", "--literally"), "v1")
+		g := newGitEnv(t).source(t, nil, r.dir)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- g.Index(ctx) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Index: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("Index still running 10s after its context expired")
+		}
+		assertRefused(t, g, "acme-core", "invalid path")
+	})
+	t.Run("dot-dot member", func(t *testing.T) {
+		r := newRepo(t)
+		r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+		sub := gitStdin(t, r.dir, "100644 blob "+testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")+"\tpyproject.toml\n", "mktree")
+		rootBlob := gitStdin(t, r.dir, "[tool.uv.workspace]\nmembers = [\"*\"]\n", "hash-object", "-w", "--stdin")
+		tagTree(t, r, gitStdin(t, r.dir, fmt.Sprintf("040000 tree %s\t..\n100644 blob %s\tpyproject.toml\n", sub, rootBlob), "mktree"), "bad")
+		g := newGitEnv(t).source(t, nil, r.dir)
+		index(t, g)
+		if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+			t.Fatalf("the source never completes: %v", err)
+		}
+	})
+	t.Run("dot-dot in a root package", func(t *testing.T) {
+		r := newRepo(t)
+		r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+		evil := gitStdin(t, r.dir, "pwned\n", "hash-object", "-w", "--stdin")
+		sub := gitStdin(t, r.dir, "100644 blob "+evil+"\t.bashrc\n", "mktree")
+		root := testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")
+		tagTree(t, r, gitStdin(t, r.dir, fmt.Sprintf("040000 tree %s\t..\n100644 blob %s\tpyproject.toml\n", sub, root), "mktree"), "v1")
+		g := newGitEnv(t).source(t, nil, r.dir)
+		index(t, g)
+		assertRefused(t, g, "acme-core", "invalid path")
+	})
+}
+
+// assertRefused checks that pkg is not served, a skip names reason, no
+// release is stored and the index is complete.
+func assertRefused(t *testing.T, g *GitSource, pkg, reason string) {
+	t.Helper()
+	if _, err := g.Project(context.Background(), pkg); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("%s: %v", pkg, err)
+	}
+	if !slices.ContainsFunc(g.Skipped(), func(s Skipped) bool { return strings.Contains(s.Reason, reason) }) {
+		t.Fatalf("skipped = %+v", g.Skipped())
+	}
+	if n := releaseRecords(t, g.state); n != 0 {
+		t.Fatalf("%d releases stored", n)
+	}
+	if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("index incomplete: %v", err)
+	}
+}
+
+// TestRefusedEarliestTagRefusesTheVersion: the earliest tag of a version
+// decides; when its content is refused, a later tag does not stand in.
+func TestRefusedEarliestTagRefusesTheVersion(t *testing.T) {
+	r := newRepo(t)
+	if err := os.Symlink("docs/README.md", filepath.Join(r.dir, "README.md")); err != nil {
+		t.Fatal(err)
+	}
+	withReadme := strings.Replace(pyproject("acme-core", "1.0.0"), "[project]\n", "[project]\nreadme = \"README.md\"\n", 1)
+	r.write(map[string]string{"pyproject.toml": withReadme, "docs/README.md": "# Acme\n"})
+	r.tag("v1")
+	if err := os.Remove(filepath.Join(r.dir, "README.md")); err != nil {
+		t.Fatal(err)
+	}
+	r.write(map[string]string{"README.md": "# Acme\n"})
+	r.tag("v1-fixed")
+	g := newGitEnv(t).source(t, nil, r.dir)
+	index(t, g)
+	assertRefused(t, g, "acme-core", "regular file")
+}
+
+// TestAncestryErrorIsPending: when ancestry cannot be decided, the version
+// is unavailable for the pass rather than reported as divergent or built.
+func TestAncestryErrorIsPending(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "a.py": "first"})
+	r.tag("v1")
+	between := r.write(map[string]string{"a.py": "between"})
+	r.write(map[string]string{"a.py": "second"})
+	r.tag("v2")
+	m := mirrorWithout(t, r, between)
+	env := newGitEnv(t)
+	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v", err)
+	}
+	if c := g.Conflicts(); len(c) != 0 {
+		t.Fatalf("conflicts = %+v", c)
+	}
+	if n := releaseRecords(t, env.state); n != 0 {
+		t.Fatalf("%d releases stored", n)
+	}
+}
+
+// TestUnreadableAttributes: a .gitattributes that cannot be read leaves the
+// tag unread (nothing is built); one over 1MiB is refused.
+func TestUnreadableAttributes(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{".gitattributes": "*.bin filter=lfs\n", "pyproject.toml": pyproject("acme-core", "1.0.0")})
+	r.tag("v1")
+	m := mirrorWithout(t, r, testutil.Git(t, r.dir, "rev-parse", "v1:.gitattributes"))
+	env := newGitEnv(t)
+	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("unreadable attributes: %v", err)
+	}
+	if n := releaseRecords(t, env.state); n != 0 {
+		t.Fatalf("%d releases stored", n)
+	}
+
+	big := newRepo(t)
+	big.write(map[string]string{".gitattributes": "#" + strings.Repeat("x", 1<<20) + "\n", "pyproject.toml": pyproject("acme-core", "1.0.0")})
+	big.tag("v1")
+	g2 := newGitEnv(t).source(t, nil, big.dir)
+	index(t, g2)
+	assertRefused(t, g2, "acme-core", ".gitattributes")
 }

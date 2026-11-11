@@ -79,7 +79,21 @@ func RefuseTree(entries []gitmirror.TreeEntry) string {
 	if slices.ContainsFunc(entries, func(e gitmirror.TreeEntry) bool { return e.Type == "commit" }) {
 		return "contains submodules, which an sdist cannot include"
 	}
+	if i := slices.IndexFunc(entries, func(e gitmirror.TreeEntry) bool { return !cleanTreePath(e.Path) }); i >= 0 {
+		return fmt.Sprintf("contains an invalid path (%q), which git fsck rejects", entries[i].Path)
+	}
 	return ""
+}
+
+// cleanTreePath reports whether p is a path git fsck accepts: relative,
+// without empty, "." or ".." segments.
+func cleanTreePath(p string) bool {
+	for seg := range strings.SplitSeq(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildSdist turns `git archive --format=tar` output of the package's
