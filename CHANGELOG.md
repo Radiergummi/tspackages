@@ -39,6 +39,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   archives now include the reference.
 - `-version` prints the build, `-log-format text` switches the logs from
   JSON, and `tspackages_build_info` reports the running version.
+- docs/operations.md: deploying with systemd or the container image, what
+  to back up and how to restore it, upgrades, monitoring, removing a bad
+  publish by hand, and what clients see while the registry is down.
 
 ### Changed
 

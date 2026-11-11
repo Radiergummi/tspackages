@@ -7,7 +7,8 @@ request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
 Composer and PyPI ship today. Go, npm, OCI and Maven follow. Read
-[docs/security.md](docs/security.md) before you deploy.
+[docs/security.md](docs/security.md) before you deploy, and
+[docs/operations.md](docs/operations.md) for backups, upgrades and monitoring.
 
 - Tailscale is the only authentication. There are no tokens, no basic auth and
   no dev mode. A caller without a matching capability gets `403`.
