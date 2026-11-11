@@ -72,3 +72,11 @@ func TestVersionEqualSpellings(t *testing.T) {
 		t.Fatal("1.0 and 1.0.0 must be equal, 1.0.1 different")
 	}
 }
+
+func TestParseVersionRejectsOverflow(t *testing.T) {
+	for _, s := range []string{"99999999999999999999", "1.99999999999999999999", "99999999999999999999!1.0", "1.0.post99999999999999999999"} {
+		if _, err := ParseVersion(s); err == nil {
+			t.Errorf("%s: accepted a component that doesn't fit", s)
+		}
+	}
+}

@@ -36,8 +36,15 @@ func ParseVersion(s string) (Version, error) {
 		return Version{}, fmt.Errorf("invalid version %q", s)
 	}
 	g := func(name string) string { return m[versionRE.SubexpIndex(name)] }
+	// Digits only, by the grammar; "" is an implicit 0. A number too large
+	// for an int would otherwise make distinct versions equal.
+	var overflow bool
 	num := func(s string) int {
-		n, _ := strconv.Atoi(s) // digits only, by the grammar; "" is an implicit 0
+		if s == "" {
+			return 0
+		}
+		n, err := strconv.Atoi(s)
+		overflow = overflow || err != nil
 		return n
 	}
 	v := Version{epoch: num(g("epoch")), post: -1, dev: -1}
@@ -66,11 +73,17 @@ func ParseVersion(s string) (Version, error) {
 	}
 	if l := g("local"); l != "" {
 		for _, part := range separatorRE.Split(strings.ToLower(l), -1) {
-			if n, err := strconv.Atoi(part); err == nil {
-				part = strconv.Itoa(n)
+			if strings.Trim(part, "0123456789") == "" {
+				part = strings.TrimLeft(part, "0")
+				if part == "" {
+					part = "0"
+				}
 			}
 			v.local = append(v.local, part)
 		}
+	}
+	if overflow {
+		return Version{}, fmt.Errorf("invalid version %q: a number is too large", s)
 	}
 	return v, nil
 }
