@@ -137,6 +137,11 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, u Up
 	if dist.name != name || dist.version != formVersion.Canonical() {
 		return File{}, &UploadError{fmt.Sprintf("filename %q does not match project %q version %q", u.Filename, u.Name, u.Version)}
 	}
+	// The longest key segment is the escaped filename plus a suffix; the
+	// name, version and claim segments are shorter.
+	if len(storage.EscapeSegment(u.Filename)+".attestations") > storage.MaxSegment {
+		return File{}, &UploadError{fmt.Sprintf("filename %q is too long", u.Filename)}
+	}
 	data, err := io.ReadAll(io.LimitReader(u.Content, s.limits.MaxBytes+1))
 	if err != nil {
 		return File{}, err

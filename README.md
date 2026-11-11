@@ -219,7 +219,7 @@ uv publish --publish-url https://registry.<tailnet>.ts.net/pypi/legacy/ \
 ```
 
 The name and version in the form, the filename and the metadata inside the
-file must agree. An existing filename is rejected with `400 File already
+file must agree. Filenames longer than 148 bytes are rejected. An existing filename is rejected with `400 File already
 exists`, even with identical bytes (`twine upload --skip-existing` copes), and
 so is a second sdist, or a second wheel with the same tags, for a version
 already published under another spelling.

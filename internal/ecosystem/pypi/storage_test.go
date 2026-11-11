@@ -208,6 +208,22 @@ func TestUploadDuplicates(t *testing.T) {
 	}
 }
 
+// TestUploadFilenameTooLong: a filename whose storage keys would not fit is
+// refused before its release slot is claimed.
+func TestUploadFilenameTooLong(t *testing.T) {
+	e := newStoreEnv(t)
+	whl := wheelOf(t, "acme_core", "1.0.0", metadataFor("acme-core", "1.0.0"))
+	fn := "acme_core-1.0.0-py3-none-" + strings.Repeat("x", 130) + ".whl"
+	if _, err := e.upload(t, "acme-core", "1.0.0", fn, whl, ""); !errors.As(err, new(*UploadError)) {
+		t.Fatalf("err = %v", err)
+	}
+	for info, err := range e.d.List(context.Background(), "pypi/") {
+		if err == nil {
+			t.Fatalf("a refused upload left %s", info.Key)
+		}
+	}
+}
+
 func TestUploadConcurrentDifferentFiles(t *testing.T) {
 	e := newStoreEnv(t)
 	var wg sync.WaitGroup
