@@ -56,7 +56,8 @@ ecosystems:
         ssh_key: ${env:DEPLOY_KEY}
         known_hosts: ${env:KNOWN_HOSTS}
         # Optional, per remote: which members a tag releases. Without it,
-        # every tag releases every package found at that commit.
+        # every tag releases every package found at that commit. "." is the
+        # root package, "*" every package.
         tags:
           git@github.com:matchory/mono.git:
             "core@*": [packages/core]

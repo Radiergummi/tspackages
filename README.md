@@ -132,12 +132,14 @@ packages with a dynamic version (`setuptools_scm`, `hatch-vcs`), without a
 `[build-system]` table or with `[tool.uv] package = false` are skipped and
 listed on the status page. Branches aren't served. Optionally, `tags` maps
 tag patterns per remote to the member directories a matching tag releases
-(`"*"` for all); with a mapping, tags matching no pattern release nothing:
+(`"."` for the root package, `"*"` for all); with a mapping, tags matching
+no pattern release nothing:
 
 ```yaml
 tags:
   "git@github.com:acme/mono.git":
     "core@*": [packages/core]
+    "root@*": ["."]
     "v*": ["*"]
 ```
 

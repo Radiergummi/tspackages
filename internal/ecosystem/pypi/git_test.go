@@ -621,3 +621,15 @@ func TestRebuildMustMatchRecord(t *testing.T) {
 		t.Fatalf("conflicts = %+v", c)
 	}
 }
+
+// TestTagMappingRootDir: "." in a tag mapping is the root package.
+func TestTagMappingRootDir(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	r.tag("v1")
+	g := newGitEnv(t).source(t, map[string]map[string][]string{r.dir: {"v*": {"."}}}, r.dir)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
+		t.Fatalf("root = %v", got)
+	}
+}

@@ -252,7 +252,7 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands 
 			continue
 		}
 		for _, c := range found {
-			if mapped && !slices.Contains(dirs, "*") && !slices.Contains(dirs, c.pkg.Dir) {
+			if mapped && !slices.Contains(dirs, "*") && !slices.Contains(dirs, cmp.Or(c.pkg.Dir, ".")) {
 				continue
 			}
 			c.tag = ref.Short
@@ -271,8 +271,8 @@ func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands 
 }
 
 // mapping returns the directories a tag releases under the remote's tag
-// mapping; mapped is false when the remote has none. Patterns are tried in
-// sorted order; the first match wins.
+// mapping ("." is the root package); mapped is false when the remote has
+// none. Patterns are tried in sorted order; the first match wins.
 func (g *GitSource) mapping(remote, tag string) (dirs []string, mapped bool) {
 	patterns, ok := g.tags[remote]
 	if !ok || len(patterns) == 0 {

@@ -109,7 +109,8 @@ type Source struct {
 	MetadataTTL         time.Duration         `yaml:"metadata_ttl"`
 	PollInterval        time.Duration         `yaml:"poll_interval"`
 	// Tags maps a remote (as listed in Remotes) to tag patterns and the
-	// package directories each releases ("*" = all). pypi git sources only.
+	// package directories each releases ("*" = all, "." = the root
+	// package). pypi git sources only.
 	Tags map[string]map[string][]string `yaml:"tags"`
 }
 
