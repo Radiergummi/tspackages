@@ -739,7 +739,12 @@ func TestListTreeBytesCapped(t *testing.T) {
 		fmt.Fprintf(&sb, "100644 blob %s\tf%05d\n", blob, i)
 	}
 	wide := run(sb.String(), "mktree")
+	deep := run("100644 blob "+blob+"\tf\n", "mktree")
+	for range 300 {
+		deep = run("040000 tree "+deep+"\td\n", "mktree")
+	}
 	for name, top := range map[string]string{
+		"deep path": deep,
 		"long path": run("100644 blob "+blob+"\t"+strings.Repeat("n", 5000)+"\n", "mktree"),
 		"listing":   run("040000 tree "+wide+"\t"+strings.Repeat("d", 4000)+"\n", "mktree"),
 	} {

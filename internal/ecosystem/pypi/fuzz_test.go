@@ -2,15 +2,15 @@ package pypi
 
 import (
 	"bytes"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 )
 
-// FuzzPyprojectScan: what the pyproject.toml pre-scan accepts decodes to
-// no deeper a value than its caps allow, so the decoder's quadratic cost
-// stays bounded.
+// FuzzPyprojectScan: what the pyproject.toml pre-scan accepts decodes with
+// bounded allocation, and to no deeper a value than its caps allow.
 func FuzzPyprojectScan(f *testing.F) {
 	for _, seed := range []string{
 		"[project]\nname = \"a\"\n",
@@ -22,6 +22,10 @@ func FuzzPyprojectScan(f *testing.F) {
 		// The scan once ended this string a quote early and missed the rest
 		// of the line.
 		"b = [\"\"\"y\"\"\"\", " + strings.Repeat("{a=", 80) + "1" + strings.Repeat("}", 80) + "]\n",
+		// Keys whose paths cost the decoder their bytes times their number.
+		"[" + strings.Repeat("a", 128<<10) + "]\n" + strings.Repeat("k0=1\nk1=1\n", 100),
+		strings.Repeat("ab."+strings.Repeat("cd.", 39)+"z=1\n", 100),
+		"\xef\xbb\xbf[" + strings.Repeat("a", 2000) + "]\nk=1\n",
 	} {
 		f.Add([]byte(seed))
 	}
@@ -29,8 +33,16 @@ func FuzzPyprojectScan(f *testing.F) {
 		if len(b) > maxPyprojectBytes || tomlTooComplex(b) {
 			return
 		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		before := ms.TotalAlloc
 		var doc map[string]any
-		if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
+		_, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc)
+		runtime.ReadMemStats(&ms)
+		if alloc := ms.TotalAlloc - before; alloc > 64<<20+256*uint64(len(b)) {
+			t.Fatalf("decoding %d bytes allocated %d MB: %q", len(b), alloc>>20, b)
+		}
+		if err != nil {
 			return
 		}
 		// Headers, dotted keys, brackets and braces together nest at most

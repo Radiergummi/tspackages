@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
 	"slices"
 	"strings"
 	"time"
@@ -92,8 +91,8 @@ func RefuseTree(entries []gitmirror.TreeEntry) string {
 		paths[e.Path] = true
 	}
 	for _, e := range entries {
-		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
-			if paths[d] {
+		for j := strings.LastIndexByte(e.Path, '/'); j > 0; j = strings.LastIndexByte(e.Path[:j], '/') {
+			if d := e.Path[:j]; paths[d] {
 				return fmt.Sprintf("lists %q more than once (as a file and a directory), which git fsck rejects", d)
 			}
 		}

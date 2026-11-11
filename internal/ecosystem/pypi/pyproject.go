@@ -71,10 +71,13 @@ const (
 var errWorkspaceTooLarge = errors.New("workspace globs or member directories are too many or too long to match")
 
 // pyproject.toml caps: the TOML decoder's time and memory grow
-// quadratically with how deep tables, arrays and dotted keys nest.
+// quadratically with how deep tables, arrays and dotted keys nest, and with
+// the bytes of its keys' paths times their number (see tomlTooComplex).
 const (
-	maxPyprojectBytes = 256 << 10
+	maxPyprojectBytes = 64 << 10 // pandas', among the largest, is 27KB
 	maxTOMLDepth      = 64
+	maxTOMLKeyPath    = 1 << 10
+	maxTOMLKeyCost    = 1 << 20
 )
 
 // DiscoverPackages finds the packages of a repository: the root
@@ -172,7 +175,7 @@ func readPyproject(read func(string) ([]byte, error), p string) (map[string]any,
 		return nil, err
 	}
 	if len(b) > maxPyprojectBytes || tomlTooComplex(b) {
-		return nil, fmt.Errorf("%s: %w: over %d bytes, or tables, arrays and dotted keys nested more than %d deep", p, errBadPyproject, maxPyprojectBytes, maxTOMLDepth)
+		return nil, fmt.Errorf("%s: %w: over %d bytes, or keys nested deeper than %d levels or with paths too long to decode cheaply", p, errBadPyproject, maxPyprojectBytes, maxTOMLDepth)
 	}
 	var doc map[string]any
 	if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
@@ -328,8 +331,8 @@ func stringList(v any) []string {
 
 // nestedIn reports whether a strict ancestor of d is a member.
 func nestedIn(d string, isMember map[string]bool) bool {
-	for a := path.Dir(d); a != "." && a != "/"; a = path.Dir(a) {
-		if isMember[a] {
+	for j := strings.LastIndexByte(d, '/'); j > 0; j = strings.LastIndexByte(d[:j], '/') {
+		if isMember[d[:j]] {
 			return true
 		}
 	}
@@ -358,24 +361,35 @@ func matchable(globs, dirs []string) bool {
 	return globBytes*dirBytes <= maxMatchWork
 }
 
-// tomlTooComplex reports whether b, read outside strings and comments,
-// nests tables, arrays and dotted keys more than maxTOMLDepth levels deep in
-// all: a table header's segments, each open "[" or "{" with the dotted
-// segments of the key it is the value of, and the key being read. It scans
-// b once.
+// tomlTooComplex reports whether decoding b would cost the TOML decoder
+// more than the caps allow. Read outside strings and comments:
+//
+//   - Tables, arrays and dotted keys may nest at most maxTOMLDepth levels in
+//     all: a table header's segments, each open "[" or "{" with the dotted
+//     segments of the key it is the value of, and the key being read.
+//   - The decoder keys every key and every dotted prefix by its full path
+//     (the header's, the enclosing inline tables' keys' and the key's own
+//     bytes): a path may be at most maxTOMLKeyPath bytes, and all of them
+//     together, a prefix counted at its key's full length, maxTOMLKeyCost.
+//
+// A leading byte order mark is skipped, as the decoder does. It scans b once.
 func tomlTooComplex(b []byte) bool {
-	var open []int // per open "[" or "{": the dotted segments of its key
-	sum := 0       // of open
-	header := 0    // levels of the current table header
+	b = stripBOM(b)
+	type key struct{ dots, bytes int } // dotted segments - 1, and bytes
+	var open []key                     // per open "[" or "{": its key
+	var sum key                        // of open
+	var header key                     // the current table header; dots+1 levels
+	headerLevels := 0
+	var k, cur key // the key before "=" at this level, and what was read since
+	cost := 0
 	inHeader, lineStart := false, true
-	key, dots := 0, 0 // segments of the key before "=", dots read since
 	for i := 0; i < len(b); i++ {
 		c := b[i]
 		switch c {
 		case ' ', '\t', '\r':
 			continue
 		case '\n':
-			key, dots, lineStart = 0, 0, true
+			k, cur, lineStart = key{}, key{}, true
 			continue
 		case '#':
 			for i+1 < len(b) && b[i+1] != '\n' {
@@ -383,38 +397,63 @@ func tomlTooComplex(b []byte) bool {
 			}
 			continue
 		case '"', '\'':
-			i = stringEnd(b, i)
+			j := stringEnd(b, i)
+			cur.bytes += j - i + 1
+			i = j
 		case '[', '{':
 			if c == '[' && lineStart && len(open) == 0 {
-				inHeader, header = true, 0
+				inHeader, header, headerLevels = true, key{}, 0
 			}
-			open = append(open, key)
-			sum += key
-			key, dots = 0, 0
+			open = append(open, k)
+			sum.dots, sum.bytes = sum.dots+k.dots, sum.bytes+k.bytes
+			k, cur = key{}, key{}
 		case ']', '}':
 			if n := len(open); n > 0 {
-				sum -= open[n-1]
+				sum.dots, sum.bytes = sum.dots-open[n-1].dots, sum.bytes-open[n-1].bytes
 				open = open[:n-1]
 			}
 			if inHeader && len(open) == 0 {
-				inHeader, header = false, dots+1
+				inHeader, header, headerLevels = false, cur, cur.dots+1
+				if header.bytes > maxTOMLKeyPath {
+					return true
+				}
+				cost += headerLevels * header.bytes
 			}
 			if !inHeader {
-				key, dots = 0, 0
+				k, cur = key{}, key{}
 			}
 		case '.':
-			dots++
+			cur.dots++
+			cur.bytes++
 		case '=':
-			key, dots = dots, 0
+			k, cur = cur, key{}
+			path := header.bytes + sum.bytes + k.bytes
+			if path > maxTOMLKeyPath {
+				return true
+			}
+			cost += (k.dots + 1) * path
 		case ',':
-			key, dots = 0, 0
+			k, cur = key{}, key{}
+		default:
+			cur.bytes++
 		}
 		lineStart = false
-		if header+len(open)+sum+max(key, dots) > maxTOMLDepth {
+		if headerLevels+len(open)+sum.dots+max(k.dots, cur.dots) > maxTOMLDepth || cost > maxTOMLKeyCost {
 			return true
 		}
 	}
 	return false
+}
+
+// stripBOM drops a leading UTF-8 or UTF-16 byte order mark.
+func stripBOM(b []byte) []byte {
+	switch {
+	case bytes.HasPrefix(b, []byte("\xef\xbb\xbf")):
+		return b[3:]
+	case bytes.HasPrefix(b, []byte("\xff\xfe")), bytes.HasPrefix(b, []byte("\xfe\xff")):
+		return b[2:]
+	}
+	return b
 }
 
 // stringEnd returns the index of the last quote of the TOML string opening

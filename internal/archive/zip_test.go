@@ -221,6 +221,7 @@ func TestDropSymlinksRefusesAmbiguousNames(t *testing.T) {
 		"dir then file": makeZip(t, entry{name: "src/", mode: fs.ModeDir | 0o755}, entry{name: "src", body: "x"}),
 		"file then dir": makeZip(t, entry{name: "src", body: "x"}, entry{name: "src/", mode: fs.ModeDir | 0o755}),
 		"long name":     makeZip(t, entry{name: strings.Repeat("d/", 3000) + "x", body: "x"}),
+		"deep name":     makeZip(t, entry{name: strings.Repeat("d/", 300) + "x", body: "x"}),
 	} {
 		if _, _, err := DropSymlinks(in); !errors.As(err, new(*Error)) {
 			t.Errorf("%s: err = %v", name, err)

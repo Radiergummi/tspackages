@@ -150,9 +150,12 @@ func FindFile(zr *zip.Reader, name string) (*zip.File, error) {
 	return nil, ErrNotFound
 }
 
-// maxNameBytes caps an entry name in a built archive, as git trees are
-// listed with paths of at most 4KiB.
-const maxNameBytes = 4 << 10
+// maxNameBytes and maxNameDepth cap an entry name in a built archive, as
+// git trees are listed with paths of at most 4KiB and 256 levels.
+const (
+	maxNameBytes = 4 << 10
+	maxNameDepth = 256
+)
 
 // DropSymlinks returns data without its symlink entries and the names it
 // dropped. Data without symlinks is returned as is; otherwise the other
@@ -168,8 +171,8 @@ func DropSymlinks(data []byte) ([]byte, []string, error) {
 	files := make(map[string]bool, len(zr.File)) // names of file entries
 	dirs := map[string]bool{}
 	for _, f := range zr.File {
-		if len(f.Name) > maxNameBytes {
-			return nil, nil, reject("archive entry name over %d bytes", maxNameBytes)
+		if len(f.Name) > maxNameBytes || strings.Count(f.Name, "/") > maxNameDepth {
+			return nil, nil, reject("archive entry name over %d bytes or %d levels deep", maxNameBytes, maxNameDepth)
 		}
 		name := strings.TrimSuffix(f.Name, "/")
 		switch {
@@ -180,12 +183,12 @@ func DropSymlinks(data []byte) ([]byte, []string, error) {
 		default:
 			files[name] = true
 		}
-		for d := path.Dir(name); d != "." && d != "/"; d = path.Dir(d) {
-			dirs[d] = true
+		for j := strings.LastIndexByte(name, '/'); j > 0; j = strings.LastIndexByte(name[:j], '/') {
+			dirs[name[:j]] = true
 		}
 	}
-	for name, file := range files {
-		if file && dirs[name] {
+	for _, f := range zr.File { // in archive order, so the name reported is the same each time
+		if name := f.Name; files[name] && dirs[name] {
 			return nil, nil, reject("archive has %q as a file and a directory", name)
 		}
 	}

@@ -234,7 +234,13 @@ func TestPyprojectShapeLimits(t *testing.T) {
 		"extra literal quotes": head + "b = ['''y''''', " + strings.Repeat("{a=", 200) + "1" + strings.Repeat("}", 200) + "]\n",
 		// Dotted keys inside nested inline tables add up.
 		"dotted keys in inline tables": head + "x = " + strings.Repeat("{"+strings.Repeat("a.", 30)+"a=", 30) + "1" + strings.Repeat("}", 30) + "\n",
-		"size":                         head + "# " + strings.Repeat("x", 300<<10) + "\n",
+		"size":                         head + "# " + strings.Repeat("x", 65<<10) + "\n",
+		// The decoder keys every key and dotted prefix by its full path.
+		"long key path":   head + "[" + strings.Repeat("a", 1100) + "]\nk = 1\n",
+		"key path cost":   head + "[" + strings.Repeat("a", 1000) + "]\n" + manyLines(2000, func(i int) string { return fmt.Sprintf("k%04x = 1", i) }),
+		"dotted key cost": head + manyLines(300, func(i int) string { return strings.Repeat(fmt.Sprintf("k%03x.", i), 39) + "z = 1" }),
+		// The decoder skips a byte order mark, so a header after it is one.
+		"BOM": "\xef\xbb\xbf[" + strings.Repeat("a", 1100) + "]\nk = 1\n" + head,
 	} {
 		t.Run(name, func(t *testing.T) {
 			start := time.Now()
@@ -302,4 +308,12 @@ func TestPKGINFOCarriageReturn(t *testing.T) {
 	if strings.Contains(string(out), "\r") || !strings.Contains(string(out), "Summary: one License: evil\n") {
 		t.Fatalf("PKG-INFO = %q", out)
 	}
+}
+
+func manyLines(n int, line func(int) string) string {
+	var sb strings.Builder
+	for i := range n {
+		sb.WriteString(line(i) + "\n")
+	}
+	return sb.String()
 }

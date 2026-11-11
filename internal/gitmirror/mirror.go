@@ -585,21 +585,24 @@ func checkPath(p string) error {
 const MaxTreeEntries = 100_000
 
 // ErrTreeTooLarge is wrapped by ListTree for a tree with more than
-// MaxTreeEntries entries, a path over MaxTreePath bytes or a listing over
-// maxTreeListing bytes.
+// MaxTreeEntries entries, a path over MaxTreePath bytes or MaxTreeDepth
+// levels, or a listing over maxTreeListing bytes.
 var ErrTreeTooLarge = errors.New("tree too large to list")
 
 // MaxTreePath caps a ListTree path, which ls-tree repeats in full for every
-// entry under it, and maxTreeListing the whole listing.
+// entry under it, MaxTreeDepth its levels, and maxTreeListing the whole
+// listing.
 const (
 	MaxTreePath    = 4 << 10
+	MaxTreeDepth   = 256
 	maxTreeListing = 64 << 20
 )
 
 // ListTree lists every file, symlink and submodule under dir ("" = the whole
 // tree) at commit, with paths from the repository root. The listing is parsed
 // while git writes it and stops at MaxTreeEntries, a path over MaxTreePath
-// or a listing over maxTreeListing bytes (ErrTreeTooLarge).
+// bytes or MaxTreeDepth levels, or a listing over maxTreeListing bytes
+// (ErrTreeTooLarge).
 func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
@@ -660,6 +663,8 @@ func (tp *treeParser) Write(b []byte) (int, error) {
 			tp.err = fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
 		case len(p) > MaxTreePath:
 			tp.err = fmt.Errorf("gitmirror: %w: a path over %d bytes", ErrTreeTooLarge, MaxTreePath)
+		case strings.Count(p, "/") >= MaxTreeDepth:
+			tp.err = fmt.Errorf("gitmirror: %w: a path over %d levels", ErrTreeTooLarge, MaxTreeDepth)
 		case len(tp.entries) == MaxTreeEntries:
 			tp.err = fmt.Errorf("gitmirror: %w: more than %d entries", ErrTreeTooLarge, MaxTreeEntries)
 		}

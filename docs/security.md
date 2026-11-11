@@ -16,15 +16,16 @@ tailnet. Read this before you deploy.
 - **How it holds.** Content that can't be served is refused, reported on the
   status page and remembered for the commit, never retried as if it were an
   outage. The caps behind this for `git` sources: trees of at most 100,000
-  entries, paths of at most 4KiB and a tree listing of at most 64MiB, files
-  read whole of at most 1MiB, a `pyproject.toml` of at most 256KiB whose
-  table headers, `[`/`{` nesting and dotted keys nest at most 64 levels deep
-  in all, at most 1,000 workspace members and globs (globs and member
+  entries, paths of at most 4KiB and 256 levels and a tree listing of at
+  most 64MiB, files read whole of at most 1MiB, a `pyproject.toml` of at
+  most 64KiB whose table headers, `[`/`{` nesting and dotted keys nest at
+  most 64 levels deep in all and whose key paths, which the TOML decoder
+  stores in full for every key and dotted prefix, are at most 1KiB each and
+  1MiB in all, at most 1,000 workspace members and globs (globs and member
   directories of at most 4KiB), no nested members, no path listed twice or
   as both file and directory, and git archives held in memory up to
   `max_artifact_bytes` (512MiB at most). Finding a version's earliest tag
   takes at most two ancestry checks per commit.
-
 
 ## Identity
 

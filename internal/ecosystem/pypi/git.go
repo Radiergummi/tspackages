@@ -329,7 +329,8 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	}
 	tree, err := m.ListTree(ctx, commit, "")
 	if errors.Is(err, gitmirror.ErrTreeTooLarge) {
-		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree is too large to list (more than %d entries or a path over 1MiB)", gitmirror.MaxTreeEntries)), nil
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree is too large to list (more than %d entries, a path over %d bytes or %d levels, or a listing over 64MiB)",
+			gitmirror.MaxTreeEntries, gitmirror.MaxTreePath, gitmirror.MaxTreeDepth)), nil
 	}
 	if err != nil {
 		return nil, err
@@ -403,11 +404,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		if isRelease(p) {
 			entries := entries[i]
 			var attrs []gitmirror.TreeEntry // the ancestor directories' attributes
-			for d := p.Dir; d != ""; {
-				if d = path.Dir(d); d == "." {
-					d = ""
-				}
-				attrs = append(attrs, attrsAt[d]...)
+			for j := len(p.Dir); j > 0; {
+				j = max(strings.LastIndexByte(p.Dir[:j], '/'), 0)
+				attrs = append(attrs, attrsAt[p.Dir[:j]]...)
 			}
 			c.refused = cmp.Or(p.Skip, RefuseTree(append(slices.Clone(entries), attrs...)))
 			if c.refused == "" && !keysFit(SdistFilename(p.Name, p.Version)) {
@@ -475,7 +474,8 @@ func groupTree(tree []gitmirror.TreeEntry, pkgs []Package) ([][]gitmirror.TreeEn
 			attrsAt[d] = append(attrsAt[d], e)
 		}
 		inMember := false
-		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
+		for j := strings.LastIndexByte(e.Path, '/'); j > 0; j = strings.LastIndexByte(e.Path[:j], '/') {
+			d := e.Path[:j]
 			inMember = inMember || rootExclude[d]
 			for _, i := range byDir[d] {
 				entries[i] = append(entries[i], e)
