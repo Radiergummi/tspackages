@@ -1,6 +1,7 @@
 package pypi
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -1292,5 +1293,52 @@ func TestBadCommitTimeRefused(t *testing.T) {
 			index(t, g)
 			assertRefused(t, g, "acme-core", "commit time")
 		})
+	}
+}
+
+// TestDuplicatePyprojectRefused: a tree listing pyproject.toml twice would
+// give PKG-INFO from one entry and the sdist the other; it is refused.
+func TestDuplicatePyprojectRefused(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	first := testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")
+	second := gitStdin(t, r.dir, pyproject("acme-core", "1.0.0")+"# other\n", "hash-object", "-w", "--stdin")
+	raw := "100644 pyproject.toml\x00" + unhex(first) + "100644 pyproject.toml\x00" + unhex(second)
+	tagTree(t, r, gitStdin(t, r.dir, raw, "hash-object", "-t", "tree", "-w", "--stdin", "--literally"), "v1")
+	g := newGitEnv(t).source(t, nil, r.dir)
+	index(t, g)
+	assertRefused(t, g, "acme-core", "more than once")
+}
+
+// TestManyTagsOneVersion: the earliest of many tags for one version is
+// found with a linear number of ancestry checks.
+func TestManyTagsOneVersion(t *testing.T) {
+	r := newRepo(t)
+	const n = 120
+	for i := range n {
+		r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "a.py": fmt.Sprint(i)})
+		r.tag(fmt.Sprintf("t%03d", n-i)) // the earliest commit has the last tag name
+	}
+	g := newGitEnv(t).source(t, nil, r.dir)
+	start := time.Now()
+	index(t, g)
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("pass took %v", d)
+	}
+	tr := tar.NewReader(bytes.NewReader(gunzip(t, sdistBytes(t, g, "acme-core", "acme_core-1.0.0.tar.gz"))))
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatalf("no a.py: %v", err)
+		}
+		if strings.HasSuffix(h.Name, "/a.py") {
+			if b, _ := io.ReadAll(tr); string(b) != "0" {
+				t.Fatalf("a.py = %q, want the earliest commit's", b)
+			}
+			break
+		}
+	}
+	if c := g.Conflicts(); len(c) != 1 || len(c[0].Tags) != n-1 {
+		t.Fatalf("conflicts = %+v", c)
 	}
 }

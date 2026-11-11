@@ -3,6 +3,27 @@
 tspackages authorizes by Tailscale identity and is only as strict as your
 tailnet. Read this before you deploy.
 
+## Threat model
+
+- **Who is trusted.** Tailnet identities, for what the grants give them, and
+  anyone who can push to a configured git remote, to publish code: they could
+  publish anything anyway.
+- **What holds regardless.** No push, accidental or malicious, may change
+  the bytes of a published release, make served metadata disagree with the
+  artifact it describes, or crash the process, run it out of memory or make
+  it crash on every start. A push may make an index pass slow, within
+  minutes, not hours.
+- **How it holds.** Content that can't be served is refused, reported on the
+  status page and remembered for the commit, never retried as if it were an
+  outage. The caps behind this for `git` sources: trees of at most 100,000
+  entries and paths of at most 1MiB, files read whole of at most 1MiB, a
+  `pyproject.toml` of at most 256KiB with `[`/`{` nesting and dotted keys
+  of at most 64, at most 1,000 workspace members and globs (globs and member
+  directories of at most 4KiB), no nested members, no path listed twice
+  or as both file and directory, and git archives held in memory up to
+  `max_artifact_bytes` (512MiB at most). Finding a version's earliest tag
+  takes at most two ancestry checks per commit.
+
 ## Identity
 
 - **Any process on a node has that node's rights.** A tagged CI node's

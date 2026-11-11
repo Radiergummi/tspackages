@@ -681,3 +681,38 @@ func TestTreePathValidation(t *testing.T) {
 		t.Error("non-sha commit accepted")
 	}
 }
+
+// TestDecomposedPaths: a path stored in NFD (as on Linux) is read and
+// archived as listed; git on macOS would otherwise precompose it into a
+// path the tree does not have.
+func TestDecomposedPaths(t *testing.T) {
+	src := makeRepo(t)
+	run := func(in string, args ...string) string {
+		cmd := exec.Command("git", append([]string{"-c", "commit.gpgsign=false"}, args...)...)
+		cmd.Dir, cmd.Stdin = src, strings.NewReader(in)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@example.com")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	dir := "pkg/é" // NFD
+	blob := run("x\n", "hash-object", "-w", "--stdin")
+	inner := run("100644 blob "+blob+"\tx.py\n", "mktree")
+	mid := run("040000 tree "+inner+"\té\n", "mktree")
+	top := run("040000 tree "+mid+"\tpkg\n", "mktree")
+	commit := run("", "commit-tree", "-m", "nfd", top)
+	run("", "update-ref", "refs/tags/nfd", commit)
+	m := newMirror(t, src)
+	if b, err := m.ReadFile(context.Background(), commit, dir+"/x.py"); err != nil || string(b) != "x\n" {
+		t.Fatalf("ReadFile: %q %v", b, err)
+	}
+	var buf bytes.Buffer
+	if err := m.ArchiveTar(context.Background(), commit, []string{dir}, &buf); err != nil {
+		t.Fatalf("ArchiveTar: %v", err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte(dir+"/x.py")) {
+		t.Fatal("archive lacks the file")
+	}
+}

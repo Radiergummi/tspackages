@@ -369,14 +369,32 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		}
 		return b, err
 	}
-	pkgs, err := DiscoverPackages(read, dirs)
-	if errors.Is(err, errTooManyPyprojects) {
+	pkgs, err := DiscoverPackages(ctx, read, dirs)
+	switch {
+	case errors.Is(err, errTooManyPyprojects):
 		return g.refuseCommit(key, m, commit, fmt.Sprintf("discovery would read more than %d pyproject.toml files", maxPyprojects)), nil
-	}
-	if err != nil {
+	case errors.Is(err, errWorkspaceTooLarge):
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("workspace has more than %d globs, or a glob or member directory over %d bytes, or too many to match", maxGlobs, maxGlobBytes)), nil
+	case err != nil:
 		return nil, err
 	}
 	entries, attrsAt := groupTree(tree, pkgs)
+	// Packages share no entries, so this only guards the shapes that would
+	// let them (Identity, RefuseTree and lfsRefusal walk each package's).
+	if total := sumLen(entries); total > gitmirror.MaxTreeEntries {
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("packages hold %d entries in all, more than %d", total, gitmirror.MaxTreeEntries)), nil
+	}
+	// Each .gitattributes is read once per commit, however many packages
+	// it is an ancestor of.
+	lfsMemo := map[string]lfsResult{}
+	lfsCheck := func(p string) (string, error) {
+		r, ok := lfsMemo[p]
+		if !ok {
+			r.reason, r.err = lfsFileRefusal(read, p)
+			lfsMemo[p] = r
+		}
+		return r.reason, r.err
+	}
 	var out []candidate
 	for i, p := range pkgs {
 		c := candidate{pkg: p, remote: m, commit: commit}
@@ -391,12 +409,12 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 				}
 				attrs = append(attrs, attrsAt[d]...)
 			}
-			c.refused = cmp.Or(p.Skip, RefuseTree(entries))
+			c.refused = cmp.Or(p.Skip, RefuseTree(append(slices.Clone(entries), attrs...)))
 			if c.refused == "" && !keysFit(SdistFilename(p.Name, p.Version)) {
 				c.refused = "name and version are too long for the store's keys"
 			}
 			if c.refused == "" {
-				if c.refused, err = lfsRefusal(read, append(slices.Clone(attrs), entries...)); err != nil {
+				if c.refused, err = lfsRefusal(lfsCheck, append(slices.Clone(attrs), entries...)); err != nil {
 					return nil, err // unread this pass, and not cached
 				}
 			}
@@ -476,24 +494,46 @@ func groupTree(tree []gitmirror.TreeEntry, pkgs []Package) ([][]gitmirror.TreeEn
 // .gitattributes files among entries routes files through Git LFS or
 // cannot be checked, or "". git ignores a symlinked .gitattributes, and so
 // does this. An error is a read that failed.
-func lfsRefusal(read func(string) ([]byte, error), entries []gitmirror.TreeEntry) (string, error) {
+func lfsRefusal(check func(path string) (string, error), entries []gitmirror.TreeEntry) (string, error) {
 	for _, e := range entries {
 		if path.Base(e.Path) != ".gitattributes" {
 			continue
 		}
-		b, err := read(e.Path)
-		switch {
-		case errors.Is(err, errNotRegular):
-			continue
-		case errors.Is(err, gitmirror.ErrTooLarge), errors.Is(err, errBadPath):
-			return fmt.Sprintf("%q cannot be checked for Git LFS (over 1MiB or an unreadable path)", e.Path), nil
-		case err != nil:
-			return "", err
-		case bytes.Contains(b, []byte("filter=lfs")):
-			return "uses Git LFS (filter=lfs), which an sdist cannot resolve", nil
+		if reason, err := check(e.Path); reason != "" || err != nil {
+			return reason, err
 		}
 	}
 	return "", nil
+}
+
+// lfsResult is what lfsFileRefusal found for one file.
+type lfsResult struct {
+	reason string
+	err    error
+}
+
+// lfsFileRefusal is lfsRefusal for the .gitattributes file at p.
+func lfsFileRefusal(read func(string) ([]byte, error), p string) (string, error) {
+	b, err := read(p)
+	switch {
+	case errors.Is(err, errNotRegular):
+		return "", nil
+	case errors.Is(err, gitmirror.ErrTooLarge), errors.Is(err, errBadPath):
+		return fmt.Sprintf("%q cannot be checked for Git LFS (over 1MiB or an unreadable path)", p), nil
+	case err != nil:
+		return "", err
+	case bytes.Contains(b, []byte("filter=lfs")):
+		return "uses Git LFS (filter=lfs), which an sdist cannot resolve", nil
+	}
+	return "", nil
+}
+
+func sumLen[T any](xss [][]T) int {
+	n := 0
+	for _, xs := range xss {
+		n += len(xs)
+	}
+	return n
 }
 
 func inPackage(p, dir string) bool { return dir == "" || strings.HasPrefix(p, dir+"/") }
@@ -652,25 +692,46 @@ func differing(name string, cs []candidate, served, kind string) *Conflict {
 // candidate's commit (ties: the first tag by name), or nil when the
 // candidates with differing contents have no common first. An error is an
 // ancestry git could not decide.
+//
+// It asks git at most twice per distinct commit: a pass that keeps the
+// earliest commit seen so far (if there is a first commit, it ends up kept,
+// as nothing else precedes it), then a pass confirming that commit precedes
+// all others.
 func (g *GitSource) earliest(ctx context.Context, cs []candidate) (*candidate, error) {
-	for i := range cs {
-		first := true
-		for j := range cs {
-			if i == j || cs[i].commit == cs[j].commit {
-				continue
-			}
-			ok, err := cs[i].remote.IsAncestor(ctx, cs[i].commit, cs[j].commit)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				first = false
-				break
-			}
+	var distinct []int // the first candidate (by tag) of each commit
+	seen := map[string]bool{}
+	for i, c := range cs {
+		if !seen[c.commit] {
+			seen[c.commit] = true
+			distinct = append(distinct, i)
 		}
-		if first {
-			return &cs[i], nil
+	}
+	first := distinct[0]
+	for _, i := range distinct[1:] {
+		ok, err := cs[i].remote.IsAncestor(ctx, cs[i].commit, cs[first].commit)
+		if err != nil {
+			return nil, err
 		}
+		if ok {
+			first = i
+		}
+	}
+	precedesAll := true
+	for _, i := range distinct {
+		if i == first {
+			continue
+		}
+		ok, err := cs[first].remote.IsAncestor(ctx, cs[first].commit, cs[i].commit)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			precedesAll = false
+			break
+		}
+	}
+	if precedesAll {
+		return &cs[first], nil
 	}
 	// No common first commit: fine if every candidate has the same content.
 	if len(uniq(cs, func(c candidate) string { return c.identity })) == 1 {

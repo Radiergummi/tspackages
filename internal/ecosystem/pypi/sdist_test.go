@@ -217,3 +217,38 @@ func TestRefuseSubmodules(t *testing.T) {
 		t.Errorf("submodule: %q", r)
 	}
 }
+
+// TestRefuseAmbiguousPaths: a path listed twice, or both a file and a
+// directory, has no single content, so metadata could disagree with the
+// sdist.
+func TestRefuseAmbiguousPaths(t *testing.T) {
+	for name, entries := range map[string][]gitmirror.TreeEntry{
+		"duplicate":        {{Type: "blob", Path: "pyproject.toml"}, {Type: "blob", Path: "pyproject.toml"}},
+		"file and dir":     {{Type: "blob", Path: "a"}, {Type: "blob", Path: "a/b"}},
+		"file and dir too": {{Type: "blob", Path: "x/a/b/c"}, {Type: "blob", Path: "x/a"}},
+	} {
+		if r := RefuseTree(entries); !strings.Contains(r, "more than once") {
+			t.Errorf("%s: %q", name, r)
+		}
+	}
+	if r := RefuseTree([]gitmirror.TreeEntry{{Type: "blob", Path: "a/b"}, {Type: "blob", Path: "a/c"}, {Type: "blob", Path: "ab"}}); r != "" {
+		t.Errorf("plain tree refused: %q", r)
+	}
+}
+
+// TestSdistRefusesDuplicateEntries: a git archive with a name twice is
+// refused rather than built with one of them.
+func TestSdistRefusesDuplicateEntries(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, body := range []string{"one", "two"} {
+		tw.WriteHeader(&tar.Header{Name: "a.py", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body))})
+		tw.Write([]byte(body))
+	}
+	tw.Close()
+	v, _ := ParseVersion("1.0")
+	_, err := BuildSdist(&buf, Package{Name: "a", Version: v}, []byte("Metadata-Version: 2.2\n"), time.Unix(1700000000, 0))
+	if !errors.As(err, new(*RefusedError)) {
+		t.Fatalf("err = %v", err)
+	}
+}

@@ -23,6 +23,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entries or a path over 1MiB, or whose workspace has more than 1,000
   members, and lists it on the status page; it no longer reads such trees
   whole. A release refused while building isn't built again until restart.
+- A PyPI `git` source also refuses a `pyproject.toml` over 256KiB or with
+  `[`/`{` nesting or dotted keys deeper than 64, a workspace member nested in
+  another, a workspace with more than 1,000 globs or a glob or member
+  directory over 4KiB, and a path listed twice or as both a file and a
+  directory. Composer `git` archives with such a path are refused too.
+  docs/security.md describes the threat model these caps enforce.
 - A registry archive whose bytes differ from the ones first fetched for the
   same version and reference is logged at warn and listed on the status page.
   Packagist declares no checksum for most GitHub archives, so this is the

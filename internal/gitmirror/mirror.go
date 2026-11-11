@@ -474,6 +474,9 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 		"-c", "credential.helper=",
 		"-c", "gc.auto=0",
 		"-c", "maintenance.auto=false",
+		// Paths go to git as the tree lists them; on macOS git would
+		// otherwise turn a decomposed (NFD) path into one the tree lacks.
+		"-c", "core.precomposeunicode=false",
 	}
 	if gitDir != "" {
 		full = append(full, "--git-dir="+gitDir)

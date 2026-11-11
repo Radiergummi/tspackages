@@ -1,10 +1,13 @@
 package pypi
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -41,7 +44,7 @@ const buildSystem = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend =
 
 func discover(t *testing.T, tr tree) []Package {
 	t.Helper()
-	pkgs, err := DiscoverPackages(tr.read, tr.dirs())
+	pkgs, err := DiscoverPackages(context.Background(), tr.read, tr.dirs())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,15 +125,15 @@ func TestDiscoverReadErrors(t *testing.T) {
 		}
 	}
 	for _, p := range []string{"pyproject.toml", "README.md"} {
-		if pkgs, err := DiscoverPackages(failing(p, fmt.Errorf("git cat-file: exit status 128")), nil); err == nil {
+		if pkgs, err := DiscoverPackages(context.Background(), failing(p, fmt.Errorf("git cat-file: exit status 128")), nil); err == nil {
 			t.Errorf("unreadable %s: %+v", p, pkgs)
 		}
 	}
-	pkgs, err := DiscoverPackages(failing("README.md", fmt.Errorf("%w: README.md", errNotRegular)), nil)
+	pkgs, err := DiscoverPackages(context.Background(), failing("README.md", fmt.Errorf("%w: README.md", errNotRegular)), nil)
 	if err != nil || len(pkgs) != 1 || !strings.Contains(pkgs[0].Skip, "regular file") {
 		t.Errorf("symlinked readme: %+v %v", pkgs, err)
 	}
-	pkgs, err = DiscoverPackages(failing("README.md", fmt.Errorf("x: %w", gitmirror.ErrTooLarge)), nil)
+	pkgs, err = DiscoverPackages(context.Background(), failing("README.md", fmt.Errorf("x: %w", gitmirror.ErrTooLarge)), nil)
 	if err != nil || len(pkgs) != 1 || !strings.Contains(pkgs[0].Skip, "larger than") {
 		t.Errorf("large readme: %+v %v", pkgs, err)
 	}
@@ -210,5 +213,87 @@ func TestWritePKGINFODynamicExtrasOnly(t *testing.T) {
 	}
 	if staticMetadata(distribution{sdist: true}, m) {
 		t.Fatal("metadata with dynamic extras is offered as static")
+	}
+}
+
+// TestPyprojectShapeLimits: a pyproject.toml whose nesting or key segments
+// would make the TOML decoder take time and memory quadratic in its size,
+// or one over the size cap, is refused quickly; brackets, braces and dots
+// inside strings and comments do not count.
+func TestPyprojectShapeLimits(t *testing.T) {
+	head := "[project]\nname = \"a\"\nversion = \"1\"\n"
+	const n = 10000
+	for name, src := range map[string]string{
+		"inline tables": head + "x = " + strings.Repeat("{a=", n) + "1" + strings.Repeat("}", n) + "\n",
+		"arrays":        head + "x = " + strings.Repeat("[", n) + strings.Repeat("]", n) + "\n",
+		"dotted header": head + "[" + strings.Repeat("a.", n) + "a]\n",
+		"dotted key":    head + strings.Repeat("a.", n) + "a = 1\n",
+		"size":          head + "# " + strings.Repeat("x", 300<<10) + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			pkgs, err := DiscoverPackages(context.Background(), tree{"pyproject.toml": src + buildSystem}.read, nil)
+			if err != nil || len(pkgs) != 1 || pkgs[0].Skip != skipBadPyproject {
+				t.Fatalf("%+v %v", pkgs, err)
+			}
+			if d := time.Since(start); d > time.Second {
+				t.Fatalf("took %v", d)
+			}
+		})
+	}
+	quoted := head + "description = \"" + strings.Repeat("[{a.", 200) + "\"\n" +
+		"keywords = ['''" + strings.Repeat("{[.", 200) + "''']\n" +
+		"# " + strings.Repeat("[{.", 200) + "\n" + buildSystem
+	if pkgs := discover(t, tree{"pyproject.toml": quoted}); len(pkgs) != 1 || pkgs[0].Skip != "" {
+		t.Fatalf("strings and comments counted: %+v", pkgs)
+	}
+}
+
+// TestNestedMemberRefused: a workspace member inside another member is
+// refused, as uv does; it would otherwise share the outer member's entries.
+func TestNestedMemberRefused(t *testing.T) {
+	pkgs := discover(t, tree{
+		"pyproject.toml":                  "[tool.uv.workspace]\nmembers = [\"packages/*\", \"packages/a/*\"]\n",
+		"packages/a/pyproject.toml":       pyproject("acme-a", "1.0.0"),
+		"packages/a/inner/pyproject.toml": pyproject("acme-inner", "1.0.0"),
+	})
+	skips := map[string]string{}
+	for _, p := range pkgs {
+		skips[p.Dir] = p.Skip
+	}
+	if skips["packages/a"] != "" || !strings.Contains(skips["packages/a/inner"], "nested") {
+		t.Fatalf("packages = %+v", pkgs)
+	}
+}
+
+// TestWorkspaceGlobLimits: globs and directories past the matching caps
+// refuse the commit instead of being matched pairwise.
+func TestWorkspaceGlobLimits(t *testing.T) {
+	many := "[tool.uv.workspace]\nmembers = [" + strings.Repeat("\"x/*\", ", 1001) + "]\n"
+	long := "[tool.uv.workspace]\nmembers = [\"" + strings.Repeat("*a", 2100) + "\"]\n"
+	deep := strings.Repeat("d/", 2100) + "p"
+	for name, tr := range map[string]tree{
+		"many globs": {"pyproject.toml": many, "x/a/pyproject.toml": pyproject("a", "1")},
+		"long glob":  {"pyproject.toml": long, "x/a/pyproject.toml": pyproject("a", "1")},
+		"long dir":   {"pyproject.toml": "[tool.uv.workspace]\nmembers = [\"*\"]\n", deep + "/pyproject.toml": pyproject("a", "1")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DiscoverPackages(context.Background(), tr.read, tr.dirs()); !errors.Is(err, errWorkspaceTooLarge) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+// TestPKGINFOCarriageReturn: a bare "\r" in a field would end the header
+// for Python's email parser.
+func TestPKGINFOCarriageReturn(t *testing.T) {
+	tr := tree{"pyproject.toml": "[project]\nname = \"a\"\nversion = \"1\"\ndescription = \"one\\rLicense: evil\"\n" + buildSystem}
+	out, err := WritePKGINFO(discover(t, tr)[0], tr.read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "\r") || !strings.Contains(string(out), "Summary: one License: evil\n") {
+		t.Fatalf("PKG-INFO = %q", out)
 	}
 }

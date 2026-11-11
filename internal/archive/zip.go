@@ -153,11 +153,28 @@ func FindFile(zr *zip.Reader, name string) (*zip.File, error) {
 // DropSymlinks returns data without its symlink entries and the names it
 // dropped. Data without symlinks is returned as is; otherwise the other
 // entries are copied unchanged (still compressed) in their order, with the
-// archive comment, so the result is deterministic.
+// archive comment, so the result is deterministic. An archive naming a path
+// twice, or as a file and as a directory, is refused: it has no single
+// content for that path.
 func DropSymlinks(data []byte) ([]byte, []string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, nil, reject("not a valid zip archive")
+	}
+	files := make(map[string]bool, len(zr.File))
+	for _, f := range zr.File {
+		name := strings.TrimSuffix(f.Name, "/")
+		if files[name] {
+			return nil, nil, reject("archive has duplicate entry %q", f.Name)
+		}
+		files[name] = !strings.HasSuffix(f.Name, "/")
+	}
+	for _, f := range zr.File {
+		for d := path.Dir(f.Name); d != "." && d != "/"; d = path.Dir(d) {
+			if files[d] {
+				return nil, nil, reject("archive has %q as a file and a directory", d)
+			}
+		}
 	}
 	var dropped []string
 	for _, f := range zr.File {

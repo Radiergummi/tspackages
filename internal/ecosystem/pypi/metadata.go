@@ -55,7 +55,8 @@ func WritePKGINFO(p Package, read func(path string) ([]byte, error)) ([]byte, er
 	var b bytes.Buffer
 	field := func(k, v string) {
 		if v != "" {
-			fmt.Fprintf(&b, "%s: %s\n", k, strings.ReplaceAll(v, "\n", " "))
+			// A bare "\r" ends a header line for Python's email parser too.
+			fmt.Fprintf(&b, "%s: %s\n", k, strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(v))
 		}
 	}
 	field("Metadata-Version", "2.2")

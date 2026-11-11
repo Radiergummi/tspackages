@@ -2,6 +2,7 @@ package pypi
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -24,6 +25,7 @@ const (
 	skipMissingFile  = "readme or license file does not exist"
 	skipNotRegular   = "readme or license file is not a regular file (a symlink?), so the sdist cannot hold it"
 	skipLargeFile    = "readme or license file is larger than 1 MiB"
+	skipNested       = "workspace member nested inside another member, which uv does not allow"
 	skipBadPath      = "path starts with \"-\" or holds a newline, carriage return or NUL, which tspackages does not pass to git"
 	skipBadPyproject = "pyproject.toml does not parse"
 )
@@ -58,6 +60,24 @@ const maxPyprojects = 1000
 
 var errTooManyPyprojects = fmt.Errorf("more than %d pyproject.toml files to read", maxPyprojects)
 
+// Workspace matching caps: each glob is matched against each directory
+// holding a pyproject.toml, at a cost of up to their lengths multiplied.
+const (
+	maxGlobs     = 1000
+	maxGlobBytes = 4 << 10 // a glob, and a candidate directory
+	maxMatchWork = 1e10    // total glob bytes times total directory bytes
+)
+
+var errWorkspaceTooLarge = errors.New("workspace globs or member directories are too many or too long to match")
+
+// pyproject.toml caps: the TOML decoder's time and memory grow
+// quadratically with nesting and with dotted key segments.
+const (
+	maxPyprojectBytes = 256 << 10
+	maxTOMLDepth      = 64
+	maxTOMLSegments   = 64
+)
+
 // DiscoverPackages finds the packages of a repository: the root
 // pyproject.toml's project and, for a uv workspace, each member directory
 // (from dirs, the directories holding a pyproject.toml) with a
@@ -65,9 +85,10 @@ var errTooManyPyprojects = fmt.Errorf("more than %d pyproject.toml files to read
 // an error wrapping resolve.ErrNotFound, errNotRegular, errBadPath or
 // gitmirror.ErrTooLarge, or any other error, which fails the discovery
 // (content problems are Package.Skip instead). More than maxPyprojects
-// files to read is errTooManyPyprojects. A repository without a root
+// files to read is errTooManyPyprojects, workspace globs or directories
+// past the matching caps errWorkspaceTooLarge. A repository without a root
 // pyproject.toml has none.
-func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]Package, error) {
+func DiscoverPackages(ctx context.Context, read func(path string) ([]byte, error), dirs []string) ([]Package, error) {
 	rootDoc, err := readPyproject(read, "pyproject.toml")
 	switch {
 	case errors.Is(err, resolve.ErrNotFound):
@@ -80,7 +101,13 @@ func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]
 	var members []string
 	if ws, ok := table(rootDoc, "tool", "uv", "workspace"); ok {
 		include, exclude := stringList(ws["members"]), stringList(ws["exclude"])
+		if !matchable(append(slices.Clone(include), exclude...), dirs) {
+			return nil, errWorkspaceTooLarge
+		}
 		for _, d := range dirs {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if matchAny(include, d) && !matchAny(exclude, d) {
 				members = append(members, d)
 			}
@@ -89,9 +116,18 @@ func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]
 	if len(members) >= maxPyprojects {
 		return nil, errTooManyPyprojects
 	}
+	isMember := make(map[string]bool, len(members))
+	for _, d := range members {
+		isMember[d] = true
+	}
 	var memberPkgs []Package
 	var memberDirs []string // directories that are members: they hold a pyproject.toml
 	for _, d := range members {
+		if nestedIn(d, isMember) {
+			memberDirs = append(memberDirs, d)
+			memberPkgs = append(memberPkgs, Package{Dir: d, Skip: skipNested})
+			continue
+		}
 		doc, err := readPyproject(read, d+"/pyproject.toml")
 		switch {
 		case errors.Is(err, resolve.ErrNotFound):
@@ -135,6 +171,9 @@ func readPyproject(read func(string) ([]byte, error), p string) (map[string]any,
 	}
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > maxPyprojectBytes || tomlTooComplex(b) {
+		return nil, fmt.Errorf("%s: %w: over %d bytes, or nested or dotted more than %d deep", p, errBadPyproject, maxPyprojectBytes, maxTOMLDepth)
 	}
 	var doc map[string]any
 	if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
@@ -286,6 +325,96 @@ func stringList(v any) []string {
 		}
 	}
 	return out
+}
+
+// nestedIn reports whether a strict ancestor of d is a member.
+func nestedIn(d string, isMember map[string]bool) bool {
+	for a := path.Dir(d); a != "." && a != "/"; a = path.Dir(a) {
+		if isMember[a] {
+			return true
+		}
+	}
+	return false
+}
+
+// matchable reports whether matching globs against dirs stays within the
+// workspace matching caps.
+func matchable(globs, dirs []string) bool {
+	if len(globs) > maxGlobs {
+		return false
+	}
+	var globBytes, dirBytes float64
+	for _, g := range globs {
+		if len(g) > maxGlobBytes {
+			return false
+		}
+		globBytes += float64(len(g))
+	}
+	for _, d := range dirs {
+		if len(d) > maxGlobBytes {
+			return false
+		}
+		dirBytes += float64(len(d))
+	}
+	return globBytes*dirBytes <= maxMatchWork
+}
+
+// tomlTooComplex reports whether b, outside strings and comments, nests "["
+// and "{" deeper than maxTOMLDepth or has a key or table header of
+// maxTOMLSegments or more dotted segments. It scans b once.
+func tomlTooComplex(b []byte) bool {
+	depth, dots := 0, 0
+	for i := 0; i < len(b); i++ {
+		switch c := b[i]; c {
+		case '#':
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+			dots = 0
+		case '"', '\'':
+			i = stringEnd(b, i)
+		case '[', '{':
+			if depth++; depth > maxTOMLDepth {
+				return true
+			}
+			dots = 0
+		case ']', '}':
+			depth--
+		case '.':
+			if dots++; dots >= maxTOMLSegments {
+				return true
+			}
+		case '=', ',', '\n':
+			dots = 0
+		}
+	}
+	return false
+}
+
+// stringEnd returns the index of the last quote of the TOML string opening
+// at b[i] (a basic or literal string, single- or multi-line), or len(b).
+func stringEnd(b []byte, i int) int {
+	q := b[i]
+	if i+2 < len(b) && b[i+1] == q && b[i+2] == q {
+		for j := i + 3; j < len(b); j++ {
+			switch {
+			case q == '"' && b[j] == '\\':
+				j++
+			case j+2 < len(b) && b[j] == q && b[j+1] == q && b[j+2] == q:
+				return j + 2
+			}
+		}
+		return len(b)
+	}
+	for j := i + 1; j < len(b); j++ {
+		switch {
+		case q == '"' && b[j] == '\\':
+			j++
+		case b[j] == q || b[j] == '\n':
+			return j
+		}
+	}
+	return len(b)
 }
 
 // matchAny matches a directory against workspace globs (path.Match per

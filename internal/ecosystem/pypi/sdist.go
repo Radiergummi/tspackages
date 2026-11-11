@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -82,6 +83,21 @@ func RefuseTree(entries []gitmirror.TreeEntry) string {
 	if i := slices.IndexFunc(entries, func(e gitmirror.TreeEntry) bool { return !cleanTreePath(e.Path) }); i >= 0 {
 		return fmt.Sprintf("contains an invalid path (%q), which git fsck rejects", entries[i].Path)
 	}
+	// Discovery reads one entry of a path, the archive holds both.
+	paths := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if paths[e.Path] {
+			return fmt.Sprintf("lists %q more than once, which git fsck rejects", e.Path)
+		}
+		paths[e.Path] = true
+	}
+	for _, e := range entries {
+		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
+			if paths[d] {
+				return fmt.Sprintf("lists %q more than once (as a file and a directory), which git fsck rejects", d)
+			}
+		}
+	}
 	return ""
 }
 
@@ -114,6 +130,7 @@ func BuildSdist(gitTar io.Reader, p Package, pkgInfo []byte, mtime time.Time) ([
 		body []byte
 	}
 	files := []file{{name: top + "PKG-INFO", mode: 0o644, body: pkgInfo}}
+	seen := map[string]bool{}
 	tr := tar.NewReader(gitTar)
 	for {
 		h, err := tr.Next()
@@ -130,6 +147,10 @@ func BuildSdist(gitTar io.Reader, p Package, pkgInfo []byte, mtime time.Time) ([
 		if !ok || excluded(h.Name, p.Exclude) || rel == "PKG-INFO" {
 			continue
 		}
+		if seen[rel] {
+			return nil, &RefusedError{Reason: "git archive holds " + h.Name + " more than once"}
+		}
+		seen[rel] = true
 		body, err := io.ReadAll(tr)
 		if err != nil {
 			return nil, fmt.Errorf("read git archive: %w", err)

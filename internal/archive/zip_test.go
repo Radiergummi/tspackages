@@ -211,3 +211,20 @@ func TestDropSymlinks(t *testing.T) {
 		t.Fatal("garbage accepted")
 	}
 }
+
+// TestDropSymlinksRefusesAmbiguousNames: a built archive naming a path twice,
+// or as a file and a directory, has no single content for it.
+func TestDropSymlinksRefusesAmbiguousNames(t *testing.T) {
+	for name, in := range map[string][]byte{
+		"duplicate":    makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "composer.json", body: `{"name":"x/y"}`}),
+		"file and dir": makeZip(t, entry{name: "src", body: "x"}, entry{name: "src/a.php", body: "<?php"}),
+	} {
+		if _, _, err := DropSymlinks(in); !errors.As(err, new(*Error)) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	ok := makeZip(t, entry{name: "src/", mode: fs.ModeDir | 0o755}, entry{name: "src/a.php", body: "<?php"}, entry{name: "Src/a.php", body: "<?php"})
+	if _, _, err := DropSymlinks(ok); err != nil {
+		t.Errorf("directory entry and case variants refused: %v", err)
+	}
+}
