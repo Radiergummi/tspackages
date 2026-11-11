@@ -144,7 +144,10 @@ tags:
 A release is stored once and never regenerated. If a later tag offers the
 same name and version with other content, the first sdist keeps being served
 and the status page reports the conflict as "changed without a version
-bump" with the tags involved. Releases
+bump" with the tags involved. An sdist whose writing was interrupted is
+rebuilt only if the rebuild has the recorded sha256 (`export-subst`
+placeholders such as `$Format:%D$` can change it); otherwise it is reported
+and the file stays missing. Releases
 whose package directory holds Git LFS files or submodules, or whose `readme`
 or `license` file is missing, a symlink, larger than 1MiB or outside the
 package directory, are refused and reported. While a remote has never been

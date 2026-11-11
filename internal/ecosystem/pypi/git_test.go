@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -581,5 +582,42 @@ func TestFailedRemoteKeepsItsLastScan(t *testing.T) {
 	index(t, g)
 	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestRebuildMustMatchRecord: a release record's sdist is only written when
+// the rebuilt bytes have the recorded digest; otherwise it is reported.
+func TestRebuildMustMatchRecord(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	r.tag("v1")
+	env := newGitEnv(t)
+	g := env.source(t, nil, r.dir)
+	index(t, g)
+	ctx := context.Background()
+	v, _ := ParseVersion("1.0.0")
+	dir := g.releaseDir("acme-core", v.Canonical())
+	rel, err := g.readRelease(ctx, dir+"release.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// As if the first build had produced other bytes and stopped before
+	// writing them.
+	rel.SHA256 = sum256([]byte("other bytes"))
+	body, _ := json.Marshal(rel)
+	if _, err := env.state.Put(ctx, dir+"release.json", bytes.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	sdKey := dir + storage.EscapeSegment(rel.Filename)
+	if err := env.state.Delete(ctx, sdKey); err != nil {
+		t.Fatal(err)
+	}
+	g2 := env.source(t, nil, r.dir)
+	index(t, g2)
+	if _, err := env.state.Stat(ctx, sdKey); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("an sdist that does not match its record was written: %v", err)
+	}
+	if c := g2.Conflicts(); len(c) != 1 || c[0].Kind != ConflictRebuild || c[0].Package != "acme-core" {
+		t.Fatalf("conflicts = %+v", c)
 	}
 }

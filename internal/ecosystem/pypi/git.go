@@ -33,7 +33,12 @@ const (
 	ConflictNoBump       = "changed without a version bump"
 	ConflictDivergent    = "divergent histories"
 	ConflictRepositories = "declared by several repositories"
+	ConflictRebuild      = "rebuilt sdist differs from its record; not written"
 )
+
+// errRebuildDiffers is a build whose sdist does not have the digest of the
+// release record it completes (export-subst output, for one, can change).
+var errRebuildDiffers = errors.New("pypi git: rebuilt sdist differs from its release record")
 
 // Conflict is a release the git source does not serve as the tags suggest.
 type Conflict struct {
@@ -415,7 +420,9 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 	slices.SortFunc(cs, func(a, b candidate) int { return strings.Compare(a.tag, b.tag) })
 	if i := slices.IndexFunc(stored[name], func(r release) bool { return r.Canonical == canon }); i >= 0 {
 		served := stored[name][i]
-		g.repair(ctx, served, cs)
+		if err := g.repair(ctx, served, cs); errors.Is(err, errRebuildDiffers) {
+			return &Conflict{Package: name, Version: served.Version, Kind: ConflictRebuild, Tags: []string{served.Tag}}, nil, false
+		}
 		return differing(name, cs, served.Identity, ConflictNoBump), nil, false
 	}
 	winner := g.earliest(ctx, cs)
@@ -430,6 +437,9 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 		if re, ok := errors.AsType[*RefusedError](err); ok {
 			return nil, &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: re.Reason}, false
 		}
+		if errors.Is(err, errRebuildDiffers) {
+			return &Conflict{Package: name, Version: winner.pkg.Version.String(), Kind: ConflictRebuild, Tags: []string{winner.tag}}, nil, false
+		}
 		g.log.Error("pypi git: building a release failed", "source", g.name, "package", name, "version", winner.pkg.Version.String(), "tag", winner.tag, "error", err)
 		return nil, nil, true
 	}
@@ -437,20 +447,22 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 }
 
 // repair rebuilds the sdist of a claimed release whose file was never
-// written (an indexer stopped in between); generation is deterministic, so
-// the bytes are the ones the record names.
-func (g *GitSource) repair(ctx context.Context, r release, cs []candidate) {
+// written (an indexer stopped in between). The rebuilt sdist is written only
+// if it has the recorded digest; otherwise build returns errRebuildDiffers.
+func (g *GitSource) repair(ctx context.Context, r release, cs []candidate) error {
 	key := g.releaseDir(r.Name, r.Canonical) + storage.EscapeSegment(r.Filename)
 	if _, err := g.state.Stat(ctx, key); !errors.Is(err, storage.ErrNotFound) {
-		return
+		return nil
 	}
 	i := slices.IndexFunc(cs, func(c candidate) bool { return c.identity == r.Identity })
 	if i < 0 {
-		return
+		return nil
 	}
-	if err := g.build(ctx, cs[i]); err != nil {
+	err := g.build(ctx, cs[i])
+	if err != nil && !errors.Is(err, errRebuildDiffers) {
 		g.log.Error("pypi git: repairing a release failed", "source", g.name, "package", r.Name, "version", r.Version, "error", err)
 	}
+	return err
 }
 
 // differing reports the candidates whose identity is not the served one.
@@ -495,8 +507,9 @@ func (g *GitSource) earliest(ctx context.Context, cs []candidate) *candidate {
 }
 
 // build generates the sdist of a candidate and stores it: the sidecar is
-// claimed first, so concurrent indexers agree on one release; the sdist is
-// deterministic, so whoever writes it writes the same bytes.
+// claimed first, so concurrent indexers agree on one release. An existing
+// sidecar with the same identity is completed only with an sdist of its
+// digest; otherwise build returns errRebuildDiffers and writes nothing.
 func (g *GitSource) build(ctx context.Context, c candidate) error {
 	m := c.remote
 	read := func(p string) ([]byte, error) { return m.ReadFile(ctx, c.commit, p) }
@@ -553,6 +566,11 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 		}
 		if existing.Identity != r.Identity {
 			return nil // reported as a conflict on the next pass
+		}
+		if existing.SHA256 != r.SHA256 {
+			g.log.Warn("pypi git: a rebuilt sdist differs from its release record; not written", "source", g.name,
+				"package", r.Name, "version", r.Version, "tag", c.tag, "recorded", existing.SHA256, "rebuilt", r.SHA256)
+			return errRebuildDiffers
 		}
 		r = existing
 	}
