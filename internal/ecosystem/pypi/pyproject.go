@@ -24,6 +24,7 @@ const (
 	skipMissingFile  = "readme or license file does not exist"
 	skipNotRegular   = "readme or license file is not a regular file (a symlink?), so the sdist cannot hold it"
 	skipLargeFile    = "readme or license file is larger than 1 MiB"
+	skipBadPath      = "path starts with \"-\" or holds a newline or NUL, which tspackages does not pass to git"
 	skipBadPyproject = "pyproject.toml does not parse"
 )
 
@@ -43,6 +44,10 @@ type Package struct {
 // not a regular file (a symlink); such a file is refused, not read.
 var errNotRegular = errors.New("not a regular file")
 
+// errBadPath is what a DiscoverPackages read returns for a path that is not
+// passed to git because of its characters; the package is refused.
+var errBadPath = errors.New("path starts with \"-\" or holds a newline or NUL")
+
 // errBadPyproject marks a pyproject.toml that does not parse.
 var errBadPyproject = errors.New("pyproject.toml does not parse")
 
@@ -50,7 +55,7 @@ var errBadPyproject = errors.New("pyproject.toml does not parse")
 // pyproject.toml's project and, for a uv workspace, each member directory
 // (from dirs, every directory in the tree) with a pyproject.toml that has a
 // [project] table. read returns a file's content, an error wrapping
-// resolve.ErrNotFound, errNotRegular or gitmirror.ErrTooLarge, or any other
+// resolve.ErrNotFound, errNotRegular, errBadPath or gitmirror.ErrTooLarge, or any other
 // error, which fails the discovery (content problems are Package.Skip
 // instead). A repository
 // without a root pyproject.toml has none.
@@ -83,6 +88,10 @@ func DiscoverPackages(read func(path string) ([]byte, error), dirs []string) ([]
 		case errors.Is(err, errBadPyproject):
 			memberDirs = append(memberDirs, d)
 			memberPkgs = append(memberPkgs, Package{Dir: d, Skip: skipBadPyproject})
+			continue
+		case errors.Is(err, errBadPath):
+			memberDirs = append(memberDirs, d)
+			memberPkgs = append(memberPkgs, Package{Dir: d, Skip: skipBadPath})
 			continue
 		case err != nil:
 			return nil, err
@@ -189,6 +198,9 @@ func checkFiles(read func(string) ([]byte, error), p *Package) error {
 			return nil
 		case errors.Is(err, errNotRegular):
 			p.Skip = skipNotRegular
+			return nil
+		case errors.Is(err, errBadPath):
+			p.Skip = skipBadPath
 			return nil
 		case errors.Is(err, gitmirror.ErrTooLarge):
 			p.Skip = skipLargeFile

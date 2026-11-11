@@ -633,3 +633,45 @@ func TestTagMappingRootDir(t *testing.T) {
 		t.Fatalf("root = %v", got)
 	}
 }
+
+// TestContentProblemsAreRefusals: a release that can never be built from
+// its repository's content is a reported skip, not a name that stays
+// unavailable, and leaves the index complete.
+func TestContentProblemsAreRefusals(t *testing.T) {
+	long := "acme-" + strings.Repeat("x", 150)
+	cases := []struct {
+		name, pkg, reason string
+		files             map[string]string
+	}{
+		{"name too long for the store", long, "too long",
+			map[string]string{"pyproject.toml": pyproject(long, "1.0.0")}},
+		{"invalid extra", "acme-core", "extra",
+			map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0") + "[project.optional-dependencies]\n\"bad extra\" = [\"x\"]\n"}},
+		{"root pyproject.toml over 1MiB", "", "does not parse",
+			map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0") + "#" + strings.Repeat("x", 1<<20) + "\n"}},
+		{"member directory with a newline", "", "path",
+			map[string]string{"pyproject.toml": workspaceRoot(), "packages/a\nb/pyproject.toml": pyproject("acme-nl", "1.0.0")}},
+		{"member directory starting with a dash", "acme-dash", "path",
+			map[string]string{"pyproject.toml": "[tool.uv.workspace]\nmembers = [\"*\"]\n", "-x/pyproject.toml": pyproject("acme-dash", "1.0.0")}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRepo(t)
+			r.write(c.files)
+			r.tag("v1")
+			g := newGitEnv(t).source(t, nil, r.dir)
+			index(t, g)
+			if c.pkg != "" {
+				if _, err := g.Project(context.Background(), c.pkg); !errors.Is(err, resolve.ErrNotFound) {
+					t.Fatalf("Project: %v", err)
+				}
+			}
+			if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+				t.Fatalf("an unknown name: %v", err)
+			}
+			if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, c.reason) {
+				t.Fatalf("skipped = %+v", s)
+			}
+		})
+	}
+}

@@ -150,13 +150,16 @@ with the tags involved. An sdist whose writing was interrupted is rebuilt
 only if the rebuild has the recorded SHA256 (`export-subst` placeholders
 such as `$Format:%D$` can change it); otherwise it is reported and the file
 stays missing. Releases whose package directory holds Git LFS files or
-submodules, or whose `readme` or `license` file is missing, a symlink,
-larger than 1MiB or outside the package directory, are refused and reported.
-While a remote has never been indexed, or a tag couldn't be read, a name the
-source doesn't know answers `502` instead of moving on to the next source.
-Files generated at build time but not committed aren't in the sdist, and
-setuptools includes non-Python package data only if `MANIFEST.in` or
-`package-data` lists it. Publish such packages through a `storage` source.
+submodules, whose `readme` or `license` file is missing, a symlink, larger
+than 1MiB or outside the package directory, whose `pyproject.toml` doesn't
+parse or names an invalid extra, whose name and version make a filename
+longer than 148 bytes, or whose directory starts with `-` or holds a
+newline, are refused and reported. While a remote has never been indexed, or
+a tag couldn't be read, a name the source doesn't know answers `502` instead
+of moving on to the next source. Files generated at build time but not
+committed aren't in the sdist, and setuptools includes non-Python package
+data only if `MANIFEST.in` or `package-data` lists it. Publish such packages
+through a `storage` source.
 
 ## Client setup
 

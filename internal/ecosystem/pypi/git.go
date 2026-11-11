@@ -315,11 +315,19 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		dirs = append(dirs, d)
 	}
 	slices.Sort(dirs)
+	// Every file is in the tree, so its content decides the outcome
+	// before git is asked: a symlink would be read as its target path (and
+	// the sdist leaves symlinks out); git refuses a path with a newline or
+	// NUL, and archiving a directory that starts with "-".
 	read := func(p string) ([]byte, error) {
-		// git reads a symlink as its target path, and the sdist leaves
-		// symlinks out.
-		if mode, ok := modes[p]; ok && mode != "100644" && mode != "100755" {
+		mode, ok := modes[p]
+		switch {
+		case !ok:
+			return nil, fmt.Errorf("%s: %w", p, resolve.ErrNotFound)
+		case mode != "100644" && mode != "100755":
 			return nil, fmt.Errorf("%s: %w", p, errNotRegular)
+		case strings.HasPrefix(p, "-") || strings.ContainsAny(p, "\x00\n"):
+			return nil, fmt.Errorf("%q: %w", p, errBadPath)
 		}
 		return m.ReadFile(ctx, commit, p)
 	}
@@ -340,6 +348,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 				}
 			}
 			c.refused = RefuseTree(entries)
+			if c.refused == "" && !keysFit(SdistFilename(p.Name, p.Version)) {
+				c.refused = "name and version are too long for the store's keys"
+			}
 			if c.refused == "" && usesLFS(read, append(slices.Clone(attrs), entries...)) {
 				c.refused = "uses Git LFS (filter=lfs), which an sdist cannot resolve"
 			}
@@ -541,7 +552,7 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 	}
 	meta, err := ParseMetadata(pkgInfo)
 	if err != nil {
-		return err
+		return &RefusedError{Reason: "generated PKG-INFO is invalid: " + err.Error()}
 	}
 	canon := c.pkg.Version.Canonical()
 	r := release{

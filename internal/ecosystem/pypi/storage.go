@@ -137,9 +137,7 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, u Up
 	if dist.name != name || dist.version != formVersion.Canonical() {
 		return File{}, &UploadError{fmt.Sprintf("filename %q does not match project %q version %q", u.Filename, u.Name, u.Version)}
 	}
-	// The longest key segment is the escaped filename plus a suffix; the
-	// name, version and claim segments are shorter.
-	if len(storage.EscapeSegment(u.Filename)+".attestations") > storage.MaxSegment {
+	if !keysFit(u.Filename) {
 		return File{}, &UploadError{fmt.Sprintf("filename %q is too long", u.Filename)}
 	}
 	data, err := io.ReadAll(io.LimitReader(u.Content, s.limits.MaxBytes+1))
@@ -300,6 +298,13 @@ func versionLess(v Version, than string) bool {
 		}
 	}
 	return false
+}
+
+// keysFit reports whether the keys of a distribution file fit the store:
+// the longest segment is the escaped filename plus a suffix; the name,
+// version and claim segments are shorter.
+func keysFit(filename string) bool {
+	return len(storage.EscapeSegment(filename)+".attestations") <= storage.MaxSegment
 }
 
 func digestOf(b []byte) string { _, s := digest.Of(b); return s }

@@ -46,7 +46,8 @@ func ParseMetadata(b []byte) (Metadata, error) {
 // package's static [project] table; read fetches the readme. Fields [project]
 // marks dynamic are listed as Dynamic. License fields are always Dynamic:
 // backends add License-File entries of their own, so a static value here
-// would promise something the built wheel does not keep (PEP 643).
+// would promise something the built wheel does not keep (PEP 643). Content
+// that cannot be written, such as an invalid extra name, is a *RefusedError.
 func WritePKGINFO(p Package, read func(path string) ([]byte, error)) ([]byte, error) {
 	proj := p.Project
 	dynamic := stringList(proj["dynamic"])
@@ -94,7 +95,7 @@ func WritePKGINFO(p Package, read func(path string) ([]byte, error)) ([]byte, er
 		for _, extra := range slices.Sorted(maps.Keys(extras)) {
 			norm, err := Normalize(extra)
 			if err != nil {
-				return nil, fmt.Errorf("invalid extra %q", extra)
+				return nil, &RefusedError{Reason: fmt.Sprintf("optional-dependencies has an invalid extra name %q", extra)}
 			}
 			field("Provides-Extra", norm)
 			for _, d := range stringList(extras[extra]) {
