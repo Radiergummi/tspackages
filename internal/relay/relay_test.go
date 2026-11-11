@@ -35,6 +35,7 @@ func newRelay(t *testing.T) (*Relay, *storage.Cache, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(r.Wait) // the test's directories must outlast cache writes
 	return r, cache, tmp
 }
 
@@ -93,7 +94,8 @@ func TestFirstReaderGetsBytesBeforeFetchEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	if _, err := io.ReadFull(rc, make([]byte, 64<<10)); err != nil {
+	// All but the last byte: that one waits for the digest check.
+	if _, err := io.ReadFull(rc, make([]byte, 64<<10-1)); err != nil {
 		t.Fatalf("first 64 KiB while the fetch is still open: %v", err)
 	}
 	src.pw.Close()
@@ -174,7 +176,7 @@ func TestLastReaderLeavingCancelsFetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.ReadFull(a, make([]byte, 1024))
+	io.ReadFull(a, make([]byte, 1023)) // the last byte waits for the end
 	a.Close()
 	select {
 	case <-src.ctxDone:
@@ -463,7 +465,7 @@ func TestJoinAfterLastReaderLeft(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.ReadFull(a, make([]byte, 4))
+	io.ReadFull(a, make([]byte, 3)) // the last byte waits for the end
 	within(t, "the last reader's Close", 2*time.Second, func() { a.Close() })
 	b, _, _, err := r.Open(context.Background(), "k", digestOf(body), fetch, nil)
 	if err != nil {
@@ -551,4 +553,133 @@ func TestReadStopsWithRequest(t *testing.T) {
 			t.Errorf("Read: %v", err)
 		}
 	})
+}
+
+// TestMismatchWithholdsLastByte: a reader never gets the whole artifact before
+// its digest matched, so a client sent a Content-Length can't mistake a
+// mismatching download for a complete one.
+func TestMismatchWithholdsLastByte(t *testing.T) {
+	r, _, _ := newRelay(t)
+	body := bytes.Repeat([]byte("x"), 64<<10)
+	var calls atomic.Int32
+	rc, _, _, err := r.Open(context.Background(), "k", digestOf([]byte("other")), bytesFetch(body, &calls), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if !errors.Is(err, ErrDigestMismatch) || len(got) >= len(body) {
+		t.Fatalf("read %d of %d bytes, err %v", len(got), len(body), err)
+	}
+}
+
+// TestLastByteWaitsForUpstreamEnd: until the upstream ended and the digest was
+// checked, a reader gets all but the last byte written so far.
+func TestLastByteWaitsForUpstreamEnd(t *testing.T) {
+	r, _, _ := newRelay(t)
+	src := newSource()
+	body := []byte("streamed, then verified")
+	go src.pw.Write(body)
+	rc, _, _, err := r.Open(context.Background(), "k", digestOf(body), src.fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if _, err := io.ReadFull(rc, make([]byte, len(body)-1)); err != nil {
+		t.Fatal(err)
+	}
+	last := make(chan []byte, 1)
+	go func() {
+		b := make([]byte, 8)
+		n, _ := rc.Read(b)
+		last <- b[:n]
+	}()
+	select {
+	case b := <-last:
+		t.Fatalf("%q handed out before the upstream ended", b)
+	case <-time.After(50 * time.Millisecond):
+	}
+	src.pw.Close()
+	if b := <-last; !bytes.Equal(b, body[len(body)-1:]) {
+		t.Fatalf("last read %q", b)
+	}
+	if n, err := rc.Read(make([]byte, 8)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("after the last byte: %d, %v", n, err)
+	}
+}
+
+// blockingDriver holds every Put until release is closed.
+type blockingDriver struct {
+	storage.Driver
+	release chan struct{}
+}
+
+func (d *blockingDriver) Put(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	<-d.release
+	return d.Driver.Put(ctx, key, r)
+}
+
+// TestVerifiedReadNotHeldByCacheWrite: readers reach EOF once the digest
+// matched, without waiting for a slow cache write.
+func TestVerifiedReadNotHeldByCacheWrite(t *testing.T) {
+	fsd, err := storage.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &blockingDriver{Driver: fsd, release: make(chan struct{})}
+	cache, err := storage.NewCache(context.Background(), d, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(cache, filepath.Join(t.TempDir(), "relay"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.Wait) // the test's directories must outlast cache writes
+	body := []byte("verified before it is cached")
+	var calls atomic.Int32
+	rc, _, _, err := r.Open(context.Background(), "k", digestOf(body), bytesFetch(body, &calls), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	within(t, "the verified read", 2*time.Second, func() {
+		if got, err := io.ReadAll(rc); err != nil || !bytes.Equal(got, body) {
+			t.Errorf("read %q, %v", got, err)
+		}
+	})
+	rc.Close()
+	close(d.release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, _, err := cache.Get(context.Background(), "k"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("verified download not cached")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("%d fetches", calls.Load())
+	}
+}
+
+// TestCacheHitWithholdsLastByte: a cache hit that fails its check doesn't
+// hand out every byte first.
+func TestCacheHitWithholdsLastByte(t *testing.T) {
+	r, cache, _ := newRelay(t)
+	body := bytes.Repeat([]byte("y"), 64<<10)
+	if err := cache.Put(context.Background(), "k", bytes.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	rc, _, hit, err := r.Open(context.Background(), "k", digestOf([]byte("original")), bytesFetch(nil, &calls), nil)
+	if err != nil || !hit {
+		t.Fatalf("hit %v, %v", hit, err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if !errors.Is(err, ErrDigestMismatch) || len(got) >= len(body) {
+		t.Fatalf("read %d of %d bytes, err %v", len(got), len(body), err)
+	}
 }

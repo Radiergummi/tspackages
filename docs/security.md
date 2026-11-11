@@ -94,7 +94,8 @@ tailnet. Read this before you deploy.
 - Upstream artifacts stream to clients while they download and are checked
   against the upstream-declared hash before they are cached. On a mismatch
   nothing is cached and the client's transfer is broken off, so it never
-  looks like a complete file. Packagist declares none for most
+  looks like a complete file: the last byte is held back until the hash
+  matched, for cached copies too. Packagist declares none for most
   GitHub archives, so the first SHA256 seen for a version and reference is
   kept in the provenance records. A later fetch with other bytes is still
   served, but logged at warn and listed on the status page.

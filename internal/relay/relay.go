@@ -62,6 +62,8 @@ type Relay struct {
 	inflight map[string]*download
 	finished uint64 // downloads that left inflight after starting to stream
 
+	runs sync.WaitGroup // fetches still running, cache writes included
+
 	afterMiss func() // test hook: runs after Open's first cache miss
 }
 
@@ -90,12 +92,14 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 // fetch for key and returns a reader that streams it as it arrives. A failure
 // to open the upstream is returned here; anything later comes from Read.
 //
-// The reader's final Read returns io.EOF only after the digest matched,
-// onCommit (if any) succeeded and the object was written to the cache. On a
-// mismatch it returns ErrDigestMismatch and nothing is cached. A cache hit is
-// re-checked against want while it streams: a mismatch fails the read and
-// drops the entry. The returned size is -1 when unknown; hit reports a cache
-// hit.
+// The reader withholds the artifact's last byte until the digest matched and
+// onCommit (if any) succeeded, so a client never gets the whole artifact
+// before it is verified; then it hands the byte out and returns io.EOF. The
+// cache write runs on in the background and doesn't hold readers up. On a
+// mismatch the reader returns ErrDigestMismatch and nothing is cached. A cache
+// hit is re-checked against want while it streams, its last byte likewise
+// withheld until the check passed: a mismatch fails the read and drops the
+// entry. The returned size is -1 when unknown; hit reports a cache hit.
 func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (body io.ReadCloser, size int64, hit bool, err error) {
 	var dl *download
 	joined := false
@@ -108,7 +112,7 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 		gen := r.finished
 		r.mu.Unlock()
 		if rc, size, err := r.cache.Open(ctx, key); err == nil {
-			return r.verifying(rc, key, want), size, true, nil
+			return r.verifying(rc, key, want, size), size, true, nil
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			return nil, 0, false, err
 		}
@@ -132,7 +136,7 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 		}
 		r.mu.Unlock()
 		if !joined {
-			go r.run(runCtx, dl, want, fetch, onCommit)
+			r.runs.Go(func() { r.run(runCtx, dl, want, fetch, onCommit) })
 		}
 		break
 	}
@@ -156,6 +160,10 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 	return rd, dl.size, false, nil
 }
 
+// Wait blocks until every fetch started so far has ended, its cache write
+// included: readers finish before that write does.
+func (r *Relay) Wait() { r.runs.Wait() }
+
 // newDownload registers a download for key with one reader. r.mu is held.
 func (r *Relay) newDownload(ctx context.Context, key string) (context.Context, *download) {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -177,7 +185,8 @@ type download struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
 	written    int64
-	committing bool // verified; the last reader leaving no longer cancels
+	committing bool // digest matched; the last reader leaving no longer cancels
+	verified   bool // digest matched and onCommit succeeded: readers may finish
 	done       bool
 	err        error // final outcome once done; nil = verified and committed
 
@@ -235,6 +244,10 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 		err = onCommit(ctx, res)
 	}
 	if err == nil {
+		dl.mu.Lock()
+		dl.verified = true
+		dl.cond.Broadcast()
+		dl.mu.Unlock()
 		err = r.commit(ctx, dl.key, path)
 	}
 	cancel()
@@ -355,29 +368,39 @@ type reader struct {
 	closed bool
 }
 
+// Read hands out what was written so far, except the last byte until the
+// download is verified. Once verified it reads to the end, whatever the cache
+// write's outcome.
 func (rd *reader) Read(p []byte) (int, error) {
 	dl := rd.dl
 	dl.mu.Lock()
-	for rd.off >= dl.written && !dl.done && rd.ctx.Err() == nil {
+	var limit int64
+	for {
+		limit = dl.written
+		if !dl.verified {
+			limit--
+		}
+		if rd.off < limit || dl.verified || dl.done || rd.ctx.Err() != nil {
+			break
+		}
 		dl.cond.Wait()
 	}
-	avail, done, err := dl.written-rd.off, dl.done, dl.err
+	verified, done, err := dl.verified, dl.done, dl.err
 	dl.mu.Unlock()
-	if avail <= 0 && !done {
-		return 0, rd.ctx.Err()
-	}
-	if avail > 0 {
-		n, rerr := dl.file.ReadAt(p[:min(int64(len(p)), avail)], rd.off)
+	switch {
+	case !verified && done:
+		return 0, err
+	case rd.off < limit:
+		n, rerr := dl.file.ReadAt(p[:min(int64(len(p)), limit-rd.off)], rd.off)
 		rd.off += int64(n)
 		if rerr != nil && !errors.Is(rerr, io.EOF) {
 			return n, rerr
 		}
 		return n, nil
+	case verified:
+		return 0, io.EOF
 	}
-	if done && err != nil {
-		return 0, err
-	}
-	return 0, io.EOF
+	return 0, rd.ctx.Err()
 }
 
 func (rd *reader) Close() error {
@@ -390,15 +413,16 @@ func (rd *reader) Close() error {
 	return nil
 }
 
-// verifying wraps a cache hit: read in order from the start to the end, its
-// bytes must match want, else the last Read fails and the entry is dropped.
-// A Seek away from the current position turns the check off (ranged
-// requests read only part of the object).
-func (r *Relay) verifying(rc io.ReadCloser, key string, want Digest) io.ReadCloser {
+// verifying wraps a cache hit of size bytes: read in order from the start to
+// the end, its bytes must match want, else the last Read fails and the entry
+// is dropped. The last byte is handed out only after the check passed. A Seek
+// away from the current position turns the check off (ranged requests read
+// only part of the object).
+func (r *Relay) verifying(rc io.ReadCloser, key string, want Digest, size int64) io.ReadCloser {
 	if want == (Digest{}) {
 		return rc
 	}
-	v := &verifier{rc: rc, relay: r, key: key, want: want, h1: sha1.New(), h256: sha256.New(), on: true}
+	v := &verifier{rc: rc, relay: r, key: key, want: want, size: size, h1: sha1.New(), h256: sha256.New(), on: true}
 	if _, ok := rc.(io.Seeker); ok {
 		return &seekingVerifier{v}
 	}
@@ -410,28 +434,48 @@ type verifier struct {
 	relay    *Relay
 	key      string
 	want     Digest
+	size     int64
 	h1, h256 hash.Hash
 	n        int64
 	on       bool
 }
 
 func (v *verifier) Read(p []byte) (int, error) {
-	n, err := v.rc.Read(p)
-	if v.on {
-		v.h1.Write(p[:n])
-		v.h256.Write(p[:n])
-		v.n += int64(n)
+	if !v.on {
+		return v.rc.Read(p)
 	}
-	if errors.Is(err, io.EOF) && v.on {
-		got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), Size: v.n}
-		if cerr := check(v.want, got); cerr != nil {
-			if derr := v.relay.cache.Delete(context.Background(), v.key); derr != nil {
-				v.relay.log.Warn("relay: dropping a corrupt cache entry failed", "key", v.key, "error", derr)
+	// Read the last byte on its own, so it can be held back until checked.
+	if v.n < v.size-1 {
+		p = p[:min(int64(len(p)), v.size-1-v.n)]
+	} else if v.n == v.size-1 && len(p) > 1 {
+		p = p[:1]
+	}
+	n, err := v.rc.Read(p)
+	v.h1.Write(p[:n])
+	v.h256.Write(p[:n])
+	v.n += int64(n)
+	last := n > 0 && v.n == v.size
+	if last || errors.Is(err, io.EOF) {
+		if cerr := v.check(); cerr != nil {
+			if last {
+				n = 0
 			}
 			return n, cerr
 		}
 	}
 	return n, err
+}
+
+// check compares what was read with want, dropping the entry on a mismatch.
+func (v *verifier) check() error {
+	got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), Size: v.n}
+	err := check(v.want, got)
+	if err != nil {
+		if derr := v.relay.cache.Delete(context.Background(), v.key); derr != nil {
+			v.relay.log.Warn("relay: dropping a corrupt cache entry failed", "key", v.key, "error", derr)
+		}
+	}
+	return err
 }
 
 func (v *verifier) Close() error { return v.rc.Close() }

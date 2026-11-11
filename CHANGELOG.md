@@ -28,8 +28,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Upstream artifact downloads stream: the first client gets bytes while the
   archive is still downloading, concurrent clients share one upstream fetch,
-  and the archive is cached only after its digest matched. A mismatch breaks
-  the client's transfer instead of ending it like a complete file. An
+  and the archive is cached only after its digest matched. The last byte is
+  held back until then, so a mismatch (or a cached copy that changed at rest)
+  breaks the client's transfer short of its `Content-Length` instead of ending
+  it like a complete file. Clients finish without waiting for the cache
+  write. An
   upstream that sends nothing for two minutes fails the download; there is
   no longer a total download timeout.
 - `max_artifact_bytes` defaults to 8GiB and no longer means memory use.

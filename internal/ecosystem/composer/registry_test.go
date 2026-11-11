@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -51,6 +52,7 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 		_, _ = w.Write(b)
 	}))
 	t.Cleanup(f.srv.Close)
@@ -92,6 +94,7 @@ type regEnv struct {
 	d     storage.Driver
 	rec   *records.Store
 	up    *upstream.Client
+	rl    *relay.Relay
 	clock time.Time
 }
 
@@ -113,8 +116,8 @@ func newRegEnv(t *testing.T) *regEnv {
 	rec := records.New(rd)
 	host := strings.TrimPrefix(f.srv.URL, "http://")
 	c := upstream.New(upstream.Options{FetchHosts: []string{strings.Split(host, ":")[0]}, AllowPrivateForTesting: true})
-	e := &regEnv{f: f, cache: cache, d: d, rec: rec, up: c, clock: time.Now()}
-	e.src = NewRegistrySource("packagist", nil, f.srv.URL, c, cache, testRelay(t, cache), rec, time.Minute, 1<<20, 0, nil, nil)
+	e := &regEnv{f: f, cache: cache, d: d, rec: rec, up: c, rl: testRelay(t, cache), clock: time.Now()}
+	e.src = NewRegistrySource("packagist", nil, f.srv.URL, c, cache, e.rl, rec, time.Minute, 1<<20, 0, nil, nil)
 	e.src.now = func() time.Time { return e.clock }
 	return e
 }
@@ -323,6 +326,7 @@ func TestDistVerifiesShasum(t *testing.T) {
 	if !bytes.Equal(got, zip) || a.Size != int64(len(zip)) {
 		t.Fatalf("artifact = %q %+v", got, a)
 	}
+	e.rl.Wait() // the cache write may outlast the read
 	if keys := distKeys(t, e.d); len(keys) != 1 {
 		t.Fatalf("keys = %v", keys)
 	}
@@ -646,6 +650,7 @@ func testRelay(t *testing.T, cache *storage.Cache) *relay.Relay {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(rl.Wait) // the test's directories must outlast cache writes
 	return rl
 }
 
@@ -666,26 +671,36 @@ func TestDistStreamsBeforeUpstreamFinishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Body.Close()
-	if _, err := io.ReadFull(a.Body, make([]byte, 32<<10)); err != nil {
+	// All but the last byte: that one waits for the end of the download.
+	if _, err := io.ReadFull(a.Body, make([]byte, 32<<10-1)); err != nil {
 		t.Fatalf("first bytes while upstream is still sending: %v", err)
 	}
 }
 
+// getAll downloads url to the end, returning the bytes and the error that
+// ended the transfer.
+func getAll(url string) ([]byte, error) {
+	resp, err := http.Get(url) //nolint:gosec,noctx // test server URL
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
 // A dist that does not match its declared shasum breaks the client's
-// transfer instead of ending like a complete file, and is not cached.
+// transfer instead of ending like a complete file, and is not cached; even
+// with a Content-Length and a body larger than the server's response buffer.
 func TestDistMismatchAbortsConnection(t *testing.T) {
 	e := newRegEnv(t)
+	body := bytes.Repeat([]byte("PK-not-what-was-declared"), 4096)
 	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, strings.Repeat("0", 40), "r1"))
-	e.f.set("/dist/pkg.zip", []byte("PK-not-what-was-declared"))
+	e.f.set("/dist/pkg.zip", body)
 	srv := httptest.NewServer(server(t, []Source{e.src}, readAll))
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/composer/dist/packagist/acme/pkg/1.0.0/r1")
-	if err == nil {
-		_, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("the client read a complete response")
+	got, err := getAll(srv.URL + "/composer/dist/packagist/acme/pkg/1.0.0/r1")
+	if err == nil || len(got) >= len(body) {
+		t.Fatalf("the client read %d of %d bytes, err %v", len(got), len(body), err)
 	}
 	before := e.f.count("/dist/pkg.zip")
 	if a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1"); err == nil {
@@ -694,5 +709,33 @@ func TestDistMismatchAbortsConnection(t *testing.T) {
 	}
 	if e.f.count("/dist/pkg.zip") != before+1 {
 		t.Fatal("the mismatching dist was served from the cache instead of being fetched again")
+	}
+}
+
+// A cached dist altered at rest is not served complete either.
+func TestCorruptCachedDistAbortsConnection(t *testing.T) {
+	e := newRegEnv(t)
+	body := bytes.Repeat([]byte("PK-cached-dist"), 4096)
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, sum1(body), "r1"))
+	e.f.set("/dist/pkg.zip", body)
+	srv := httptest.NewServer(server(t, []Source{e.src}, readAll))
+	defer srv.Close()
+	url := srv.URL + "/composer/dist/packagist/acme/pkg/1.0.0/r1"
+	if got, err := getAll(url); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("first download: %d bytes, %v", len(got), err)
+	}
+	e.rl.Wait() // the cache write may outlast the download
+	keys := distKeys(t, e.d)
+	if len(keys) != 1 {
+		t.Fatalf("cached dists: %v", keys)
+	}
+	corrupt := bytes.Clone(body)
+	corrupt[len(corrupt)-1] ^= 1
+	if _, err := e.d.Put(context.Background(), keys[0], bytes.NewReader(corrupt)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := getAll(url)
+	if err == nil || len(got) >= len(body) {
+		t.Fatalf("the client read %d of %d bytes, err %v", len(got), len(body), err)
 	}
 }

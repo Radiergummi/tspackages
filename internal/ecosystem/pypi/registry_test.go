@@ -113,6 +113,7 @@ func newRegEnv(t *testing.T) *regEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(rl.Wait) // the test's directories must outlast cache writes
 	sd, err := storage.NewFS(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
