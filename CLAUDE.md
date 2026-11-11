@@ -87,8 +87,8 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   and `*`. Anything else is a config error, because a malformed claim would
   silently route private names to the public source. Composer capability
   rules use the same grammar (case-insensitive); a malformed one matches
-  nothing. PyPI claims and rules: `*` or `[a-z0-9-]` and `*`, matched against
-  the PEP 503 normalised name.
+  nothing. PyPI claims and rules: `*` or `[a-z0-9-]` and `*` with no leading,
+  trailing or doubled `-`, matched against the PEP 503 normalised name.
 - URLs returned to clients point at tspackages and are opaque routes, never
   encoded upstream URLs.
 - Upstream artifact bytes are verified against the declared hash before

@@ -566,12 +566,12 @@ func TestPyPIClaims(t *testing.T) {
 	src := func(claim string) string {
 		return pypiConfig("      - {name: r, type: registry, url: 'https://pypi.org/simple/', fetch_hosts: [pypi.org], claims: ['" + claim + "']}\n")
 	}
-	for _, good := range []string{"*", "matchory-*", "foo", "*-utils", "a1-b2"} {
+	for _, good := range []string{"*", "matchory-*", "foo", "*-utils", "a1-b2", "a-*-b"} {
 		if _, err := Load(writeConfig(t, src(good))); err != nil {
 			t.Errorf("%q: %v", good, err)
 		}
 	}
-	for _, bad := range []string{"Matchory-*", "matchory_*", "a.b", "vendor/name", "**", "", "a b", "a[bc]"} {
+	for _, bad := range []string{"Matchory-*", "matchory_*", "a.b", "vendor/name", "**", "", "a b", "a[bc]", "acme--internal", "-acme", "acme-", "*-"} {
 		_, err := Load(writeConfig(t, src(bad)))
 		if err == nil || !strings.Contains(err.Error(), "invalid claim") || !strings.Contains(err.Error(), bad) {
 			t.Errorf("%q: err = %v", bad, err)

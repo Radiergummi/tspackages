@@ -12,7 +12,7 @@ import (
 var (
 	validNameRE = regexp.MustCompile(`(?i)^([a-z0-9]|[a-z0-9][a-z0-9._-]*[a-z0-9])$`) // PEP 508
 	separatorRE = regexp.MustCompile(`[-_.]+`)
-	patternRE   = regexp.MustCompile(`^[a-z0-9*-]*[a-z0-9-][a-z0-9*-]*$`)
+	patternRE   = regexp.MustCompile(`^([a-z0-9*]+(-[a-z0-9*]+)+|\**[a-z0-9][a-z0-9*]*)$`)
 )
 
 // Normalize returns the PEP 503 normalised form of a valid PEP 508 project
@@ -26,7 +26,9 @@ func Normalize(name string) (string, error) {
 
 // ValidPattern reports whether p is a claim or capability pattern: "*", or
 // normalised name characters with "*" wildcards and at least one other
-// character. internal/config keeps the same grammar for claims.
+// character, where "-" only joins two non-empty parts (no leading, trailing
+// or doubled "-", which no normalised name has). internal/config keeps the
+// same grammar for claims.
 func ValidPattern(p string) bool { return p == "*" || patternRE.MatchString(p) }
 
 // Match reports whether a pattern matches a normalised name, ignoring case

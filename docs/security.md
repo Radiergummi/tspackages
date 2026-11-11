@@ -113,7 +113,8 @@ tailnet. Read this before you deploy.
 
 - Names are normalised (PEP 503) before claim matching, authorization and
   storage, so `Acme_Utils` can't slip past an `acme-*` claim. Claims and
-  `pypi:` rules accept only `[a-z0-9-]` and `*`; anything else is a config
+  `pypi:` rules accept only `[a-z0-9-]` and `*`, with no leading, trailing or
+  doubled `-` (no normalised name has one); anything else is a config
   error, or a rule that grants nothing. `acme-*` doesn't cover `acme`.
 - Configure clients with tspackages as their **only** index. An extra index
   next to it (`--extra-index-url`, a second uv index) lets pip and uv pick a

@@ -112,8 +112,8 @@ PyPI has the same three source types and the same resolution rules. Names
 are normalised as PEP 503 says (lowercase; runs of `-`, `_` and `.` become
 `-`) before claims, authorization and storage, so `Acme_Utils` and
 `acme.utils` are one package. A claim is `*` or a pattern of `[a-z0-9-]` and
-`*` in normalised form. `acme-*` doesn't match the bare name `acme`; claim
-both with `["acme", "acme-*"]`. Versions are compared by PEP 440 equality:
+`*` in normalised form, with no leading, trailing or doubled `-`. `acme-*`
+doesn't match the bare name `acme`; claim both with `["acme", "acme-*"]`. Versions are compared by PEP 440 equality:
 `1.0` and `1.0.0` are one version, so a release can't be published twice
 under two spellings.
 

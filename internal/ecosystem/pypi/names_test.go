@@ -22,7 +22,7 @@ func TestNormalize(t *testing.T) {
 }
 
 func TestPatterns(t *testing.T) {
-	for p, valid := range map[string]bool{"*": true, "matchory-*": true, "foo": true, "*-utils": true, "Matchory-*": false, "a_b": false, "a.b": false, "**": false, "": false, "a/b": false} {
+	for p, valid := range map[string]bool{"*": true, "matchory-*": true, "foo": true, "*-utils": true, "Matchory-*": false, "a_b": false, "a.b": false, "**": false, "": false, "a/b": false, "acme--internal": false, "-acme": false, "acme-": false, "-*": false, "*-": false, "a-*-b": true, "*-*": true} {
 		if ValidPattern(p) != valid {
 			t.Errorf("ValidPattern(%q) = %v", p, !valid)
 		}

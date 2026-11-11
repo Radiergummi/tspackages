@@ -360,8 +360,9 @@ var sourceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 var (
 	claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
 	// pypiClaimRe is pypi.ValidPattern's grammar: normalised name characters
-	// and "*", with at least one character that is not "*".
-	pypiClaimRe = regexp.MustCompile(`^[a-z0-9*-]*[a-z0-9-][a-z0-9*-]*$`)
+	// and "*", with at least one character that is not "*", and "-" only
+	// between two non-empty parts, as in every normalised name.
+	pypiClaimRe = regexp.MustCompile(`^([a-z0-9*]+(-[a-z0-9*]+)+|\**[a-z0-9][a-z0-9*]*)$`)
 )
 
 var claimHint = map[string]string{
