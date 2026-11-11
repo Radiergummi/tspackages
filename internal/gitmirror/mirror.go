@@ -383,7 +383,9 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 	if err := checkCommit(commit); err != nil {
 		return nil, err
 	}
-	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00\n") {
+	// cat-file reads its input by line and drops a trailing "\r", so such
+	// a path would be looked up as another one.
+	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00\n\r") {
 		return nil, fmt.Errorf("gitmirror: invalid path %q", path)
 	}
 	for seg := range strings.SplitSeq(path, "/") {
@@ -580,12 +582,13 @@ func checkPath(p string) error {
 const MaxTreeEntries = 100_000
 
 // ErrTreeTooLarge is wrapped by ListTree for a tree with more than
-// MaxTreeEntries entries.
-var ErrTreeTooLarge = fmt.Errorf("tree has more than %d entries", MaxTreeEntries)
+// MaxTreeEntries entries or a path over 1 MiB.
+var ErrTreeTooLarge = errors.New("tree too large to list")
 
 // ListTree lists every file, symlink and submodule under dir ("" = the whole
 // tree) at commit, with paths from the repository root. The listing is parsed
-// while git writes it and stops at MaxTreeEntries (ErrTreeTooLarge).
+// while git writes it and stops at MaxTreeEntries or a path over 1 MiB
+// (ErrTreeTooLarge).
 func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
@@ -640,7 +643,7 @@ func (tp *treeParser) Write(b []byte) (int, error) {
 		case !ok || len(f) != 3:
 			tp.err = fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
 		case len(tp.entries) == MaxTreeEntries:
-			tp.err = fmt.Errorf("gitmirror: %w", ErrTreeTooLarge)
+			tp.err = fmt.Errorf("gitmirror: %w: more than %d entries", ErrTreeTooLarge, MaxTreeEntries)
 		}
 		if tp.err != nil {
 			return 0, tp.err
@@ -649,7 +652,7 @@ func (tp *treeParser) Write(b []byte) (int, error) {
 	}
 	tp.buf = append(tp.buf[:0], tp.buf[start:]...)
 	if len(tp.buf) > maxReadFile {
-		tp.err = errors.New("gitmirror: ls-tree record over 1 MiB")
+		tp.err = fmt.Errorf("gitmirror: %w: a path over 1 MiB", ErrTreeTooLarge)
 		return 0, tp.err
 	}
 	return len(b), nil
@@ -687,6 +690,10 @@ func (m *Mirror) IsAncestor(ctx context.Context, a, b string) (bool, error) {
 	return err == nil, err
 }
 
+// ErrBadCommitTime is wrapped by CommitTime for a committer time git prints
+// but an int64 of seconds does not hold: the commit's content, not I/O.
+var ErrBadCommitTime = errors.New("unusable commit time")
+
 // CommitTime returns the committer time of commit.
 func (m *Mirror) CommitTime(ctx context.Context, commit string) (time.Time, error) {
 	if err := checkCommit(commit); err != nil {
@@ -698,7 +705,7 @@ func (m *Mirror) CommitTime(ctx context.Context, commit string) (time.Time, erro
 	}
 	sec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("gitmirror: unexpected commit time %q", out)
+		return time.Time{}, fmt.Errorf("gitmirror: %w %q", ErrBadCommitTime, out)
 	}
 	return time.Unix(sec, 0).UTC(), nil
 }

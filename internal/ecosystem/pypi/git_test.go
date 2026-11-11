@@ -1206,3 +1206,91 @@ func TestTreeBombsRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestCarriageReturnPathRefused: git's batch input drops a trailing "\r",
+// so such a path is refused instead of being looked up as another one; the
+// source completes and other remotes' packages stay served.
+func TestCarriageReturnPathRefused(t *testing.T) {
+	a := newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-good", "1.0.0")})
+	a.tag("v1")
+	b := newRepo(t)
+	b.write(map[string]string{
+		"pyproject.toml": strings.Replace(pyproject("acme-cr", "1.0.0"), "[project]\n", "[project]\nreadme = \"README\\r\"\n", 1),
+		"README\r":       "x",
+	})
+	b.tag("v1")
+	g := newGitEnv(t).source(t, nil, a.dir, b.dir)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-good"); len(got) != 1 {
+		t.Fatalf("acme-good = %v", got)
+	}
+	if _, err := g.Project(context.Background(), "acme-cr"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("acme-cr: %v", err)
+	}
+	if !slices.ContainsFunc(g.Skipped(), func(s Skipped) bool { return strings.Contains(s.Reason, "carriage return") }) {
+		t.Fatalf("skipped = %+v", g.Skipped())
+	}
+	if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("index incomplete: %v", err)
+	}
+}
+
+// TestLongTreePathRefused: a path over 1MiB refuses its commit instead of
+// leaving the tag unread on every pass.
+func TestLongTreePathRefused(t *testing.T) {
+	a := newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-good", "1.0.0")})
+	a.tag("v1")
+	b := newRepo(t)
+	b.write(map[string]string{"pyproject.toml": pyproject("acme-other", "1.0.0")})
+	blob := gitStdin(t, b.dir, "x\n", "hash-object", "-w", "--stdin")
+	root := testutil.Git(t, b.dir, "rev-parse", "HEAD:pyproject.toml")
+	tagTree(t, b, gitStdin(t, b.dir, "100644 blob "+root+"\tpyproject.toml\n100644 blob "+blob+"\t"+strings.Repeat("n", 1100000)+"\n", "mktree"), "v2")
+	g := newGitEnv(t).source(t, nil, a.dir, b.dir)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-good"); len(got) != 1 {
+		t.Fatalf("acme-good = %v", got)
+	}
+	if !slices.ContainsFunc(g.Skipped(), func(s Skipped) bool { return strings.Contains(s.Reason, "too large") }) {
+		t.Fatalf("skipped = %+v", g.Skipped())
+	}
+	if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("index incomplete: %v", err)
+	}
+}
+
+// TestUnreadPyprojectsNotCounted: pyproject.toml files discovery never reads
+// (no workspace member matches them) do not count towards the cap.
+func TestUnreadPyprojectsNotCounted(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	leaf := map[string]string{"pyproject.toml": gitStdin(t, r.dir, pyproject("acme-m", "1.0.0"), "hash-object", "-w", "--stdin")}
+	bomb := bombTree(t, r, 16, 3, leaf)
+	root := testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")
+	tagTree(t, r, gitStdin(t, r.dir, fmt.Sprintf("040000 tree %s\tvendor\n100644 blob %s\tpyproject.toml\n", bomb, root), "mktree"), "v1")
+	g := newGitEnv(t).source(t, nil, r.dir)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
+		t.Fatalf("acme-core = %v (skipped %+v)", got, g.Skipped())
+	}
+}
+
+// TestBadCommitTimeRefused: a committer time no int64 holds, or one past
+// the year 9999 (no RFC 3339 time for the release record), is the commit's
+// content, so the release is refused, not retried.
+func TestBadCommitTimeRefused(t *testing.T) {
+	for _, when := range []string{"99999999999999999999999", "999999999999"} {
+		t.Run(when, func(t *testing.T) {
+			r := newRepo(t)
+			r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+			tree := testutil.Git(t, r.dir, "rev-parse", "HEAD^{tree}")
+			raw := "tree " + tree + "\nauthor T <t@e> 1 +0000\ncommitter T <t@e> " + when + " +0000\n\nx\n"
+			c := gitStdin(t, r.dir, raw, "hash-object", "-t", "commit", "-w", "--stdin", "--literally")
+			testutil.Git(t, r.dir, "update-ref", "refs/tags/v1", c)
+			g := newGitEnv(t).source(t, nil, r.dir)
+			index(t, g)
+			assertRefused(t, g, "acme-core", "commit time")
+		})
+	}
+}

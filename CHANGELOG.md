@@ -19,6 +19,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remote of a `git` source has been indexed since startup and every tag
   read, it builds no new release, and a name without a stored release
   answers `502` instead of falling through to a later source.
+- A PyPI `git` source refuses a tag whose tree has more than 100,000
+  entries or a path over 1MiB, or whose workspace has more than 1,000
+  members, and lists it on the status page; it no longer reads such trees
+  whole. A release refused while building isn't built again until restart.
 - A registry archive whose bytes differ from the ones first fetched for the
   same version and reference is logged at warn and listed on the status page.
   Packagist declares no checksum for most GitHub archives, so this is the

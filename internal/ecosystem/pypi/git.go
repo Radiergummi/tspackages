@@ -329,30 +329,21 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	}
 	tree, err := m.ListTree(ctx, commit, "")
 	if errors.Is(err, gitmirror.ErrTreeTooLarge) {
-		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree has more than %d entries", gitmirror.MaxTreeEntries)), nil
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree is too large to list (more than %d entries or a path over 1MiB)", gitmirror.MaxTreeEntries)), nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	// Each pyproject.toml may cost a read; a tree of a few objects can hold
-	// thousands.
-	if n := countFunc(tree, func(e gitmirror.TreeEntry) bool { return path.Base(e.Path) == "pyproject.toml" }); n > maxPyprojects {
-		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree holds %d pyproject.toml files, more than %d", n, maxPyprojects)), nil
-	}
-	dirSet := map[string]bool{}
+	// Only a directory holding a pyproject.toml can be a workspace member.
+	// Paths fsck rejects are refused by RefuseTree for the package holding
+	// them.
 	modes := map[string]string{}
+	var dirs []string
 	for _, e := range tree {
 		modes[e.Path] = e.Mode
-		if !cleanTreePath(e.Path) {
-			continue // refused by RefuseTree for the package holding it
+		if d := path.Dir(e.Path); path.Base(e.Path) == "pyproject.toml" && d != "." && cleanTreePath(e.Path) {
+			dirs = append(dirs, d)
 		}
-		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
-			dirSet[d] = true
-		}
-	}
-	dirs := make([]string, 0, len(dirSet))
-	for d := range dirSet {
-		dirs = append(dirs, d)
 	}
 	slices.Sort(dirs)
 	// Every file is in the tree, so its path and mode decide the outcome
@@ -365,7 +356,7 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	read := func(p string) ([]byte, error) {
 		mode, ok := modes[p]
 		switch {
-		case !cleanTreePath(p) || strings.HasPrefix(p, "-") || strings.ContainsAny(p, "\x00\n"):
+		case !cleanTreePath(p) || strings.HasPrefix(p, "-") || strings.ContainsAny(p, "\x00\n\r"):
 			return nil, fmt.Errorf("%q: %w", p, errBadPath)
 		case !ok:
 			return nil, fmt.Errorf("%s: %w", p, resolve.ErrNotFound)
@@ -379,6 +370,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		return b, err
 	}
 	pkgs, err := DiscoverPackages(read, dirs)
+	if errors.Is(err, errTooManyPyprojects) {
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("discovery would read more than %d pyproject.toml files", maxPyprojects)), nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -414,10 +408,6 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	return slices.Clone(out), nil
 }
 
-// maxPyprojects caps the pyproject.toml files of a tree that discovery
-// looks at.
-const maxPyprojects = 1000
-
 // isRelease reports whether p has a name and version.
 func isRelease(p Package) bool { return p.Name != "" && len(p.Version.release) > 0 }
 
@@ -428,21 +418,13 @@ func (g *GitSource) refuseCommit(key string, m *gitmirror.Mirror, commit, reason
 	return slices.Clone(out)
 }
 
-func countFunc[T any](xs []T, f func(T) bool) int {
-	n := 0
-	for _, x := range xs {
-		if f(x) {
-			n++
-		}
-	}
-	return n
-}
-
 // groupTree gives each release in pkgs its tree entries (those under its
 // directory, for the root package without the member directories) and
 // returns the .gitattributes files by directory ("" = the root), in one walk
 // over the tree. Paths fsck rejects are matched by prefix, so the package
-// holding one is refused.
+// holding one is refused; a .gitattributes at such a path is no directory's
+// attributes (a walk per package used to count it for packages it did not
+// belong to).
 func groupTree(tree []gitmirror.TreeEntry, pkgs []Package) ([][]gitmirror.TreeEntry, map[string][]gitmirror.TreeEntry) {
 	byDir := map[string][]int{}
 	rootExclude := map[string]bool{}
@@ -724,6 +706,10 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 		return err
 	}
 	when, err := m.CommitTime(ctx, c.commit)
+	// The release record holds the time as RFC 3339, years 0 to 9999.
+	if errors.Is(err, gitmirror.ErrBadCommitTime) || err == nil && (when.Year() < 0 || when.Year() > 9999) {
+		return &RefusedError{Reason: "the tagged commit's commit time is unusable"}
+	}
 	if err != nil {
 		return err
 	}
@@ -746,7 +732,10 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 		r.Metadata = digestOf(pkgInfo)
 	}
 	dir := g.releaseDir(r.Name, canon)
-	body, _ := json.Marshal(r)
+	body, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
 	if _, err := g.state.PutIfAbsent(ctx, dir+"release.json", bytes.NewReader(body)); err != nil {
 		if !errors.Is(err, storage.ErrExists) {
 			return err
