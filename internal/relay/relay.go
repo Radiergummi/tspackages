@@ -122,18 +122,19 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 			r.mu.Unlock()
 			continue
 		}
+		var runCtx context.Context
 		if joined {
 			dl.readers++
 		} else {
-			dl = &download{key: key, readers: 1, ready: make(chan struct{})}
-			dl.cond = sync.NewCond(&dl.mu)
-			r.inflight[key] = dl
+			// The fetch outlives this request (others may join) but not its
+			// last reader: leave cancels it.
+			runCtx, dl = r.newDownload(ctx, key)
 		}
 		r.mu.Unlock()
+		if !joined {
+			go r.run(runCtx, dl, want, fetch, onCommit)
+		}
 		break
-	}
-	if !joined {
-		go r.run(context.WithoutCancel(ctx), dl, want, fetch, onCommit)
 	}
 	select {
 	case <-dl.ready:
@@ -145,7 +146,23 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 		r.leave(dl)
 		return nil, 0, false, dl.openErr
 	}
-	return &reader{r: r, dl: dl}, dl.size, false, nil
+	rd := &reader{r: r, dl: dl, ctx: ctx}
+	// Wake a Read waiting for bytes when the request ends.
+	rd.stop = context.AfterFunc(ctx, func() {
+		dl.mu.Lock()
+		dl.cond.Broadcast()
+		dl.mu.Unlock()
+	})
+	return rd, dl.size, false, nil
+}
+
+// newDownload registers a download for key with one reader. r.mu is held.
+func (r *Relay) newDownload(ctx context.Context, key string) (context.Context, *download) {
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	dl := &download{key: key, readers: 1, ready: make(chan struct{}), cancel: cancel}
+	dl.cond = sync.NewCond(&dl.mu)
+	r.inflight[key] = dl
+	return runCtx, dl
 }
 
 type download struct {
@@ -153,21 +170,25 @@ type download struct {
 	ready chan struct{} // closed once the upstream answered (openErr or file set)
 
 	openErr error
-	file    *os.File // temp file; read with ReadAt, closed when the last reader leaves
+	file    *os.File // temp file; read with ReadAt, closed once run ended and no reader is left
 	size    int64
-	cancel  context.CancelFunc
+	cancel  context.CancelFunc // cancels the fetch; set before the download is shared
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	written int64
-	done    bool
-	err     error // final outcome once done; nil = verified and committed
-	readers int   // guarded by Relay.mu
+	mu         sync.Mutex
+	cond       *sync.Cond
+	written    int64
+	committing bool // verified; the last reader leaving no longer cancels
+	done       bool
+	err        error // final outcome once done; nil = verified and committed
+
+	// Guarded by Relay.mu.
+	readers    int
+	runEnded   bool
+	fileClosed bool
 }
 
 func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) {
-	ctx, cancel := context.WithCancel(ctx)
-	dl.cancel = cancel
+	cancel := dl.cancel
 	body, size, err := fetch(ctx)
 	if err == nil {
 		dl.file, err = os.CreateTemp(r.tmpDir, "dl-*")
@@ -180,7 +201,8 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 		cancel()
 		dl.openErr = err
 		r.mu.Lock()
-		delete(r.inflight, dl.key)
+		r.forget(dl)
+		dl.runEnded = true
 		r.mu.Unlock()
 		close(dl.ready)
 		return
@@ -200,6 +222,15 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	if err == nil {
 		err = check(want, res)
 	}
+	if err == nil {
+		// Under dl.mu, as leave cancels under it: either leave saw this
+		// flag, or the cancellation is visible here.
+		dl.mu.Lock()
+		if err = ctx.Err(); err == nil {
+			dl.committing = true
+		}
+		dl.mu.Unlock()
+	}
 	if err == nil && onCommit != nil {
 		err = onCommit(ctx, res)
 	}
@@ -209,8 +240,10 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	cancel()
 	// Commit or not, the key is free for a new fetch from here on.
 	r.mu.Lock()
-	delete(r.inflight, dl.key)
+	r.forget(dl)
 	r.finished++
+	dl.runEnded = true
+	r.closeIfIdle(dl)
 	r.mu.Unlock()
 	dl.mu.Lock()
 	dl.done, dl.err = true, err
@@ -276,38 +309,48 @@ func (r *Relay) commit(ctx context.Context, key, path string) error {
 	return nil
 }
 
-// leave drops one reader; the last one cancels an unfinished fetch and closes
-// the temp file.
+// leave drops one reader without waiting for anything. The last one cancels
+// an unfinished fetch that isn't committing yet and takes it out of the
+// in-flight set, so a later reader starts afresh instead of joining it.
 func (r *Relay) leave(dl *download) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	dl.readers--
-	last := dl.readers == 0
-	r.mu.Unlock()
-	if !last {
-		return
-	}
-	<-dl.ready
-	if dl.openErr != nil {
+	if dl.readers > 0 {
 		return
 	}
 	dl.mu.Lock()
-	done := dl.done
-	dl.mu.Unlock()
-	if !done {
+	if !dl.done && !dl.committing {
 		dl.cancel()
-		dl.mu.Lock()
-		for !dl.done {
-			dl.cond.Wait()
-		}
-		dl.mu.Unlock()
+		r.forget(dl)
 	}
-	dl.file.Close()
+	dl.mu.Unlock()
+	r.closeIfIdle(dl)
+}
+
+// forget takes dl out of the in-flight set unless a newer download for its
+// key replaced it. r.mu is held.
+func (r *Relay) forget(dl *download) {
+	if r.inflight[dl.key] == dl {
+		delete(r.inflight, dl.key)
+	}
+}
+
+// closeIfIdle closes the temp file once run has ended and no reader is
+// left. r.mu is held; runEnded orders run's file assignment before this.
+func (r *Relay) closeIfIdle(dl *download) {
+	if dl.readers == 0 && dl.runEnded && !dl.fileClosed && dl.file != nil {
+		dl.fileClosed = true
+		dl.file.Close()
+	}
 }
 
 // reader follows a download's temp file as it grows.
 type reader struct {
 	r      *Relay
 	dl     *download
+	ctx    context.Context // the request; Read gives up when it ends
+	stop   func() bool     // unregisters the wake-up on ctx
 	off    int64
 	closed bool
 }
@@ -315,11 +358,14 @@ type reader struct {
 func (rd *reader) Read(p []byte) (int, error) {
 	dl := rd.dl
 	dl.mu.Lock()
-	for rd.off >= dl.written && !dl.done {
+	for rd.off >= dl.written && !dl.done && rd.ctx.Err() == nil {
 		dl.cond.Wait()
 	}
 	avail, done, err := dl.written-rd.off, dl.done, dl.err
 	dl.mu.Unlock()
+	if avail <= 0 && !done {
+		return 0, rd.ctx.Err()
+	}
 	if avail > 0 {
 		n, rerr := dl.file.ReadAt(p[:min(int64(len(p)), avail)], rd.off)
 		rd.off += int64(n)
@@ -339,6 +385,7 @@ func (rd *reader) Close() error {
 		return nil
 	}
 	rd.closed = true
+	rd.stop()
 	rd.r.leave(rd.dl)
 	return nil
 }

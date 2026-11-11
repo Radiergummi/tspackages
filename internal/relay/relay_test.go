@@ -415,3 +415,140 @@ func TestOpenAfterCommitDuringMissDoesNotRefetch(t *testing.T) {
 		t.Fatalf("upstream fetched %d times", n)
 	}
 }
+
+// stubbornBody streams its bytes, then blocks until released, ignoring
+// cancellation, like an upstream that is slow to notice.
+type stubbornBody struct {
+	r       io.Reader
+	release chan struct{}
+}
+
+func (b *stubbornBody) Read(p []byte) (int, error) {
+	if n, err := b.r.Read(p); n > 0 || !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	<-b.release
+	return 0, io.EOF
+}
+
+func (*stubbornBody) Close() error { return nil }
+
+func within(t *testing.T, what string, d time.Duration, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { f(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return within %v", what, d)
+	}
+}
+
+// TestJoinAfterLastReaderLeft: once the last reader has left an unfinished
+// download, a new reader starts a fresh fetch instead of joining the
+// cancelled one, and leaving doesn't wait for the upstream.
+func TestJoinAfterLastReaderLeft(t *testing.T) {
+	r, _, _ := newRelay(t)
+	body := []byte("abandoned then wanted again")
+	var calls atomic.Int32
+	first := &stubbornBody{r: bytes.NewReader(body[:4]), release: make(chan struct{})}
+	defer close(first.release)
+	fetch := func(context.Context) (io.ReadCloser, int64, error) {
+		if calls.Add(1) == 1 {
+			return first, -1, nil
+		}
+		return io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
+	}
+	a, _, _, err := r.Open(context.Background(), "k", digestOf(body), fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadFull(a, make([]byte, 4))
+	within(t, "the last reader's Close", 2*time.Second, func() { a.Close() })
+	b, _, _, err := r.Open(context.Background(), "k", digestOf(body), fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if got, err := io.ReadAll(b); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("new reader: %q, %v", got, err)
+	}
+}
+
+// TestLeavingDuringCommitKeepsCommit: a verified download is cached even if
+// its only reader leaves while it commits.
+func TestLeavingDuringCommitKeepsCommit(t *testing.T) {
+	r, cache, _ := newRelay(t)
+	body := []byte("verified, then the client left")
+	var calls atomic.Int32
+	inCommit, release, committed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	onCommit := func(ctx context.Context, _ Result) error {
+		close(inCommit)
+		<-release
+		committed <- ctx.Err()
+		return ctx.Err()
+	}
+	a, _, _, err := r.Open(context.Background(), "k", digestOf(body), bytesFetch(body, &calls), onCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-inCommit
+	a.Close()
+	close(release)
+	if err := <-committed; err != nil {
+		t.Fatalf("commit cancelled: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, _, err := cache.Get(context.Background(), "k"); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("verified download not cached")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestOpenCancelledBeforeUpstreamAnswers: a request that gives up while the
+// upstream hasn't answered returns at once and cancels the fetch.
+func TestOpenCancelledBeforeUpstreamAnswers(t *testing.T) {
+	r, _, _ := newRelay(t)
+	fetchCancelled := make(chan struct{})
+	fetch := func(ctx context.Context) (io.ReadCloser, int64, error) {
+		<-ctx.Done()
+		close(fetchCancelled)
+		return nil, 0, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	within(t, "Open", 2*time.Second, func() {
+		if _, _, _, err := r.Open(ctx, "k", Digest{}, fetch, nil); !errors.Is(err, context.Canceled) {
+			t.Errorf("Open: %v", err)
+		}
+	})
+	select {
+	case <-fetchCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fetch was not cancelled")
+	}
+}
+
+// TestReadStopsWithRequest: a reader waiting for bytes returns once its
+// request is cancelled, without waiting for the idle timeout.
+func TestReadStopsWithRequest(t *testing.T) {
+	r, _, _ := newRelay(t)
+	src := newSource()
+	ctx, cancel := context.WithCancel(context.Background())
+	rc, _, _, err := r.Open(ctx, "k", Digest{}, src.fetch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	time.AfterFunc(50*time.Millisecond, cancel)
+	within(t, "Read", 2*time.Second, func() {
+		if _, err := rc.Read(make([]byte, 8)); !errors.Is(err, context.Canceled) {
+			t.Errorf("Read: %v", err)
+		}
+	})
+}
