@@ -256,7 +256,7 @@ func syncDir(dir string) error {
 	return f.Sync()
 }
 
-// stage streams r into a synced 0644 temp file next to p and returns its path
+// stage streams r into a synced 0600 temp file next to p and returns its path
 // and content hash.
 func stage(p string, r io.Reader) (tmp, etag string, err error) {
 	f, err := os.CreateTemp(filepath.Dir(p), "*"+tmpSuffix)
