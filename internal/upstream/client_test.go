@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -427,5 +428,73 @@ func TestTimeoutBoundsHeadersNotBody(t *testing.T) {
 	body, _, _, err := c.FetchVerified(context.Background(), slowBody.URL, "", 100)
 	if err != nil || string(body) != "late" {
 		t.Fatalf("%q %v", body, err)
+	}
+}
+
+// Open returns as soon as the headers arrive, so bytes reach the caller while
+// the upstream is still sending.
+func TestOpenStreams(t *testing.T) {
+	release := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(make([]byte, 1024))
+		w.(http.Flusher).Flush()
+		<-release
+		w.Write([]byte("tail"))
+	}))
+	defer s.Close()
+	defer close(release)
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	body, size, err := c.Open(context.Background(), s.URL, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if size != -1 {
+		t.Errorf("size = %d, want -1 (no Content-Length)", size)
+	}
+	if _, err := io.ReadFull(body, make([]byte, 1024)); err != nil {
+		t.Fatalf("first KiB: %v", err)
+	}
+}
+
+func TestOpenTooLargeMidStream(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for range 2 {
+			w.Write(make([]byte, 1<<20))
+			w.(http.Flusher).Flush() // chunked: no Content-Length up front
+		}
+	}))
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	body, _, err := c.Open(context.Background(), s.URL, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if _, err := io.ReadAll(body); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestOpenDeclaredTooLarge(t *testing.T) {
+	s := bodyServer("0123456789")
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	if _, _, err := c.Open(context.Background(), s.URL, 9); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v", err)
+	}
+	body, size, err := c.Open(context.Background(), s.URL, 10)
+	if err != nil || size != 10 {
+		t.Fatalf("exactly max: size %d, %v", size, err)
+	}
+	body.Close()
+}
+
+func TestOpenStatus(t *testing.T) {
+	s := httptest.NewServer(http.NotFoundHandler())
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	if _, _, err := c.Open(context.Background(), s.URL, 100); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("err = %v", err)
 	}
 }

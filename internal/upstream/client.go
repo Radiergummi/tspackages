@@ -255,34 +255,65 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	return resp, nil
 }
 
+// Open fetches rawURL and returns its body as it arrives, with the declared
+// size (-1 if unknown). A non-2xx answer is a *StatusError. A declared size
+// above maxBytes is ErrTooLarge before anything is read; a body that grows
+// beyond maxBytes fails with ErrTooLarge from Read. The caller must close the
+// body.
+func (c *Client) Open(ctx context.Context, rawURL string, maxBytes int64) (io.ReadCloser, int64, error) {
+	if maxBytes <= 0 {
+		return nil, 0, fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
+	}
+	resp, err := c.Get(ctx, rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		resp.Body.Close()
+		return nil, 0, &StatusError{Code: resp.StatusCode, URL: redactURL(resp.Request.URL)}
+	}
+	if resp.ContentLength > maxBytes {
+		resp.Body.Close()
+		return nil, 0, ErrTooLarge
+	}
+	return &cappedBody{rc: resp.Body, left: maxBytes}, resp.ContentLength, nil
+}
+
+// cappedBody fails with ErrTooLarge once more than its limit has been read.
+type cappedBody struct {
+	rc   io.ReadCloser
+	left int64
+}
+
+func (b *cappedBody) Read(p []byte) (int, error) {
+	if b.left < 0 {
+		return 0, ErrTooLarge
+	}
+	if b.left < math.MaxInt64 && int64(len(p)) > b.left+1 {
+		p = p[:b.left+1] // one byte more than allowed detects overflow
+	}
+	n, err := b.rc.Read(p)
+	b.left -= int64(n)
+	if b.left < 0 {
+		return n + int(b.left), ErrTooLarge
+	}
+	return n, err
+}
+
+func (b *cappedBody) Close() error { return b.rc.Close() }
+
 // FetchVerified downloads at most maxBytes and returns the body with its
 // SHA-1 and SHA-256. If wantSHA1 is set and differs (case-insensitively), it
 // returns ErrDigestMismatch and no body.
 func (c *Client) FetchVerified(ctx context.Context, rawURL, wantSHA1 string, maxBytes int64) (body []byte, sha1Hex, sha256Hex string, err error) {
-	if maxBytes <= 0 {
-		return nil, "", "", fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
-	}
-	resp, err := c.Get(ctx, rawURL)
+	rc, _, err := c.Open(ctx, rawURL, maxBytes)
 	if err != nil {
 		return nil, "", "", err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, "", "", &StatusError{Code: resp.StatusCode, URL: redactURL(resp.Request.URL)}
-	}
-	if resp.ContentLength > maxBytes {
-		return nil, "", "", ErrTooLarge
-	}
-	limit := maxBytes
-	if limit < math.MaxInt64 {
-		limit++ // one extra byte detects overflow
-	}
-	body, err = io.ReadAll(io.LimitReader(resp.Body, limit))
+	defer rc.Close()
+	body, err = io.ReadAll(rc)
 	if err != nil {
 		return nil, "", "", err
-	}
-	if int64(len(body)) > maxBytes {
-		return nil, "", "", ErrTooLarge
 	}
 	sha1Hex, sha256Hex = digest.Of(body)
 	if wantSHA1 != "" && !strings.EqualFold(sha1Hex, wantSHA1) {
