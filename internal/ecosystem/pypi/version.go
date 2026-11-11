@@ -110,7 +110,8 @@ func (v Version) format(release []int) string {
 		fmt.Fprintf(&b, ".dev%d", v.dev)
 	}
 	if len(v.local) > 0 {
-		b.WriteString("+" + strings.Join(v.local, "."))
+		b.WriteByte('+')
+		b.WriteString(strings.Join(v.local, "."))
 	}
 	return b.String()
 }
