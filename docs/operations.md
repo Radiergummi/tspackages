@@ -136,8 +136,15 @@ docker run -d --name tspackages --restart unless-stopped --stop-timeout 60 \
 ```
 
 The image runs as uid 10001, reads `/etc/tspackages/config.yaml` and declares
-`/var/lib/tspackages` a volume. The config and the files it names must be
-readable by uid 10001 (for example group 10001, mode 0640). Docker stops a
+`/var/lib/tspackages` a volume. `/etc/tspackages` must be traversable and
+the config and the files it names readable by uid 10001 (for example group
+10001, mode 0750 on the directory and 0640 on the files).
+
+The `--env-file` option takes one unquoted `KEY=value` per line: quotes stay
+part of the value, and a value can't span lines. Write `TS_AUTHKEY` there
+without quotes, and put multi-line secrets such as the SSH key and
+`known_hosts` in files under `/etc/tspackages`, named in the config with
+`${file:/etc/tspackages/deploy_key}`. Docker stops a
 container after 10 seconds by default, sooner than tspackages' 30-second
 drain, hence `--stop-timeout`. A bind mount instead of a named volume must
 be owned by uid 10001 with mode 0700.
@@ -171,23 +178,32 @@ The `fs` driver writes every object to a temp file, syncs it and renames it
 into place, so an object on disk is always complete. Its locks are held only
 for one operation each and don't cover a copy made from outside. A copy of
 a running store can catch an index older or newer than the files it lists.
-Copy either with the service stopped or from a filesystem snapshot (ZFS or
-LVM, for example). For the layout in the README quick start, with `fs` stores at
-`/var/lib/tspackages/state` and `/var/lib/tspackages/hosted` (the example
-config uses S3 instead):
+The state store has no indexes and its objects never change, so a copy of
+it made while tspackages runs is fine (leave out `*#tmp` files). Copy the
+hosted stores with the service stopped or from a filesystem snapshot (ZFS
+or LVM, for example), or delete their `index.json` files after restoring
+(see [Restoring](#restoring)). For the layout in the README quick start,
+with `fs` stores at `/var/lib/tspackages/state` and
+`/var/lib/tspackages/hosted` (the example config uses S3 instead):
 
 ```sh
 systemctl stop tspackages
-tar -C /var/lib/tspackages --exclude='#locks' --exclude='*#tmp' \
+tar --format=posix -C /var/lib/tspackages --exclude='#locks' --exclude='*#tmp' \
   -czf /backup/tspackages-$(date +%F).tar.gz tailscale state hosted
 systemctl start tspackages
 ```
 
-The archive holds the node keys: encrypt it, or keep the state dir out of it
+`--format=posix` keeps modification times to the nanosecond. The `#etag`
+files record them, and with whole seconds only every first read after a
+restore hashes the object again. The archive holds the node keys: encrypt it, or keep the state dir out of it
 and accept registering a new node after a loss. `#locks` and `*#tmp` files
 are recreated or removed at startup. A snapshot of a running store is as
 good as a crash: a publish that was in flight may be stored but not listed.
 Running that publish again with the same file completes it.
+
+For the container, stop it and archive the named volume from a helper
+container:
+`docker run --rm -v tspackages-data:/data:ro -v /backup:/backup debian:stable-slim tar --format=posix -C /data --exclude='#locks' --exclude='*#tmp' -czf /backup/tspackages.tar.gz .`
 
 ### Stores in buckets
 
@@ -203,6 +219,11 @@ Running that publish again with the same file completes it.
 - Test an upload after turning on Object Lock: some S3-compatible services
   want a checksum on every write to a locked bucket, and with `endpoint` set
   tspackages sends checksums only where the API requires them.
+- Add a lifecycle rule that aborts incomplete multipart uploads after a
+  day: uploads over 64MiB go up in parts, and an abort tspackages couldn't
+  finish leaves parts behind. On hosted buckets, also expire noncurrent
+  versions after your retention period; every upload leaves one of
+  `index.json`.
 - **Replicate** both buckets to another region or account.
 - To restore, copy back the object versions that were current at the chosen
   time, or point the config at the replica.
@@ -280,9 +301,11 @@ outage.
      /usr/local/bin/tspackages.new -config /etc/tspackages/config.yaml
    ```
 
-   Validation errors print at once. A valid config gets as far as the lock
-   and logs `work_dir is locked by another instance; waiting`; stop it with
-   Ctrl-C.
+   Run it only while the old instance runs. Validation errors print at
+   once. A valid config gets as far as the lock and logs `work_dir is
+   locked by another instance; waiting`; stop it with Ctrl-C. If that line
+   doesn't appear within a few seconds, stop it at once: it got the lock
+   and is bringing up the real node.
 4. Stop the old instance, replace the binary or image, start the new one.
 5. Check `/readyz`, the status page and `tspackages_build_info`.
 
@@ -307,8 +330,8 @@ Metrics:
 - `tspackages_requests_total{ecosystem,source,code}`: alert on a rising
   share of `5xx`.
 - `tspackages_git_last_sync_timestamp_seconds{ecosystem,source}`: the
-  oldest last successful sync among a git source's remotes, `0` while one
-  never synced. Alert when it falls more than a few poll intervals behind.
+  oldest last successful sync among a git source's remotes, `0` until every
+  remote has synced at least once. Alert when it falls more than a few poll intervals behind.
 - `tspackages_upstream_request_duration_seconds{source}`,
   `tspackages_cache_hits_total`, `tspackages_rate_limited_total` and
   `tspackages_build_info{version,commit}`.
@@ -327,11 +350,13 @@ worth an alert:
 | `composer git: tag moved upstream; serving the pinned commit` | warn | A tag was force-pushed. The pin keeps the first commit. |
 | `composer package declared by several remotes; not served` | error | Two remotes of one git source declare the same package. |
 | `composer git: serving pinned versions only` | warn | A remote can't be indexed, so only its pinned versions are served. |
+| `composer git index failed`, `pypi git index failed` | error | A whole index pass failed. |
 | `composer git: indexing failed; keeping previous index` | error | A remote couldn't be indexed; its previous versions stay served. |
 | `composer git sync failed; ...`, `pypi git sync failed; ...` | warn | A remote is unreachable. |
 | `pypi git: indexing a remote failed; its stored releases stay served` | warn | A remote couldn't be indexed. |
-| `pypi git index failed` | error | A whole index pass failed, for example reading the state store. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
+| `pypi git: repairing a release failed` | error | A stored release lacks its sdist and couldn't be built again. |
+| `composer upstream unhealthy`, `pypi upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
 | `left symlinks out of a git archive` | warn | A git-built archive lacks the listed symlinks. |
 | `composer source failed`, `pypi source failed` | error | A request ended in `5xx`. |
 | `not ready` | warn | `/readyz` failed. |
@@ -422,11 +447,18 @@ Pins keep a served tag alive even after it is deleted upstream, so remove
 both:
 
 1. Delete the tag in the repository.
-2. Delete `pins/composer/<source>/<esc(remote)>/<esc(tag)>.json` from the
+2. Wait for one index pass that synced after the deletion: one
+   `poll_interval` (default 1m), with
+   `tspackages_git_last_sync_timestamp_seconds` for the source later than
+   the deletion. A pass that indexes a mirror synced before the deletion,
+   or a stale mirror after a failed sync, still sees the tag and pins it
+   again.
+3. Delete `pins/composer/<source>/<esc(remote)>/<esc(tag)>.json` from the
    state store, with `<remote>` exactly as the config lists it.
+4. Check after the next pass that the version is gone from
+   `/composer/p2/<vendor>/<name>.json`.
 
-The next index pass drops the version. Delete the pin after the tag: a tag
-that still exists is pinned again on the next pass. The archive under
+The archive under
 `composer-git/` can stay unless it holds a secret: the archive of a commit
 is shared by every tag and branch that points at it, and is built again
 while one does.
@@ -438,12 +470,13 @@ still offers it builds it again. So:
 
 1. Delete every tag that offers this name and version, or leave them out of
    the source's `tags` mapping and restart.
-2. Delete everything under
+2. Wait for one index pass that synced after that, as for Composer.
+3. Delete everything under
    `pypi-git/<esc(source)>/<esc(name)>/<esc(version)>/` in the state store
    (`release.json`, the sdist and its `.metadata`), `version` again in
    canonical form.
-
-The next index pass drops the release.
+4. Check after the next pass that the release is gone from
+   `/pypi/simple/<name>/`.
 
 ### From a registry source
 
@@ -460,9 +493,11 @@ Removing the release isn't enough. The secret also lives in:
 - for a git-served version, the archives under `composer-git/<source>/`
   (`<commit>.zip` and `<commit>.meta.json`) and the release directories
   under `pypi-git/` in the state store;
-- the git mirror under `<work_dir>/git/`. Stop tspackages, delete the
-  mirror's directory and start it again; it clones the mirror again. Remove
-  the commit from the repository first, or the clone brings it back;
+- the git mirrors under `<work_dir>/git/`. Their directories are named by
+  a hash; `git -C <dir> config remote.origin.url` shows a mirror's remote,
+  or delete everything under `<work_dir>/git/`. Stop tspackages first; it
+  clones every missing mirror again at start. Remove the commit from the
+  repository first, or the clone brings it back;
 - the cache, for a release from a registry source;
 - every client and CI cache that downloaded it.
 
@@ -487,9 +522,9 @@ To keep that window small and harmless:
   directory and installs from a lock file without fetching them again. Every
   tspackages response carries `Cache-Control: private, no-store`, so don't
   count on a client's HTTP cache.
-- **Cache in CI.** Persist the package manager's cache directory between
-  runs (`composer config cache-dir`, `uv cache dir`, `pip cache dir`). For
-  Python builds that must not depend on the registry, keep a wheelhouse
+- **Cache in CI.** Persist Composer's cache directory between runs
+  (`composer config cache-dir`). pip's cache is mostly an HTTP cache, which
+  `no-store` keeps empty. For Python builds that must not depend on the registry, keep a wheelhouse
   (`pip download -d wheelhouse`, then `pip install --no-index --find-links
   wheelhouse`).
 - **Upgrade at a quiet time** and tell publishers: an upload sent during
