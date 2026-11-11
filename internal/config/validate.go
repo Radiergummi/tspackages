@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -39,7 +40,7 @@ func ValidateWith(c *Config, opts ValidateOptions) error {
 
 	for _, eco := range slices.Sorted(maps.Keys(c.Ecosystems)) {
 		e := c.Ecosystems[eco]
-		if eco != "composer" {
+		if eco != "composer" && eco != "pypi" {
 			add("ecosystem %q is not supported yet", eco)
 			continue
 		}
@@ -240,8 +241,8 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		}
 		seen[s.Name] = true
 		for _, c := range s.Claims {
-			if !validClaim(c) {
-				add(`invalid claim %q (use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-])`, c)
+			if !validClaim(eco, c) {
+				add("invalid claim %q (%s)", c, claimHint[eco])
 				continue
 			}
 			// Uploads go to the first claiming source, so a name that an
@@ -250,16 +251,21 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				continue
 			}
 			for _, e := range earlier {
-				if claimsOverlap(c, e.pattern) {
+				if claimsOverlap(eco, c, e.pattern) {
 					add("claim %q overlaps claim %q of earlier source %q; uploads matching both would never be served (list the storage source first)", c, e.pattern, e.source)
 					break
 				}
 			}
 		}
 		for _, c := range s.Claims {
-			if validClaim(c) {
+			if validClaim(eco, c) {
 				earlier = append(earlier, claim{c, s.Name})
 			}
+		}
+		if len(s.Tags) > 0 && (eco != "pypi" || s.Type != "git") {
+			add("tags is only supported on pypi git sources")
+		} else {
+			validateTags(s, add)
 		}
 
 		if len(s.Claims) == 0 && s.Type != "storage" {
@@ -298,6 +304,9 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			if ssh && s.KnownHosts == "" {
 				add("known_hosts is required for SSH remotes")
 			}
+			if eco == "pypi" && len(s.Branches) > 0 {
+				add("branches are not supported for pypi (Python indexes have no branch versions)")
+			}
 		case "registry":
 			if s.URL == "" {
 				add("url is required")
@@ -314,6 +323,9 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			} else if s.URL != "" {
 				if u.Scheme != "https" && (u.Scheme != "http" || !opts.AllowHTTPUpstreams) {
 					add("url %q must use https", s.URL)
+				}
+				if eco == "pypi" && !strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/simple") {
+					add("url %q must point at a simple index (ending in /simple/)", s.URL)
 				}
 				if !HostAllowed(s.FetchHosts, u) {
 					add("url host %q is not in fetch_hosts", u.Host)
@@ -345,18 +357,41 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 // and URL path segments.
 var sourceNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-var claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
+var (
+	claimRe = regexp.MustCompile(`^[a-z0-9_.*-]+/[a-z0-9_.*-]+$`)
+	// pypiClaimRe is pypi.ValidPattern's grammar: normalised name characters
+	// and "*", with at least one character that is not "*".
+	pypiClaimRe = regexp.MustCompile(`^[a-z0-9*-]*[a-z0-9-][a-z0-9*-]*$`)
+)
 
-// validClaim accepts "*" or exactly two lowercase segments, so a claim can
-// never be a pattern that matches no Composer name or uses path.Match classes.
-func validClaim(c string) bool { return c == "*" || claimRe.MatchString(c) }
+var claimHint = map[string]string{
+	"composer": `use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-]`,
+	"pypi":     `use "*" or a normalised name pattern of [a-z0-9-] and "*"`,
+}
+
+// validClaim accepts "*" or a pattern in the ecosystem's normalised name
+// grammar (Composer: exactly two lowercase segments), so a claim can never be
+// a pattern that matches no name or uses path.Match classes.
+func validClaim(eco, c string) bool {
+	if c == "*" {
+		return true
+	}
+	if eco == "pypi" {
+		return pypiClaimRe.MatchString(c)
+	}
+	return claimRe.MatchString(c)
+}
 
 // claimsOverlap reports whether some package name matches both valid claims.
-// "*" matches every name; otherwise each claim is two segments in which only
-// "*" is special (it matches any run of characters within the segment).
-func claimsOverlap(a, b string) bool {
+// "*" matches every name; otherwise only "*" is special within a segment (it
+// matches any run of characters). Composer claims have two segments, pypi
+// claims one.
+func claimsOverlap(eco, a, b string) bool {
 	if a == "*" || b == "*" {
 		return true
+	}
+	if eco == "pypi" {
+		return globsOverlap(a, b)
 	}
 	av, an, _ := strings.Cut(a, "/")
 	bv, bn, _ := strings.Cut(b, "/")
@@ -408,4 +443,31 @@ func HostAllowed(hosts []string, u *url.URL) bool {
 		h = strings.ToLower(h)
 		return h == host || (hostPort != "" && h == hostPort)
 	})
+}
+
+// validateTags checks a pypi git source's tag mapping: every remote is listed
+// in remotes, every pattern is a valid glob, and every entry is "*" alone or
+// clean relative paths.
+func validateTags(s Source, add func(string, ...any)) {
+	for remote, patterns := range s.Tags {
+		if !slices.Contains(s.Remotes, remote) {
+			add("tags: remote %q is not listed in remotes", remote)
+		}
+		for pattern, dirs := range patterns {
+			if _, err := path.Match(pattern, ""); err != nil {
+				add("tags: invalid pattern %q", pattern)
+			}
+			if slices.Contains(dirs, "*") {
+				if len(dirs) != 1 {
+					add(`tags: pattern %q lists "*" with other directories`, pattern)
+				}
+				continue
+			}
+			for _, d := range dirs {
+				if d == "" || path.IsAbs(d) || path.Clean(d) != d || d == ".." || strings.HasPrefix(d, "../") {
+					add("tags: directory %q of pattern %q must be a clean relative path", d, pattern)
+				}
+			}
+		}
+	}
 }

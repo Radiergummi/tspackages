@@ -115,7 +115,7 @@ func TestValidateErrors(t *testing.T) {
 		name, yaml, want string
 	}{
 		{"unknown key", "stroage: {}\n" + base, "field stroage not found"},
-		{"unsupported ecosystem", base + "  pypi:\n    sources: []\n", `ecosystem "pypi" is not supported yet`},
+		{"unsupported ecosystem", base + "  oci:\n    sources: []\n", `ecosystem "oci" is not supported yet`},
 		{"two unclaimed", ecoc(`      - {name: a, type: registry, url: "https://a", fetch_hosts: [a]}
       - {name: b, type: registry, url: "https://b", fetch_hosts: [b]}
 `), "at most one unclaimed source"},
@@ -303,19 +303,19 @@ func TestProblemsAreAggregatedInOrder(t *testing.T) {
 	body := strings.Replace(base, "SECRET", "x", 1) + `      - {name: a, type: registry, url: "https://a"}
       - {name: a, type: git, claims: ["x/*"], remotes: ["file:///x"]}
   npm: {sources: []}
-  pypi: {sources: []}
+  oci: {sources: []}
 `
 	_, err := Load(writeConfig(t, body))
 	if err == nil {
 		t.Fatal("want error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"fetch_hosts is required", "duplicate source name", "unsupported remote scheme", `"npm" is not supported`, `"pypi" is not supported`} {
+	for _, want := range []string{"fetch_hosts is required", "duplicate source name", "unsupported remote scheme", `"npm" is not supported`, `"oci" is not supported`} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
 		}
 	}
-	if strings.Index(msg, `"npm"`) > strings.Index(msg, `"pypi"`) {
+	if strings.Index(msg, `"npm"`) > strings.Index(msg, `"oci"`) {
 		t.Errorf("ecosystem errors not sorted:\n%s", msg)
 	}
 }
@@ -438,10 +438,10 @@ func TestClaimsOverlap(t *testing.T) {
 		{"a/*", "b/*", false},
 		{"*x/y", "*z/y", false},
 	} {
-		if got := claimsOverlap(c.a, c.b); got != c.want {
+		if got := claimsOverlap("composer", c.a, c.b); got != c.want {
 			t.Errorf("claimsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 		}
-		if got := claimsOverlap(c.b, c.a); got != c.want {
+		if got := claimsOverlap("composer", c.b, c.a); got != c.want {
 			t.Errorf("claimsOverlap(%q, %q) = %v, want %v", c.b, c.a, got, c.want)
 		}
 	}
@@ -554,5 +554,95 @@ func TestExpandSkipsUnexportedFields(t *testing.T) {
 	}
 	if v.A != "expanded" || v.b != "${env:TSP_X}" {
 		t.Fatalf("%+v", v)
+	}
+}
+
+// pypiConfig is base with only a pypi ecosystem holding sources.
+func pypiConfig(sources string) string {
+	return strings.Replace(strings.Split(base, "ecosystems:")[0], "SECRET", "x", 1) + "ecosystems:\n  pypi:\n    sources:\n" + sources
+}
+
+func TestPyPIClaims(t *testing.T) {
+	src := func(claim string) string {
+		return pypiConfig("      - {name: r, type: registry, url: 'https://pypi.org/simple/', fetch_hosts: [pypi.org], claims: ['" + claim + "']}\n")
+	}
+	for _, good := range []string{"*", "matchory-*", "foo", "*-utils", "a1-b2"} {
+		if _, err := Load(writeConfig(t, src(good))); err != nil {
+			t.Errorf("%q: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"Matchory-*", "matchory_*", "a.b", "vendor/name", "**", "", "a b", "a[bc]"} {
+		_, err := Load(writeConfig(t, src(bad)))
+		if err == nil || !strings.Contains(err.Error(), "invalid claim") || !strings.Contains(err.Error(), bad) {
+			t.Errorf("%q: err = %v", bad, err)
+		}
+	}
+}
+
+func TestPyPIStorageClaimOverlap(t *testing.T) {
+	_, err := Load(writeConfig(t, pypiConfig(`      - {name: g, type: git, claims: ["matchory-*"], remotes: ["https://h/a.git"]}
+      - {name: hosted, type: storage, store: main, claims: ["matchory-core"]}
+`)))
+	if err == nil || !strings.Contains(err.Error(), "overlaps claim") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := Load(writeConfig(t, pypiConfig(`      - {name: hosted, type: storage, store: main, claims: ["matchory-*"]}
+      - {name: g, type: git, claims: ["matchory-*", "other"], remotes: ["https://h/a.git"]}
+      - {name: pypi, type: registry, url: "https://pypi.org/simple/", fetch_hosts: [pypi.org, files.pythonhosted.org]}
+`))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPyPITagsMapping(t *testing.T) {
+	ok := pypiConfig(`      - name: g
+        type: git
+        claims: ["acme-*"]
+        remotes: ["https://h/mono.git"]
+        tags:
+          "https://h/mono.git":
+            "core@*": [packages/core]
+            "v*": ["*"]
+`)
+	c, err := Load(writeConfig(t, ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Ecosystems["pypi"].Sources[0].Tags["https://h/mono.git"]["core@*"]; len(got) != 1 || got[0] != "packages/core" {
+		t.Fatalf("tags = %v", c.Ecosystems["pypi"].Sources[0].Tags)
+	}
+	for name, body := range map[string]string{
+		"unlisted remote": strings.Replace(ok, `"https://h/mono.git":`, `"https://h/other.git":`, 1),
+		"dotdot path":     strings.Replace(ok, "[packages/core]", "[../core]", 1),
+		"absolute path":   strings.Replace(ok, "[packages/core]", "[/core]", 1),
+		"bad pattern":     strings.Replace(ok, `"core@*"`, `"core@["`, 1),
+		"star with paths": strings.Replace(ok, `["*"]`, `["*", packages/core]`, 1),
+		"on composer":     strings.Replace(strings.Replace(ok, "pypi:", "composer:", 1), `["acme-*"]`, `["acme/*"]`, 1),
+	} {
+		if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "tags") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+func TestPyPIRegistryURLMustBeSimpleIndex(t *testing.T) {
+	_, err := Load(writeConfig(t, pypiConfig("      - {name: r, type: registry, url: 'https://pypi.org/', fetch_hosts: [pypi.org]}\n")))
+	if err == nil || !strings.Contains(err.Error(), "/simple/") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPyPIBranchesRejected(t *testing.T) {
+	_, err := Load(writeConfig(t, pypiConfig(`      - {name: g, type: git, claims: ["a-*"], remotes: ["https://h/a.git"], branches: [main]}
+`)))
+	if err == nil || !strings.Contains(err.Error(), "branches") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestUnsupportedEcosystem(t *testing.T) {
+	body := strings.Replace(pypiConfig("      - {name: r, type: registry, url: 'https://x/simple/', fetch_hosts: [x]}\n"), "pypi:", "npm:", 1)
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), `ecosystem "npm" is not supported yet`) {
+		t.Fatalf("err = %v", err)
 	}
 }
