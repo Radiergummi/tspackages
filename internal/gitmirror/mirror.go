@@ -517,6 +517,7 @@ func (m *Mirror) env() []string {
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_LITERAL_PATHSPECS=1", // repository paths carry no ":" magic or globs
 		"LC_ALL=C",
 		"LANGUAGE=",
 	)

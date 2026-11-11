@@ -599,6 +599,42 @@ func TestArchiveTar(t *testing.T) {
 	}
 }
 
+// Repository paths are literal: glob characters and ":" magic in a directory
+// name select only that directory.
+func TestPathsAreLiteral(t *testing.T) {
+	src := makeRepo(t)
+	write(t, src, "pkg[ab]/x.py", "x")
+	write(t, src, "pkga/y.py", "y")
+	write(t, src, ":(top)pkga/z.py", "z")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	for _, dir := range []string{"pkg[ab]", ":(top)pkga"} {
+		entries, err := m.ListTree(context.Background(), commit, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 || !strings.HasPrefix(entries[0].Path, dir+"/") {
+			t.Errorf("ListTree(%q): %+v", dir, entries)
+		}
+		var buf bytes.Buffer
+		if err := m.ArchiveTar(context.Background(), commit, []string{dir}, &buf); err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		tr := tar.NewReader(&buf)
+		for h, err := tr.Next(); err == nil; h, err = tr.Next() {
+			if h.Typeflag == tar.TypeReg {
+				names = append(names, h.Name)
+			}
+		}
+		if len(names) != 1 || !strings.HasPrefix(names[0], dir+"/") {
+			t.Errorf("ArchiveTar(%q): %v", dir, names)
+		}
+	}
+}
+
 func TestIsAncestorAndCommitTime(t *testing.T) {
 	src := makeRepo(t)
 	base := testutil.Git(t, src, "rev-parse", "HEAD")
