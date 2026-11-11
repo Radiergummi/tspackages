@@ -154,12 +154,13 @@ submodules, whose `readme` or `license` file is missing, a symlink, larger
 than 1MiB or outside the package directory, whose `pyproject.toml` doesn't
 parse or names an invalid extra, whose name and version make a filename
 longer than 148 bytes, or whose directory starts with `-` or holds a
-newline, are refused and reported. While a remote has never been indexed, or
-a tag couldn't be read, a name the source doesn't know answers `502` instead
-of moving on to the next source. Files generated at build time but not
-committed aren't in the sdist, and setuptools includes non-Python package
-data only if `MANIFEST.in` or `package-data` lists it. Publish such packages
-through a `storage` source.
+newline, are refused and reported. Until every remote has been indexed since
+tspackages started and every tag read, no new release is built (one may
+still be declared there), and a name without a stored release answers `502`
+instead of moving on to the next source. Files generated at build time but
+not committed aren't in the sdist, and setuptools includes non-Python
+package data only if `MANIFEST.in` or `package-data` lists it. Publish such
+packages through a `storage` source.
 
 ## Client setup
 

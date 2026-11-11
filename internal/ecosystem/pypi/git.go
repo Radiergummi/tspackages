@@ -36,6 +36,10 @@ const (
 	ConflictRebuild      = "rebuilt sdist differs from its record; not written"
 )
 
+// errClaimedElsewhere is a build that found the release claimed by another
+// indexer with other content; nothing is written.
+var errClaimedElsewhere = errors.New("pypi git: release claimed with other content")
+
 // errRebuildDiffers is a build whose sdist does not have the digest of the
 // release record it completes (export-subst output, for one, can change).
 var errRebuildDiffers = errors.New("pypi git: rebuilt sdist differs from its release record")
@@ -199,7 +203,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	conflicts, withheld, pending, refused := g.resolve(ctx, cands, stored)
+	conflicts, withheld, pending, refused := g.resolve(ctx, cands, stored, complete)
 	skipped = append(skipped, refused...)
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -238,8 +242,10 @@ type scan struct {
 	unread  error // a tag that could not be read
 }
 
-// scanRemote syncs a mirror and returns the candidates at its tags. An
-// unreachable remote is indexed from its local mirror when there is one.
+// scanRemote syncs a mirror and returns the candidates at its tags. A
+// remote that is unreachable after it synced in this process is indexed from
+// its local mirror; one that has not synced since the process started is an
+// error, even if a mirror from an earlier run is on disk.
 // unread is the error of a tag that could not be read; the other tags are
 // still returned.
 func (g *GitSource) scanRemote(ctx context.Context, m *gitmirror.Mirror) (cands []candidate, skipped []Skipped, unread, err error) {
@@ -395,8 +401,10 @@ func usesLFS(read func(string) ([]byte, error), entries []gitmirror.TreeEntry) b
 func inPackage(p, dir string) bool { return dir == "" || strings.HasPrefix(p, dir+"/") }
 
 // resolve decides, per name and canonical version, what to build and what
-// to report, and builds the new releases.
-func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[string][]release) (conflicts []Conflict, withheld, pending map[string]bool, refused []Skipped) {
+// to report, and builds the new releases. An incomplete pass builds nothing
+// new: a remote not yet scanned may declare the name too, or an unread tag
+// may be a version's earliest; those names are pending instead.
+func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[string][]release, complete bool) (conflicts []Conflict, withheld, pending map[string]bool, refused []Skipped) {
 	withheld, pending = map[string]bool{}, map[string]bool{}
 
 	byName := map[string][]candidate{}
@@ -421,7 +429,7 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 			byVersion[canon] = append(byVersion[canon], c)
 		}
 		for _, canon := range sortedKeys(byVersion) {
-			c, skip, failed := g.resolveVersion(ctx, name, canon, byVersion[canon], stored)
+			c, skip, failed := g.resolveVersion(ctx, name, canon, byVersion[canon], stored, complete)
 			if failed {
 				pending[name] = true
 			}
@@ -441,9 +449,11 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 
 // resolveVersion handles one release: the stored one wins; otherwise the
 // candidate whose commit precedes all others is built; divergent contents are
-// withheld. failed reports a build that failed for a reason other than
-// refused content; the next pass tries again.
-func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs []candidate, stored map[string][]release) (c *Conflict, skip *Skipped, failed bool) {
+// withheld. failed reports a release not stored in this pass for a reason
+// other than refused content: the pass was incomplete (so nothing new is
+// built), the build failed, or another indexer's record could not be
+// completed; the next pass tries again.
+func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs []candidate, stored map[string][]release, complete bool) (c *Conflict, skip *Skipped, failed bool) {
 	slices.SortFunc(cs, func(a, b candidate) int { return strings.Compare(a.tag, b.tag) })
 	if i := slices.IndexFunc(stored[name], func(r release) bool { return r.Canonical == canon }); i >= 0 {
 		served := stored[name][i]
@@ -451,6 +461,9 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 			return &Conflict{Package: name, Version: served.Version, Kind: ConflictRebuild, Tags: []string{served.Tag}}, nil, false
 		}
 		return differing(name, cs, served.Identity, ConflictNoBump), nil, false
+	}
+	if !complete {
+		return nil, nil, true
 	}
 	winner := g.earliest(ctx, cs)
 	if winner == nil {
@@ -465,7 +478,10 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 			return nil, &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: re.Reason}, false
 		}
 		if errors.Is(err, errRebuildDiffers) {
-			return &Conflict{Package: name, Version: winner.pkg.Version.String(), Kind: ConflictRebuild, Tags: []string{winner.tag}}, nil, false
+			return &Conflict{Package: name, Version: winner.pkg.Version.String(), Kind: ConflictRebuild, Tags: []string{winner.tag}}, nil, true
+		}
+		if errors.Is(err, errClaimedElsewhere) {
+			return nil, nil, true // reported as a conflict once the record is listed
 		}
 		g.log.Error("pypi git: building a release failed", "source", g.name, "package", name, "version", winner.pkg.Version.String(), "tag", winner.tag, "error", err)
 		return nil, nil, true
@@ -536,7 +552,8 @@ func (g *GitSource) earliest(ctx context.Context, cs []candidate) *candidate {
 // build generates the sdist of a candidate and stores it: the sidecar is
 // claimed first, so concurrent indexers agree on one release. An existing
 // sidecar with the same identity is completed only with an sdist of its
-// digest; otherwise build returns errRebuildDiffers and writes nothing.
+// digest; otherwise build returns errRebuildDiffers and writes nothing. One
+// with another identity is left alone (errClaimedElsewhere).
 func (g *GitSource) build(ctx context.Context, c candidate) error {
 	m := c.remote
 	read := func(p string) ([]byte, error) { return m.ReadFile(ctx, c.commit, p) }
@@ -592,7 +609,7 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 			return rerr
 		}
 		if existing.Identity != r.Identity {
-			return nil // reported as a conflict on the next pass
+			return errClaimedElsewhere
 		}
 		if existing.SHA256 != r.SHA256 {
 			g.log.Warn("pypi git: a rebuilt sdist differs from its release record; not written", "source", g.name,

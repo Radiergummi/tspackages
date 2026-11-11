@@ -16,8 +16,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-remote tag mapping. Releases are keyed by normalised name and PEP 440
   version and never change bytes once published. The status page lists
   PyPI client settings, git conflicts and skipped packages. Until every
-  remote of a `git` source has been indexed and every tag read, a name it
-  doesn't know answers `502` instead of falling through to a later source.
+  remote of a `git` source has been indexed since startup and every tag
+  read, it builds no new release, and a name without a stored release
+  answers `502` instead of falling through to a later source.
 - A registry archive whose bytes differ from the ones first fetched for the
   same version and reference is logged at warn and listed on the status page.
   Packagist declares no checksum for most GitHub archives, so this is the

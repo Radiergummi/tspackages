@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"iter"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -469,11 +470,11 @@ func TestRemoteNeverIndexedIsUnavailable(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "later")
 	g := newGitEnv(t).source(t, nil, a.dir, missing)
 	index(t, g)
-	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
-		t.Fatalf("core = %v", got)
-	}
-	if _, err := g.Project(context.Background(), "acme-api"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
-		t.Fatalf("a name of the unindexed remote: %v", err)
+	// Nothing new is built yet: the unindexed remote may declare it too.
+	for _, n := range []string{"acme-core", "acme-api"} {
+		if _, err := g.Project(context.Background(), n); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+			t.Fatalf("%s while a remote never indexed: %v", n, err)
+		}
 	}
 	if err := os.MkdirAll(missing, 0o755); err != nil {
 		t.Fatal(err)
@@ -483,8 +484,10 @@ func TestRemoteNeverIndexedIsUnavailable(t *testing.T) {
 	b.write(map[string]string{"pyproject.toml": pyproject("acme-api", "1.0.0")})
 	b.tag("v1")
 	index(t, g)
-	if got := versionsOf(t, g, "acme-api"); len(got) != 1 {
-		t.Fatalf("api = %v", got)
+	for _, n := range []string{"acme-core", "acme-api"} {
+		if got := versionsOf(t, g, n); len(got) != 1 {
+			t.Fatalf("%s = %v", n, got)
+		}
 	}
 	if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("once every remote is indexed: %v", err)
@@ -497,6 +500,23 @@ func TestUnreadableTagIsUnavailable(t *testing.T) {
 	r := newRepo(t)
 	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
 	r.tag("v1")
+	m := mirrorWithoutTree(t, r, "v1")
+	env := newGitEnv(t)
+	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Index(context.Background())
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("a name at an unreadable tag: %v", err)
+	}
+}
+
+// mirrorWithoutTree returns a synced mirror of r that lost the root tree of
+// rev (the tag lists, its tree does not read), with r's remote gone, so a
+// pass indexes the local mirror.
+func mirrorWithoutTree(t *testing.T, r *repo, rev string) *gitmirror.Mirror {
+	t.Helper()
 	m, err := gitmirror.New(gitmirror.Options{Remote: r.dir, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
 	if err != nil {
 		t.Fatal(err)
@@ -504,9 +524,7 @@ func TestUnreadableTagIsUnavailable(t *testing.T) {
 	if err := m.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Lose the tagged commit's tree from the mirror: the tag lists, its
-	// tree does not read.
-	tree := testutil.Git(t, r.dir, "rev-parse", "v1^{tree}")
+	tree := testutil.Git(t, r.dir, "rev-parse", rev+"^{tree}")
 	packs, _ := filepath.Glob(filepath.Join(m.Dir(), "objects", "pack", "*.pack"))
 	for _, p := range packs {
 		b, err := os.ReadFile(p)
@@ -525,18 +543,83 @@ func TestUnreadableTagIsUnavailable(t *testing.T) {
 	if err := os.Remove(filepath.Join(m.Dir(), "objects", tree[:2], tree[2:])); err != nil {
 		t.Fatal(err)
 	}
-	// The remote is gone too, so the pass indexes the local mirror.
 	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
 		t.Fatal(err)
 	}
+	return m
+}
+
+// releaseRecords counts the stored release records.
+func releaseRecords(t *testing.T, d storage.Driver) int {
+	t.Helper()
+	n := 0
+	for info, err := range d.List(context.Background(), "pypi-git/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(info.Key, "/release.json") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestIncompletePassBuildsNothing: after a restart, a remote that has not
+// synced yet may declare a name the other remotes do, so no release is
+// built until every remote has been scanned.
+func TestIncompletePassBuildsNothing(t *testing.T) {
+	a, b := newRepo(t), newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "a.py": "a"})
+	a.tag("v1")
+	b.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "b.py": "b"})
+	b.tag("v1")
+	env := newGitEnv(t)
+	index(t, env.source(t, nil, a.dir, b.dir))
+	if err := os.Rename(b.dir, b.dir+"-away"); err != nil {
+		t.Fatal(err)
+	}
+	g := env.source(t, nil, a.dir, b.dir) // a restart: b's fresh mirror never synced
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("while b is unreachable: %v", err)
+	}
+	if n := releaseRecords(t, env.state); n != 0 {
+		t.Fatalf("%d releases built from an incomplete pass", n)
+	}
+	if err := os.Rename(b.dir+"-away", b.dir); err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("once b is back: %v", err)
+	}
+	if n := releaseRecords(t, env.state); n != 0 {
+		t.Fatalf("%d releases of a name two repositories declare", n)
+	}
+}
+
+// TestUnreadEarliestTagBuildsNothing: when the earliest tag of a version
+// cannot be read, a later tag must not be stored in its place.
+func TestUnreadEarliestTagBuildsNothing(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "a.py": "first"})
+	r.tag("v1")
+	// Unrelated history, so building the later tag never reads v1's tree.
+	testutil.Git(t, r.dir, "checkout", "-q", "--orphan", "other")
+	r.write(map[string]string{"a.py": "second"})
+	r.tag("v1-again")
+	m := mirrorWithoutTree(t, r, "v1")
 	env := newGitEnv(t)
 	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.Index(context.Background())
-	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
-		t.Fatalf("a name at an unreadable tag: %v", err)
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v", err)
+	}
+	if n := releaseRecords(t, env.state); n != 0 {
+		t.Fatalf("%d releases built while the earliest tag was unread", n)
 	}
 }
 
@@ -620,6 +703,69 @@ func TestRebuildMustMatchRecord(t *testing.T) {
 	}
 	if c := g2.Conflicts(); len(c) != 1 || c[0].Kind != ConflictRebuild || c[0].Package != "acme-core" {
 		t.Fatalf("conflicts = %+v", c)
+	}
+}
+
+// hideRecords lists no release records, as a store does before another
+// indexer's claim shows up in its listing.
+type hideRecords struct{ storage.Driver }
+
+func (h hideRecords) List(ctx context.Context, prefix string) iter.Seq2[storage.Info, error] {
+	return func(yield func(storage.Info, error) bool) {
+		for info, err := range h.Driver.List(ctx, prefix) {
+			if err == nil && strings.HasSuffix(info.Key, "/release.json") {
+				continue
+			}
+			if !yield(info, err) {
+				return
+			}
+		}
+	}
+}
+
+// TestClaimedElsewhereIsPending: a build that finds another indexer's record
+// it cannot complete leaves the name unavailable for the pass, not missing.
+func TestClaimedElsewhereIsPending(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		change   func(*release)
+		conflict string
+	}{
+		{"other identity", func(r *release) { r.Identity = "other" }, ""},
+		{"other bytes", func(r *release) { r.SHA256 = sum256([]byte("other bytes")) }, ConflictRebuild},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRepo(t)
+			r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+			r.tag("v1")
+			env := newGitEnv(t)
+			g := env.source(t, nil, r.dir)
+			index(t, g)
+			ctx := context.Background()
+			v, _ := ParseVersion("1.0.0")
+			dir := g.releaseDir("acme-core", v.Canonical())
+			rel, err := g.readRelease(ctx, dir+"release.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.change(&rel)
+			body, _ := json.Marshal(rel)
+			if _, err := env.state.Put(ctx, dir+"release.json", bytes.NewReader(body)); err != nil {
+				t.Fatal(err)
+			}
+			if err := env.state.Delete(ctx, dir+storage.EscapeSegment(rel.Filename)); err != nil {
+				t.Fatal(err)
+			}
+			env.state = hideRecords{env.state}
+			g2 := env.source(t, nil, r.dir)
+			index(t, g2)
+			if _, err := g2.Project(ctx, "acme-core"); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("err = %v", err)
+			}
+			if c.conflict != "" && !slices.ContainsFunc(g2.Conflicts(), func(x Conflict) bool { return x.Kind == c.conflict }) {
+				t.Fatalf("conflicts = %+v", g2.Conflicts())
+			}
+		})
 	}
 }
 
