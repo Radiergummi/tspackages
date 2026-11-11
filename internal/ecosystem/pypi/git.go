@@ -116,6 +116,9 @@ type GitSource struct {
 	stored   map[string]release     // sidecars by key; they never change
 	idx      atomic.Pointer[gitIndex]
 	lastScan map[string]scan // each remote's last successful scan; guarded by mu
+	// buildRefusals are the reasons builds were refused, by remote, commit
+	// and package directory; guarded by mu.
+	buildRefusals map[string]string
 
 	hmu    sync.Mutex
 	health map[string]error // last pass outcome per remote
@@ -139,6 +142,7 @@ func NewGitSource(name string, claims []string, mirrors []*gitmirror.Mirror, tag
 	g := &GitSource{
 		name: name, claims: claims, mirrors: mirrors, tags: tags, state: state, rec: rec, poll: poll, log: log, maxBytes: maxBytes,
 		byCommit: map[string][]candidate{}, stored: map[string]release{}, health: map[string]error{}, lastScan: map[string]scan{},
+		buildRefusals: map[string]string{},
 	}
 	g.idx.Store(&gitIndex{releases: map[string][]release{}, withheld: map[string]bool{}})
 	// Serve what is stored at once; a pass adds to it.
@@ -324,8 +328,16 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		return slices.Clone(c), nil
 	}
 	tree, err := m.ListTree(ctx, commit, "")
+	if errors.Is(err, gitmirror.ErrTreeTooLarge) {
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree has more than %d entries", gitmirror.MaxTreeEntries)), nil
+	}
 	if err != nil {
 		return nil, err
+	}
+	// Each pyproject.toml may cost a read; a tree of a few objects can hold
+	// thousands.
+	if n := countFunc(tree, func(e gitmirror.TreeEntry) bool { return path.Base(e.Path) == "pyproject.toml" }); n > maxPyprojects {
+		return g.refuseCommit(key, m, commit, fmt.Sprintf("tree holds %d pyproject.toml files, more than %d", n, maxPyprojects)), nil
 	}
 	dirSet := map[string]bool{}
 	modes := map[string]string{}
@@ -347,7 +359,9 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	// before git is asked: ReadFile refuses a path that is not clean or holds
 	// a newline or NUL, ArchiveTar a directory that starts with "-", and a
 	// symlink would be read as its target path (the sdist leaves symlinks
-	// out). Whatever ReadFile still fails on is not the content's doing.
+	// out). Whatever ReadFile still fails on is not the content's doing: a
+	// path the tree lists but git cannot find is a broken mirror, so its
+	// not-found is not passed on as one.
 	read := func(p string) ([]byte, error) {
 		mode, ok := modes[p]
 		switch {
@@ -358,25 +372,30 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 		case mode != "100644" && mode != "100755":
 			return nil, fmt.Errorf("%s: %w", p, errNotRegular)
 		}
-		return m.ReadFile(ctx, commit, p)
+		b, err := m.ReadFile(ctx, commit, p)
+		if errors.Is(err, resolve.ErrNotFound) {
+			return nil, fmt.Errorf("%s is in the tree but not in the mirror: %v", p, err) //nolint:errorlint // a missing object is I/O, not a miss
+		}
+		return b, err
 	}
 	pkgs, err := DiscoverPackages(read, dirs)
 	if err != nil {
 		return nil, err
 	}
+	entries, attrsAt := groupTree(tree, pkgs)
 	var out []candidate
-	for _, p := range pkgs {
+	for i, p := range pkgs {
 		c := candidate{pkg: p, remote: m, commit: commit}
 		// A package with a name and version is a release candidate, even
 		// when it is refused: the earliest tag of a version decides.
-		if p.Name != "" && len(p.Version.release) > 0 {
-			var entries, attrs []gitmirror.TreeEntry
-			for _, e := range tree {
-				if inPackage(e.Path, p.Dir) && !excluded(e.Path, p.Exclude) {
-					entries = append(entries, e)
-				} else if d := path.Dir(e.Path); path.Base(e.Path) == ".gitattributes" && (d == "." || strings.HasPrefix(p.Dir+"/", d+"/")) {
-					attrs = append(attrs, e) // an ancestor directory's attributes
+		if isRelease(p) {
+			entries := entries[i]
+			var attrs []gitmirror.TreeEntry // the ancestor directories' attributes
+			for d := p.Dir; d != ""; {
+				if d = path.Dir(d); d == "." {
+					d = ""
 				}
+				attrs = append(attrs, attrsAt[d]...)
 			}
 			c.refused = cmp.Or(p.Skip, RefuseTree(entries))
 			if c.refused == "" && !keysFit(SdistFilename(p.Name, p.Version)) {
@@ -393,6 +412,82 @@ func (g *GitSource) discover(ctx context.Context, m *gitmirror.Mirror, commit st
 	}
 	g.byCommit[key] = out
 	return slices.Clone(out), nil
+}
+
+// maxPyprojects caps the pyproject.toml files of a tree that discovery
+// looks at.
+const maxPyprojects = 1000
+
+// isRelease reports whether p has a name and version.
+func isRelease(p Package) bool { return p.Name != "" && len(p.Version.release) > 0 }
+
+// refuseCommit caches and returns the refusal of every package at commit.
+func (g *GitSource) refuseCommit(key string, m *gitmirror.Mirror, commit, reason string) []candidate {
+	out := []candidate{{pkg: Package{Skip: reason}, remote: m, commit: commit}}
+	g.byCommit[key] = out
+	return slices.Clone(out)
+}
+
+func countFunc[T any](xs []T, f func(T) bool) int {
+	n := 0
+	for _, x := range xs {
+		if f(x) {
+			n++
+		}
+	}
+	return n
+}
+
+// groupTree gives each release in pkgs its tree entries (those under its
+// directory, for the root package without the member directories) and
+// returns the .gitattributes files by directory ("" = the root), in one walk
+// over the tree. Paths fsck rejects are matched by prefix, so the package
+// holding one is refused.
+func groupTree(tree []gitmirror.TreeEntry, pkgs []Package) ([][]gitmirror.TreeEntry, map[string][]gitmirror.TreeEntry) {
+	byDir := map[string][]int{}
+	rootExclude := map[string]bool{}
+	for i, p := range pkgs {
+		if isRelease(p) {
+			byDir[p.Dir] = append(byDir[p.Dir], i)
+		}
+		if p.Dir == "" {
+			for _, d := range p.Exclude {
+				rootExclude[strings.TrimSuffix(d, "/")] = true
+			}
+		}
+	}
+	entries := make([][]gitmirror.TreeEntry, len(pkgs))
+	attrsAt := map[string][]gitmirror.TreeEntry{}
+	for _, e := range tree {
+		if !cleanTreePath(e.Path) {
+			for i, p := range pkgs {
+				if isRelease(p) && inPackage(e.Path, p.Dir) && !excluded(e.Path, p.Exclude) {
+					entries[i] = append(entries[i], e)
+				}
+			}
+			continue
+		}
+		if path.Base(e.Path) == ".gitattributes" {
+			d := path.Dir(e.Path)
+			if d == "." {
+				d = ""
+			}
+			attrsAt[d] = append(attrsAt[d], e)
+		}
+		inMember := false
+		for d := path.Dir(e.Path); d != "."; d = path.Dir(d) {
+			inMember = inMember || rootExclude[d]
+			for _, i := range byDir[d] {
+				entries[i] = append(entries[i], e)
+			}
+		}
+		if !inMember {
+			for _, i := range byDir[""] {
+				entries[i] = append(entries[i], e)
+			}
+		}
+	}
+	return entries, attrsAt
 }
 
 // lfsRefusal returns why the package is refused when one of the
@@ -437,7 +532,17 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 			return conflicts, withheld, pending, refused
 		}
 		cs := byName[name]
-		remotes := uniq(cs, func(c candidate) string { return c.remote.Remote() })
+		// A refused copy in another repository neither withholds the name
+		// nor takes part in its releases; within the repository that
+		// serves it, a refused tag still counts.
+		remotes := uniq(slices.DeleteFunc(slices.Clone(cs), func(c candidate) bool { return c.refused != "" }),
+			func(c candidate) string { return c.remote.Remote() })
+		switch {
+		case len(remotes) == 1:
+			cs = slices.DeleteFunc(cs, func(c candidate) bool { return c.remote.Remote() != remotes[0] })
+		case len(remotes) == 0 && len(uniq(cs, func(c candidate) string { return c.remote.Remote() })) > 1:
+			continue // refused everywhere; scanRemote reported each
+		}
 		if len(remotes) > 1 {
 			withheld[name] = true
 			redacted := make([]string, len(remotes))
@@ -504,9 +609,17 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 	if winner.refused != "" {
 		return nil, nil, false // the version is refused; scanRemote reported it
 	}
+	refusalKey := winner.remote.Remote() + "\x00" + winner.commit + "\x00" + winner.pkg.Dir
+	refuse := func(reason string) *Skipped {
+		return &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: reason}
+	}
+	if reason, ok := g.buildRefusals[refusalKey]; ok {
+		return nil, refuse(reason), false // a commit's content never changes
+	}
 	if err := g.build(ctx, *winner); err != nil {
 		if re, ok := errors.AsType[*RefusedError](err); ok {
-			return nil, &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: re.Reason}, false
+			g.buildRefusals[refusalKey] = re.Reason
+			return nil, refuse(re.Reason), false
 		}
 		if errors.Is(err, errRebuildDiffers) {
 			return &Conflict{Package: name, Version: winner.pkg.Version.String(), Kind: ConflictRebuild, Tags: []string{winner.tag}}, nil, true

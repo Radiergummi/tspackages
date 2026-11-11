@@ -527,6 +527,17 @@ func mirrorWithout(t *testing.T, r *repo, object string) *gitmirror.Mirror {
 	if err := m.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	dropObject(t, m, object)
+	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// dropObject removes object from m: its packs are unpacked into loose
+// objects first.
+func dropObject(t *testing.T, m *gitmirror.Mirror, object string) {
+	t.Helper()
 	packs, _ := filepath.Glob(filepath.Join(m.Dir(), "objects", "pack", "*.pack"))
 	for _, p := range packs {
 		b, err := os.ReadFile(p)
@@ -545,10 +556,6 @@ func mirrorWithout(t *testing.T, r *repo, object string) *gitmirror.Mirror {
 	if err := os.Remove(filepath.Join(m.Dir(), "objects", object[:2], object[2:])); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
-		t.Fatal(err)
-	}
-	return m
 }
 
 // releaseRecords counts the stored release records.
@@ -1055,4 +1062,147 @@ func TestUnreadableAttributes(t *testing.T) {
 	g2 := newGitEnv(t).source(t, nil, big.dir)
 	index(t, g2)
 	assertRefused(t, g2, "acme-core", ".gitattributes")
+}
+
+// TestMissingObjectIsUnread: a file the tree lists but the mirror lacks is a
+// broken mirror, not missing content: the tag is unread, nothing is refused.
+func TestMissingObjectIsUnread(t *testing.T) {
+	for _, c := range []struct{ name, file string }{
+		{"pyproject.toml", "pyproject.toml"},
+		{"readme", "README.md"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRepo(t)
+			r.write(map[string]string{
+				"pyproject.toml": strings.Replace(pyproject("acme-core", "1.0.0"), "[project]\n", "[project]\nreadme = \"README.md\"\n", 1),
+				"README.md":      "# Acme\n",
+			})
+			r.tag("v1")
+			m := mirrorWithout(t, r, testutil.Git(t, r.dir, "rev-parse", "v1:"+c.file))
+			env := newGitEnv(t)
+			g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			index(t, g)
+			if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+				t.Fatalf("err = %v", err)
+			}
+			if s := g.Skipped(); len(s) != 0 {
+				t.Fatalf("refused: %+v", s)
+			}
+		})
+	}
+}
+
+// TestRefusedElsewhereDoesNotWithhold: a refused copy of a name in another
+// repository does not take down the name the first one serves.
+func TestRefusedElsewhereDoesNotWithhold(t *testing.T) {
+	a, b := newRepo(t), newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	a.tag("v1")
+	b.write(map[string]string{"pyproject.toml": strings.Replace(pyproject("acme-core", "9.0.0"), "[project]\n", "[project]\nreadme = \"MISSING.md\"\n", 1)})
+	b.tag("v9")
+	g := newGitEnv(t).source(t, nil, a.dir, b.dir)
+	index(t, g)
+	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
+		t.Fatalf("files = %v", got)
+	}
+	if c := g.Conflicts(); len(c) != 0 {
+		t.Fatalf("conflicts = %+v", c)
+	}
+	if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, "does not exist") {
+		t.Fatalf("skipped = %+v", s)
+	}
+}
+
+// TestBuildRefusalCached: a release refused at build time is not built again
+// on later passes.
+func TestBuildRefusalCached(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-big", "1.0.0"), "blob.bin": strings.Repeat("x", 64<<10)})
+	r.tag("v1")
+	m, err := gitmirror.New(gitmirror.Options{Remote: r.dir, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newGitEnv(t)
+	g, err := NewGitSource("git", []string{"*"}, []*gitmirror.Mirror{m}, nil, env.state, env.rec, 0, nil, 16<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	// A build now fails on the missing blob instead of being refused.
+	dropObject(t, m, testutil.Git(t, r.dir, "rev-parse", "v1:blob.bin"))
+	if err := os.Rename(r.dir, r.dir+"-gone"); err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-big"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("built again: %v", err)
+	}
+	if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, "larger than") {
+		t.Fatalf("skipped = %+v", s)
+	}
+}
+
+// bombTree returns a tree of fan^depth leaf directories, each holding leaf
+// (name → blob), from depth+1 tree objects.
+func bombTree(t *testing.T, r *repo, fan, depth int, leaf map[string]string) string {
+	t.Helper()
+	var sb strings.Builder
+	for name, blob := range leaf {
+		fmt.Fprintf(&sb, "100644 blob %s\t%s\n", blob, name)
+	}
+	cur := gitStdin(t, r.dir, sb.String(), "mktree")
+	for range depth {
+		sb.Reset()
+		for i := range fan {
+			fmt.Fprintf(&sb, "040000 tree %s\td%02d\n", cur, i)
+		}
+		cur = gitStdin(t, r.dir, sb.String(), "mktree")
+	}
+	return cur
+}
+
+// TestTreeBombsRefused: a tree with more entries than the cap, or more
+// pyproject.toml files than packages are looked at, is refused once and
+// cached, without being read whole.
+func TestTreeBombsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name, reason string
+		root         string
+		fan, depth   int
+		leaf         func(r *repo) map[string]string
+	}{
+		{"entries", "entries", pyproject("acme-core", "1.0.0"), 16, 5,
+			func(r *repo) map[string]string {
+				return map[string]string{"f": gitStdin(t, r.dir, "x\n", "hash-object", "-w", "--stdin")}
+			}},
+		{"packages", "pyproject.toml", "[tool.uv.workspace]\nmembers = [\"bomb/*/*/*\"]\n", 16, 3,
+			func(r *repo) map[string]string {
+				return map[string]string{"pyproject.toml": gitStdin(t, r.dir, pyproject("acme-m", "1.0.0"), "hash-object", "-w", "--stdin")}
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRepo(t)
+			r.write(map[string]string{"pyproject.toml": c.root})
+			bomb := bombTree(t, r, c.fan, c.depth, c.leaf(r))
+			root := testutil.Git(t, r.dir, "rev-parse", "HEAD:pyproject.toml")
+			tagTree(t, r, gitStdin(t, r.dir, fmt.Sprintf("040000 tree %s\tbomb\n100644 blob %s\tpyproject.toml\n", bomb, root), "mktree"), "v1")
+			g := newGitEnv(t).source(t, nil, r.dir)
+			start := time.Now()
+			index(t, g)
+			index(t, g)
+			if d := time.Since(start); d > 20*time.Second {
+				t.Errorf("two passes took %v", d)
+			}
+			if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, c.reason) {
+				t.Fatalf("skipped = %+v", s)
+			}
+			if _, err := g.Project(context.Background(), "unknown"); !errors.Is(err, resolve.ErrNotFound) {
+				t.Fatalf("index incomplete: %v", err)
+			}
+		})
+	}
 }

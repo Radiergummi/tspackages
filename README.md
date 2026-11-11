@@ -155,14 +155,15 @@ submodules or paths `git fsck` rejects (such as `..`), whose `readme` or
 package directory, whose `pyproject.toml` doesn't parse or names an invalid
 extra, whose name and version make a filename longer than 148 bytes, or
 whose directory starts with `-` or holds a newline, are refused and
-reported. The earliest tag of a version decides: if it is refused, so is the
-version, and a later tag doesn't stand in. Until every remote has been
-indexed since tspackages started and every tag read, no new release is built
-(one may still be declared there), and a name without a stored release
-answers `502` instead of moving on to the next source. Files generated at
-build time but not committed aren't in the sdist, and setuptools includes
-non-Python package data only if `MANIFEST.in` or `package-data` lists it.
-Publish such packages through a `storage` source.
+reported, and so is every package of a tag whose tree has more than 100,000
+entries or 1,000 `pyproject.toml` files. The earliest tag of a version
+decides: if it is refused, so is the version, and a later tag doesn't stand
+in. Until every remote has been indexed since tspackages started and every
+tag read, no new release is built (one may still be declared there), and a
+name without a stored release answers `502` instead of moving on to the next
+source. Files generated at build time but not committed aren't in the sdist,
+and setuptools includes non-Python package data only if `MANIFEST.in` or
+`package-data` lists it. Publish such packages through a `storage` source.
 
 ## Client setup
 

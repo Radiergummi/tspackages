@@ -575,8 +575,17 @@ func checkPath(p string) error {
 	return nil
 }
 
+// MaxTreeEntries caps a ListTree: a few tree objects can name millions of
+// paths.
+const MaxTreeEntries = 100_000
+
+// ErrTreeTooLarge is wrapped by ListTree for a tree with more than
+// MaxTreeEntries entries.
+var ErrTreeTooLarge = fmt.Errorf("tree has more than %d entries", MaxTreeEntries)
+
 // ListTree lists every file, symlink and submodule under dir ("" = the whole
-// tree) at commit, with paths from the repository root.
+// tree) at commit, with paths from the repository root. The listing is parsed
+// while git writes it and stops at MaxTreeEntries (ErrTreeTooLarge).
 func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
@@ -588,23 +597,62 @@ func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry,
 		}
 		args = append(args, "--", dir)
 	}
-	out, err := m.git(ctx, m.dir, nil, nil, args...)
+	tp := &treeParser{}
+	_, err := m.git(ctx, m.dir, nil, tp, args...)
+	if tp.err != nil {
+		return nil, tp.err // git died of the closed pipe; the cause is ours
+	}
 	if err != nil {
 		return nil, err
 	}
-	var entries []TreeEntry
-	for rec := range strings.SplitSeq(strings.TrimSuffix(string(out), "\x00"), "\x00") {
+	if len(tp.buf) > 0 {
+		return nil, fmt.Errorf("gitmirror: unexpected ls-tree output %q", tp.buf)
+	}
+	return tp.entries, nil
+}
+
+// treeParser parses `ls-tree -z` output as it is written.
+type treeParser struct {
+	buf     []byte
+	entries []TreeEntry
+	err     error
+}
+
+func (tp *treeParser) Write(b []byte) (int, error) {
+	if tp.err != nil {
+		return 0, tp.err
+	}
+	tp.buf = append(tp.buf, b...)
+	start := 0
+	for {
+		i := bytes.IndexByte(tp.buf[start:], 0)
+		if i < 0 {
+			break
+		}
+		rec := string(tp.buf[start : start+i])
+		start += i + 1
 		if rec == "" {
 			continue
 		}
 		meta, p, ok := strings.Cut(rec, "\t")
 		f := strings.Fields(meta)
-		if !ok || len(f) != 3 {
-			return nil, fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
+		switch {
+		case !ok || len(f) != 3:
+			tp.err = fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
+		case len(tp.entries) == MaxTreeEntries:
+			tp.err = fmt.Errorf("gitmirror: %w", ErrTreeTooLarge)
 		}
-		entries = append(entries, TreeEntry{Mode: f[0], Type: f[1], Object: f[2], Path: p})
+		if tp.err != nil {
+			return 0, tp.err
+		}
+		tp.entries = append(tp.entries, TreeEntry{Mode: f[0], Type: f[1], Object: f[2], Path: p})
 	}
-	return entries, nil
+	tp.buf = append(tp.buf[:0], tp.buf[start:]...)
+	if len(tp.buf) > maxReadFile {
+		tp.err = errors.New("gitmirror: ls-tree record over 1 MiB")
+		return 0, tp.err
+	}
+	return len(b), nil
 }
 
 // ArchiveTar writes the tar archive of the given paths at commit, honouring
