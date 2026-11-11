@@ -1,8 +1,9 @@
 # Operations
 
 How to run tspackages: deploying, backups, upgrades, monitoring and what to
-do when something goes wrong. Read [security.md](security.md) first; this
-page assumes it.
+do when something goes wrong. Read [security.md](security.md) first,
+including its [threat model](security.md#threat-model); this page assumes
+it.
 
 tspackages is one process and one tsnet node. There is no cluster mode and no
 standby. Everything below follows from that.
@@ -242,9 +243,10 @@ container:
    list until its next upload; pip and uv don't read that list.
 4. Start tspackages. `/readyz` answers `ok` once every store is reachable.
    PyPI releases already in the state store are served at once. Names
-   claimed by a Composer git source, and PyPI git names without a stored
-   release, answer `502` until the first index pass, which starts at once
-   and clones the mirrors first.
+   claimed by a Composer git source answer `502` until the first index
+   pass, which starts at once and clones the mirrors first. See
+   [When the registry is down](#when-the-registry-is-down) for PyPI git
+   sources, which can take longer.
 5. Publish again what was published after the backup, from the **original
    artifacts**: the same zip, wheel or sdist bytes. A rebuilt file has
    another `reference` or SHA256, and lock files that pinned the original
@@ -266,7 +268,7 @@ moment: hosted packages need nothing from the state store.
   rebuilt from git; if the bytes differ (another git version, for one), the
   `shasum` in existing `composer.lock` files no longer matches. PyPI sdists
   are regenerated; they come out the same only while the sdist format is
-  unchanged and the same tag wins, otherwise hash-pinned lock files break.
+  unchanged and the same tagged commit wins, otherwise hash-pinned lock files break.
   Versions whose tags are gone upstream are lost. Provenance and audit
   records are lost, and the check for registry archives that changed
   upstream starts over.
@@ -345,15 +347,19 @@ worth an alert:
 
 | Message | Level | Means |
 |---------|-------|-------|
-| `relay: download failed` with `relay: digest mismatch` in `error` | warn | An upstream archive didn't match its declared hash. Nothing was cached and the client's transfer was broken off. |
+| `relay: download failed` with `relay: digest mismatch` in `error` | warn | An upstream archive didn't match its declared hash. Nothing was cached, and the client's transfer was broken off short of its `Content-Length`. |
+| `relay: download failed` with `relay: cache` in `error` | warn | A verified archive reached the client but couldn't be cached; the next request fetches it again. |
 | `composer dist changed upstream; serving the new bytes` | warn | A registry archive differs from the bytes first seen for that version and reference. |
 | `composer git: tag moved upstream; serving the pinned commit` | warn | A tag was force-pushed. The pin keeps the first commit. |
 | `composer package declared by several remotes; not served` | error | Two remotes of one git source declare the same package. |
 | `composer git: serving pinned versions only` | warn | A remote can't be indexed, so only its pinned versions are served. |
 | `composer git index failed`, `pypi git index failed` | error | A whole index pass failed. |
 | `composer git: indexing failed; keeping previous index` | error | A remote couldn't be indexed; its previous versions stay served. |
+| `composer git: tag skipped`, `composer git: branch skipped` | warn | A version wasn't served; `error` says why, for example an archive with a path git can't hand over intact. |
 | `composer git sync failed; ...`, `pypi git sync failed; ...` | warn | A remote is unreachable. |
-| `pypi git: indexing a remote failed; its stored releases stay served` | warn | A remote couldn't be indexed. |
+| `pypi git: indexing a remote failed; its last scan stands` | warn | A remote couldn't be indexed. Until it has been once since startup, the source builds no new release (see [When the registry is down](#when-the-registry-is-down)). |
+| `pypi git: reading a tag failed` | warn | A tag couldn't be read; until it is, the source builds no new release. |
+| `pypi git: a rebuilt sdist differs from its release record; not written` | warn | Rebuilding a stored release's missing sdist gave other bytes. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
 | `pypi git: repairing a release failed` | error | A stored release lacks its sdist and couldn't be built again. |
 | `composer upstream unhealthy`, `pypi upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
@@ -362,8 +368,12 @@ worth an alert:
 | `not ready` | warn | `/readyz` failed. |
 
 PyPI git conflicts (a release changed without a version bump, divergent
-histories, a package in several repositories) appear on the status page
-only, not in the logs.
+histories, a package in several repositories) and refused content (a tree,
+path, `pyproject.toml` or workspace over the caps in the
+[threat model](security.md#threat-model), nested members, duplicate paths)
+appear on the status page only, not in the logs. A refusal is remembered
+for the commit until restart; a fixed repository needs a new tag, and with
+it a new version, anyway.
 
 ## Removing a bad publish
 
@@ -507,9 +517,18 @@ Rotate the secret regardless.
 
 While tspackages is stopped, clients can't reach `https://<hostname>.<tailnet>.ts.net`
 at all: connections fail, usually by timing out. Installs that need metadata
-or an archive fail, and so do publishes. Right after a start, names claimed
-by a Composer git source and PyPI git names without a stored release answer
-`502` until the first index pass.
+or an archive fail, and so do publishes.
+
+Right after a start, names claimed by a Composer git source answer `502`
+until the first index pass. A PyPI git source serves its stored releases at
+once, but builds no new release, and answers `502` for a name without a
+stored release instead of letting a later source answer, until every one of
+its remotes has been synced and scanned since startup and every tag was
+read. A remote that can't be reached after a restart holds that state until
+it can, even with a local mirror; watch for
+`pypi git: indexing a remote failed` and
+`tspackages_git_last_sync_timestamp_seconds{ecosystem="pypi"}` staying at
+`0`.
 
 To keep that window small and harmless:
 
