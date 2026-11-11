@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +20,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
+	"github.com/radiergummi/tspackages/internal/relay"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
@@ -39,14 +38,16 @@ const (
 var notFoundMarker = []byte(`{"tspackages":"not-found"}`)
 
 // RegistrySource passes through an upstream Composer v2 repository. Metadata
-// is cached for ttl and served stale when upstream fails; dist archives are
-// verified against the upstream-declared shasum before they are cached.
+// is cached for ttl and served stale when upstream fails; dist archives
+// stream through the relay, verified against the upstream-declared shasum
+// before they are cached.
 type RegistrySource struct {
 	name         string
 	claims       []string
 	base         string
 	c            *upstream.Client
 	cache        *storage.Cache
+	relay        *relay.Relay
 	rec          *records.Store
 	ttl          time.Duration
 	maxArtifact  int64
@@ -56,7 +57,6 @@ type RegistrySource struct {
 	now          func() time.Time // replaced in tests
 
 	metaFlight singleflight.Group // by metadata cache key: one upstream fetch at a time
-	distFlight singleflight.Group // by distref key: one fetch, verify and store at a time
 
 	hmu      sync.Mutex // guards the health fields
 	fetchErr error      // last metadata fetch failure; nil once one succeeds
@@ -77,11 +77,12 @@ type ChangedDist struct {
 var _ Source = (*RegistrySource)(nil)
 
 // NewRegistrySource builds a pass-through source for the repository at
-// baseURL (the directory holding p2/). fetchTimeout bounds every upstream
-// request including the body read (default 5 minutes). wait, if non-nil, is
+// baseURL (the directory holding p2/). fetchTimeout bounds every metadata
+// request including the body read (default 5 minutes); dist downloads have
+// no total timeout and fail when upstream stalls (see relay). wait, if non-nil, is
 // called before every upstream request (rate limiting). log nil means
 // slog.Default().
-func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rec *records.Store, ttl time.Duration, maxArtifact int64, fetchTimeout time.Duration, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
+func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rl *relay.Relay, rec *records.Store, ttl time.Duration, maxArtifact int64, fetchTimeout time.Duration, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
 	if fetchTimeout <= 0 {
 		fetchTimeout = defaultFetchTimeout
 	}
@@ -92,7 +93,7 @@ func NewRegistrySource(name string, claims []string, baseURL string, c *upstream
 		wait = func(context.Context) error { return nil }
 	}
 	return &RegistrySource{
-		name: name, claims: claims, base: strings.TrimRight(baseURL, "/"), c: c, cache: cache, rec: rec,
+		name: name, claims: claims, base: strings.TrimRight(baseURL, "/"), c: c, cache: cache, relay: rl, rec: rec,
 		ttl: ttl, maxArtifact: maxArtifact, fetchTimeout: fetchTimeout, wait: wait,
 		log: log, now: time.Now,
 	}
@@ -331,42 +332,14 @@ func (s *RegistrySource) Versions(ctx context.Context, name string, dev bool) ([
 	return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, pkg)
 }
 
-func (s *RegistrySource) distKey(sha256 string) string {
-	return "composer/" + s.name + "/dist/" + sha256 + ".zip"
+// distKey holds a dist archive by version and reference; distSumKey holds
+// the sha1 it had, so a changed declaration evicts it before it is served.
+func (s *RegistrySource) distKey(pkg, version, reference string) string {
+	return "composer/" + s.name + "/dists/" + pkg + "/" + storage.EscapeSegment(version) + "/" + storage.EscapeSegment(reference) + ".zip"
 }
 
-func (s *RegistrySource) distRefKey(pkg, version, reference string) string {
-	return "composer/" + s.name + "/distref/" + pkg + "/" + storage.EscapeSegment(version) + "/" + storage.EscapeSegment(reference)
-}
-
-// cachedDist serves a previously verified archive if the cache still has it
-// and its bytes still satisfy the currently declared shasum.
-func (s *RegistrySource) cachedDist(ctx context.Context, refKey, declared string) (Artifact, bool) {
-	rc, _, err := s.cache.Get(ctx, refKey)
-	if err != nil {
-		return Artifact{}, false
-	}
-	sum, err := io.ReadAll(io.LimitReader(rc, 256))
-	rc.Close()
-	if err != nil {
-		return Artifact{}, false
-	}
-	sha256Hex, _, _ := strings.Cut(strings.TrimSpace(string(sum)), " ")
-	zrc, _, err := s.cache.Get(ctx, s.distKey(sha256Hex))
-	if err != nil {
-		return Artifact{}, false
-	}
-	defer zrc.Close()
-	b, err := io.ReadAll(zrc)
-	if err != nil {
-		return Artifact{}, false
-	}
-	s1 := sha1.Sum(b)
-	sha1Hex := hex.EncodeToString(s1[:])
-	if declared != "" && !strings.EqualFold(declared, sha1Hex) {
-		return Artifact{}, false
-	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b))}, true
+func (s *RegistrySource) distSumKey(pkg, version, reference string) string {
+	return s.distKey(pkg, version, reference) + ".sha1"
 }
 
 // Dist serves the archive of the version whose number and dist.reference
@@ -407,62 +380,68 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 	}
 	shasum, _ := dist["shasum"].(string)
 
-	refKey := s.distRefKey(pkg, version, reference)
-	if a, ok := s.cachedDist(ctx, refKey, shasum); ok {
-		metrics.ObserveCacheHit(ecoName, s.name)
-		return a, nil
+	key := s.distKey(pkg, version, reference)
+	if shasum != "" {
+		s.evictIfRedeclared(ctx, pkg, version, reference, shasum)
 	}
-
-	body, err := flight(ctx, &s.distFlight, refKey, func() ([]byte, error) {
-		return s.fetchAndStoreDist(ctx, pkg, version, reference, distURL, shasum, refKey)
-	})
+	fetch := func(ctx context.Context) (io.ReadCloser, int64, error) {
+		if err := s.wait(ctx); err != nil {
+			return nil, 0, err
+		}
+		start := time.Now()
+		body, size, err := s.c.Open(ctx, distURL, s.maxArtifact)
+		metrics.ObserveUpstream(s.name, time.Since(start))
+		if errors.Is(err, resolve.ErrNotFound) {
+			// Listed in metadata but gone upstream: a source fault, not a miss.
+			return nil, 0, fmt.Errorf("upstream dist missing for listed version: %v", err) //nolint:errorlint // a listed version's missing dist is a fault, not a miss
+		}
+		return body, size, err
+	}
+	onCommit := func(ctx context.Context, res relay.Result) error {
+		if err := s.checkPinned(ctx, pkg, version, reference, res.SHA256); err != nil {
+			return err
+		}
+		declared := ""
+		if shasum != "" {
+			declared = "sha1:" + shasum
+		}
+		if err := s.rec.PutProvenance(ctx, records.Provenance{
+			Ecosystem: "composer", Package: pkg, Version: version, Source: s.name, SourceType: "registry",
+			UpstreamURL: distURL, Commit: reference, DeclaredDigest: declared, SHA1: res.SHA1, SHA256: res.SHA256,
+		}); err != nil {
+			return fmt.Errorf("record provenance: %w", err)
+		}
+		if err := s.cache.Put(ctx, s.distSumKey(pkg, version, reference), strings.NewReader(res.SHA1)); err != nil {
+			s.log.Warn("caching composer dist checksum failed", "source", s.name, "package", pkg, "version", version, "error", err)
+		}
+		return nil
+	}
+	body, size, hit, err := s.relay.Open(ctx, key, relay.Digest{SHA1: shasum}, fetch, onCommit)
 	if err != nil {
 		return Artifact{}, err
 	}
-	return Artifact{Body: io.NopCloser(bytes.NewReader(body)), Size: int64(len(body))}, nil
+	if hit {
+		metrics.ObserveCacheHit(ecoName, s.name)
+	}
+	return Artifact{Body: body, Size: max(size, 0)}, nil
 }
 
-// fetchAndStoreDist downloads and verifies the archive, records its
-// provenance and caches it under refKey.
-func (s *RegistrySource) fetchAndStoreDist(ctx context.Context, pkg, version, reference, distURL, shasum, refKey string) ([]byte, error) {
-	declared := ""
-	if shasum != "" {
-		declared = "sha1:" + shasum
-	}
-	body, sha1Hex, sha256Hex, err := s.fetchDist(ctx, distURL, shasum)
-	if errors.Is(err, resolve.ErrNotFound) {
-		// Listed in metadata but gone upstream: a source fault, not a miss.
-		return nil, fmt.Errorf("upstream dist missing for listed version: %v", err) //nolint:errorlint // a listed version's missing dist is a fault, not a miss
-	}
+// evictIfRedeclared drops a cached dist whose recorded sha1 is not the one
+// upstream declares now, so the relay fetches it again instead of failing
+// the cached copy's check.
+func (s *RegistrySource) evictIfRedeclared(ctx context.Context, pkg, version, reference, shasum string) {
+	rc, _, err := s.cache.Get(ctx, s.distSumKey(pkg, version, reference))
 	if err != nil {
-		return nil, err
+		return
 	}
-	if err := s.checkPinned(ctx, pkg, version, reference, sha256Hex); err != nil {
-		return nil, err
+	got, err := io.ReadAll(io.LimitReader(rc, 64))
+	rc.Close()
+	if err != nil || strings.EqualFold(string(got), shasum) {
+		return
 	}
-	if err := s.rec.PutProvenance(ctx, records.Provenance{
-		Ecosystem: "composer", Package: pkg, Version: version, Source: s.name, SourceType: "registry",
-		UpstreamURL: distURL, Commit: reference, DeclaredDigest: declared, SHA1: sha1Hex, SHA256: sha256Hex,
-	}); err != nil {
-		return nil, fmt.Errorf("record provenance: %w", err)
+	if err := s.cache.Delete(ctx, s.distKey(pkg, version, reference)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.log.Warn("evicting a redeclared composer dist failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	}
-	if err := s.cache.Put(ctx, s.distKey(sha256Hex), bytes.NewReader(body)); err != nil {
-		s.log.Warn("caching composer dist failed", "source", s.name, "package", pkg, "version", version, "error", err)
-	} else if err := s.cache.Put(ctx, refKey, strings.NewReader(sha256Hex+" "+sha1Hex)); err != nil {
-		s.log.Warn("caching composer distref failed", "source", s.name, "package", pkg, "version", version, "error", err)
-	}
-	return body, nil
-}
-
-func (s *RegistrySource) fetchDist(ctx context.Context, url, wantSHA1 string) (body []byte, sha1Hex, sha256Hex string, err error) {
-	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
-	defer cancel()
-	if err := s.wait(ctx); err != nil {
-		return nil, "", "", err
-	}
-	start := time.Now()
-	defer func() { metrics.ObserveUpstream(s.name, time.Since(start)) }()
-	return s.c.FetchVerified(ctx, url, wantSHA1, s.maxArtifact)
 }
 
 // noteFetch records the outcome of an upstream metadata fetch for Health.

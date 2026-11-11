@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -279,10 +280,33 @@ func TestSourcesLogToInjectedLogger(t *testing.T) {
 	buf.Reset()
 	e := newRegEnv(t)
 	src := NewRegistrySource("packagist", nil, e.f.srv.URL, upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1"}, AllowPrivateForTesting: true}),
-		e.cache, e.rec, time.Minute, 1<<20, 0, nil, log)
+		e.cache, testRelay(t, e.cache), e.rec, time.Minute, 1<<20, 0, nil, log)
 	e.f.setStatus(500)
 	_, _ = src.Versions(context.Background(), "acme/pkg", false)
 	if !strings.Contains(buf.String(), "composer upstream unhealthy") {
 		t.Errorf("registry source: %q", buf.String())
+	}
+}
+
+func TestRegistryObservesDistCacheHit(t *testing.T) {
+	e := newRegEnv(t)
+	zip := []byte("PK-hit")
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, sum1(zip), "r1"))
+	e.f.set("/dist/pkg.zip", zip)
+	hit := map[string]string{"ecosystem": "composer", "source": "packagist"}
+	read := func() {
+		t.Helper()
+		a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.ReadAll(a.Body)
+		a.Body.Close()
+	}
+	read() // metadata miss, dist miss
+	h0 := counter(t, "tspackages_cache_hits_total", hit)
+	read() // metadata hit, dist hit
+	if d := counter(t, "tspackages_cache_hits_total", hit) - h0; d != 2 {
+		t.Errorf("cache hits delta = %v, want 2 (metadata and dist)", d)
 	}
 }

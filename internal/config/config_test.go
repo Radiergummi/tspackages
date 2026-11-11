@@ -40,7 +40,7 @@ func TestLoadExample(t *testing.T) {
 	}
 	if c.Limits.MaxUploadBytes != 100<<20 || c.Limits.MaxDecompressedBytes != 500<<20 ||
 		c.Limits.MaxArchiveEntries != 20000 || c.Limits.RequestsPerSecond != 50 ||
-		c.Limits.Burst != 100 || c.Limits.UpstreamFetchesPerSecond != 10 || c.Limits.MaxArtifactBytes != 500<<20 {
+		c.Limits.Burst != 100 || c.Limits.UpstreamFetchesPerSecond != 10 || c.Limits.MaxArtifactBytes != 8<<30 {
 		t.Errorf("limit defaults = %+v", c.Limits)
 	}
 	srcs := c.Ecosystems["composer"].Sources

@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/records"
+	"github.com/radiergummi/tspackages/internal/relay"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
@@ -113,7 +115,7 @@ func newRegEnv(t *testing.T) *regEnv {
 	host := strings.TrimPrefix(f.srv.URL, "http://")
 	c := upstream.New(upstream.Options{FetchHosts: []string{strings.Split(host, ":")[0]}, AllowPrivateForTesting: true})
 	e := &regEnv{f: f, cache: cache, d: d, rec: rec, up: c, clock: time.Now()}
-	e.src = NewRegistrySource("packagist", nil, f.srv.URL, c, cache, rec, time.Minute, 1<<20, 0, nil, nil)
+	e.src = NewRegistrySource("packagist", nil, f.srv.URL, c, cache, testRelay(t, cache), rec, time.Minute, 1<<20, 0, nil, nil)
 	e.src.now = func() time.Time { return e.clock }
 	return e
 }
@@ -141,11 +143,13 @@ func sum256(b []byte) string {
 func distKeys(t *testing.T, d storage.Driver) []string {
 	t.Helper()
 	var keys []string
-	for info, err := range d.List(context.Background(), "composer/packagist/dist/") {
+	for info, err := range d.List(context.Background(), "composer/packagist/dists/") {
 		if err != nil {
 			t.Fatal(err)
 		}
-		keys = append(keys, info.Key)
+		if strings.HasSuffix(info.Key, ".zip") {
+			keys = append(keys, info.Key)
+		}
 	}
 	return keys
 }
@@ -320,12 +324,14 @@ func TestDistVerifiesShasum(t *testing.T) {
 	if !bytes.Equal(got, zip) || a.Size != int64(len(zip)) {
 		t.Fatalf("artifact = %q %+v", got, a)
 	}
-	if keys := distKeys(t, e.d); len(keys) != 1 || !strings.HasSuffix(keys[0], sum256(zip)+".zip") {
+	if keys := distKeys(t, e.d); len(keys) != 1 {
 		t.Fatalf("keys = %v", keys)
 	}
 	// Second call is served from cache.
-	if _, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1"); err != nil {
+	if a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1"); err != nil {
 		t.Fatal(err)
+	} else {
+		a.Body.Close()
 	}
 	if n := e.f.count("/dist/pkg.zip"); n != 1 {
 		t.Fatalf("zip fetched %d times", n)
@@ -342,9 +348,15 @@ func TestDistVerifiesShasum(t *testing.T) {
 	e2 := newRegEnv(t)
 	e2.f.set("/p2/acme/pkg.json", distMeta(e2.f.srv.URL, sum1(zip), "r1"))
 	e2.f.set("/dist/pkg.zip", []byte("PK-evil-zip"))
-	if _, err := e2.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1"); !errors.Is(err, upstream.ErrDigestMismatch) {
+	// The body streams, so the mismatch surfaces at the end of the read.
+	a2, err := e2.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(a2.Body); !errors.Is(err, relay.ErrDigestMismatch) {
 		t.Fatalf("err = %v", err)
 	}
+	a2.Body.Close()
 	if keys := distKeys(t, e2.d); len(keys) != 0 {
 		t.Fatalf("cached after mismatch: %v", keys)
 	}
@@ -359,6 +371,7 @@ func TestDistEmptyShasum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	io.ReadAll(a.Body) // provenance is recorded once the download completes
 	a.Body.Close()
 	p, err := e.rec.GetProvenance(context.Background(), "composer", "acme/pkg", "1.0.0", sum256(zip))
 	if err != nil {
@@ -475,7 +488,7 @@ func TestDistUndeclaredChangeIsReported(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return NewRegistrySource("packagist", nil, e.f.srv.URL, e.up, cache, e.rec, time.Minute, 1<<20, 0, nil, nil)
+		return NewRegistrySource("packagist", nil, e.f.srv.URL, e.up, cache, testRelay(t, cache), e.rec, time.Minute, 1<<20, 0, nil, nil)
 	}
 	first, second := []byte("PK-first"), []byte("PK-second")
 	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, "", "r1"))
@@ -534,13 +547,18 @@ func TestMetadataGarbageDoesNotReplaceCache(t *testing.T) {
 	}
 }
 
-func TestDistRefKeyInjective(t *testing.T) {
+func TestDistKeyInjective(t *testing.T) {
 	e := newRegEnv(t)
-	if e.src.distRefKey("a/b", "1", "A") == e.src.distRefKey("a/b", "1", "84") {
+	if e.src.distKey("a/b", "1", "A") == e.src.distKey("a/b", "1", "84") {
 		t.Fatal("collision")
 	}
-	if err := storage.ValidKey(e.src.distRefKey("a/b", "1.0", "AbC/..")); err != nil {
-		t.Fatal(err)
+	if e.src.distKey("a/b", "1", "r.zip") == e.src.distSumKey("a/b", "1", "r") {
+		t.Fatal("an archive key equals a checksum key")
+	}
+	for _, k := range []string{e.src.distKey("a/b", "1.0", "AbC/.."), e.src.distSumKey("a/b", "1.0", "AbC/..")} {
+		if err := storage.ValidKey(k); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -648,5 +666,62 @@ func TestRegistryDevMissIsEmptyWhenStableExists(t *testing.T) {
 	}
 	if _, err := e.src.Versions(ctx, "acme/none", true); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("unknown package dev: %v", err)
+	}
+}
+
+func testRelay(t *testing.T, cache *storage.Cache) *relay.Relay {
+	t.Helper()
+	rl, err := relay.New(cache, filepath.Join(t.TempDir(), "relay"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rl
+}
+
+// The dist streams while upstream is still sending it.
+func TestDistStreamsBeforeUpstreamFinishes(t *testing.T) {
+	e := newRegEnv(t)
+	release := make(chan struct{})
+	dist := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(make([]byte, 32<<10))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer dist.Close()
+	defer close(release) // before dist.Close, which waits for the handler
+	e.f.set("/p2/acme/pkg.json", distMeta(dist.URL, "", "r1"))
+	a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Body.Close()
+	if _, err := io.ReadFull(a.Body, make([]byte, 32<<10)); err != nil {
+		t.Fatalf("first bytes while upstream is still sending: %v", err)
+	}
+}
+
+// A dist that does not match its declared shasum breaks the client's
+// transfer instead of ending like a complete file, and is not cached.
+func TestDistMismatchAbortsConnection(t *testing.T) {
+	e := newRegEnv(t)
+	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, strings.Repeat("0", 40), "r1"))
+	e.f.set("/dist/pkg.zip", []byte("PK-not-what-was-declared"))
+	srv := httptest.NewServer(server(t, []Source{e.src}, readAll))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/composer/dist/packagist/acme/pkg/1.0.0/r1")
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("the client read a complete response")
+	}
+	before := e.f.count("/dist/pkg.zip")
+	if a, err := e.src.Dist(context.Background(), "acme/pkg", "1.0.0", "r1"); err == nil {
+		io.ReadAll(a.Body)
+		a.Body.Close()
+	}
+	if e.f.count("/dist/pkg.zip") != before+1 {
+		t.Fatal("the mismatching dist was served from the cache instead of being fetched again")
 	}
 }

@@ -27,6 +27,9 @@ import (
 	"github.com/radiergummi/tspackages/internal/storage"
 )
 
+// MaxGitArchiveBytes caps a git-built archive, which is built in memory.
+const MaxGitArchiveBytes = 512 << 20
+
 // Conflict is a package name declared by more than one remote. Such a package
 // is not served at all.
 type Conflict struct {

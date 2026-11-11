@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/workdir"
@@ -36,6 +38,15 @@ type Result struct {
 // (-1 if unknown).
 type Fetch func(ctx context.Context) (io.ReadCloser, int64, error)
 
+// ErrStalled is returned by readers of a download whose upstream sent nothing
+// for the idle timeout.
+var ErrStalled = errors.New("relay: upstream stalled")
+
+// defaultIdle is how long an upstream may send nothing before its download
+// fails. There is no total timeout: multi-GB artifacts take as long as they
+// take while bytes keep arriving.
+const defaultIdle = 2 * time.Minute
+
 // ErrDigestMismatch is returned by a reader whose artifact did not match
 // the expected digest.
 var ErrDigestMismatch = errors.New("relay: digest mismatch")
@@ -45,6 +56,7 @@ type Relay struct {
 	cache  *storage.Cache
 	tmpDir string
 	log    *slog.Logger
+	idle   time.Duration
 
 	mu       sync.Mutex
 	inflight map[string]*download
@@ -68,7 +80,7 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 			return nil, fmt.Errorf("relay: remove leftover %s: %w", e.Name(), err)
 		}
 	}
-	return &Relay{cache: cache, tmpDir: tmpDir, log: log, inflight: map[string]*download{}}, nil
+	return &Relay{cache: cache, tmpDir: tmpDir, log: log, idle: defaultIdle, inflight: map[string]*download{}}, nil
 }
 
 // Open returns the cached object under key, or starts (or joins) the one
@@ -79,12 +91,13 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 // onCommit (if any) succeeded and the object was written to the cache. On a
 // mismatch it returns ErrDigestMismatch and nothing is cached. A cache hit is
 // re-checked against want while it streams: a mismatch fails the read and
-// drops the entry. The returned size is -1 when unknown.
-func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (io.ReadCloser, int64, error) {
+// drops the entry. The returned size is -1 when unknown; hit reports a cache
+// hit.
+func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (body io.ReadCloser, size int64, hit bool, err error) {
 	if rc, size, err := r.cache.Open(ctx, key); err == nil {
-		return r.verifying(rc, key, want), size, nil
+		return r.verifying(rc, key, want), size, true, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 
 	r.mu.Lock()
@@ -104,13 +117,13 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 	case <-dl.ready:
 	case <-ctx.Done():
 		r.leave(dl)
-		return nil, 0, ctx.Err()
+		return nil, 0, false, ctx.Err()
 	}
 	if dl.openErr != nil {
 		r.leave(dl)
-		return nil, 0, dl.openErr
+		return nil, 0, false, dl.openErr
 	}
-	return &reader{r: r, dl: dl}, dl.size, nil
+	return &reader{r: r, dl: dl}, dl.size, false, nil
 }
 
 type download struct {
@@ -154,8 +167,14 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 
 	path := dl.file.Name()
 	h1, h256 := sha1.New(), sha256.New()
-	res, err := dl.copy(body, h1, h256)
+	var stalled atomic.Bool
+	timer := time.AfterFunc(r.idle, func() { stalled.Store(true); cancel() })
+	res, err := dl.copy(body, h1, h256, func() { timer.Reset(r.idle) })
+	timer.Stop()
 	body.Close()
+	if err != nil && stalled.Load() {
+		err = ErrStalled
+	}
 	if err == nil {
 		err = check(want, res)
 	}
@@ -183,12 +202,13 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 
 // copy writes body to the temp file and the hashes, waking readers after
 // every chunk.
-func (dl *download) copy(body io.Reader, h1, h256 hash.Hash) (Result, error) {
+func (dl *download) copy(body io.Reader, h1, h256 hash.Hash, progress func()) (Result, error) {
 	buf := make([]byte, 256<<10)
 	var total int64
 	for {
 		n, rerr := body.Read(buf)
 		if n > 0 {
+			progress()
 			if _, err := dl.file.WriteAt(buf[:n], total); err != nil {
 				return Result{}, err
 			}

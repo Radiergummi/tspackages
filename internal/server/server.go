@@ -22,6 +22,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
 	"github.com/radiergummi/tspackages/internal/records"
+	"github.com/radiergummi/tspackages/internal/relay"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
 	"github.com/radiergummi/tspackages/internal/web"
@@ -69,6 +70,11 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	if err != nil {
 		return nil, nil, fmt.Errorf("storage.cache: %w", err)
 	}
+	// Downloads in progress live in work_dir/relay; the relay empties it.
+	rl, err := relay.New(cache, filepath.Join(cfg.Storage.WorkDir, "relay"), log)
+	if err != nil {
+		return nil, nil, fmt.Errorf("relay: %w", err)
+	}
 	pinStore := pins.New(stores.state)
 	rec := records.New(stores.state)
 
@@ -110,7 +116,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				Credentials:            creds,
 				AllowPrivateForTesting: h.AllowPrivateUpstreams,
 			})
-			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rec,
+			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rl, rec,
 				s.MetadataTTL, int64(l.MaxArtifactBytes), 0, limits.UpstreamWait, log)
 			sources, status = append(sources, src), append(status, src)
 			regSources = append(regSources, src)
@@ -140,7 +146,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				ms = append(ms, m)
 			}
 			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stores.state,
-				s.PollInterval, log, int64(l.MaxArtifactBytes))
+				s.PollInterval, log, min(int64(l.MaxArtifactBytes), composer.MaxGitArchiveBytes))
 			if err != nil {
 				return fail(err)
 			}

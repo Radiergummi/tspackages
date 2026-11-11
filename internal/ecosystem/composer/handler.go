@@ -67,6 +67,7 @@ type entry struct {
 	write       bool
 	version     string // writes only
 	sha256      string // writes only, once stored
+	aborted     bool   // the body failed after the headers were sent
 }
 
 type statusWriter struct {
@@ -138,6 +139,11 @@ func (c *Composer) wrap(h func(http.ResponseWriter, *http.Request, identity.Call
 			attrs = append(attrs, "node_name", caller.NodeName, "version", e.version, "sha256", e.sha256)
 		}
 		c.log.Log(r.Context(), level, "composer request", attrs...)
+		if e.aborted {
+			// Headers are out: break the connection so the client sees a
+			// failed transfer, not a short file.
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 
@@ -257,6 +263,7 @@ func (c *Composer) dist(w http.ResponseWriter, r *http.Request, caller identity.
 	}
 	if _, err := io.Copy(w, art.Body); err != nil {
 		c.log.Warn("composer dist copy failed", "package", name, "source", src.Name(), "error", err)
+		e.aborted = true
 	}
 }
 

@@ -18,6 +18,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Upstream artifact downloads stream: the first client gets bytes while the
+  archive is still downloading, concurrent clients share one upstream fetch,
+  and the archive is cached only after its digest matched. A mismatch breaks
+  the client's transfer instead of ending it like a complete file. An
+  upstream that sends nothing for two minutes fails the download; there is
+  no longer a total download timeout.
+- `max_artifact_bytes` defaults to 8GiB and no longer means memory use.
+  Composer git-built archives are capped at 512MiB (or `max_artifact_bytes`,
+  if lower), since they are built in memory.
+- S3 stores upload objects above 64MiB in parts, without buffering them.
 - A Composer dist is served only by the source that resolution picks for the
   name: when several sources claim it, a dist URL naming a later source
   answers `404` while an earlier one knows the name. Lock files written

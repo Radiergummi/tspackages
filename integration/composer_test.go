@@ -524,7 +524,8 @@ func TestComposerUpstreamFailures(t *testing.T) {
 
 	r.packagist.down.Store(false)
 	bad := r.project(map[string]string{"psr/bad": "^1.0"})
-	if out, err := r.composer(bad, "update"); err == nil || !strings.Contains(out, "502") {
+	// The archive streams, so the mismatch breaks the transfer at its end.
+	if out, err := r.composer(bad, "update"); err == nil || !strings.Contains(out, "Downloading psr/bad") {
 		t.Fatalf("archive with a wrong shasum: err=%v\n%s", err, out)
 	}
 	if _, err := os.Stat(filepath.Join(bad, "vendor", "psr", "bad")); err == nil {

@@ -503,7 +503,14 @@ func TestDistCopyErrorLogged(t *testing.T) {
 	b := &brokenDist{fakeSource{name: "b", claims: []string{"matchory/*"}}}
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, nil))
-	do(serverLog(t, log, []Source{b}, readAll), "GET", "/composer/dist/b/matchory/a/1/r", nil)
+	func() {
+		defer func() {
+			if r := recover(); r != http.ErrAbortHandler { //nolint:errorlint // the sentinel is panicked as is
+				t.Errorf("recovered %v, want http.ErrAbortHandler", r)
+			}
+		}()
+		do(serverLog(t, log, []Source{b}, readAll), "GET", "/composer/dist/b/matchory/a/1/r", nil)
+	}()
 	found := false
 	for _, l := range captured(&buf) {
 		if l["level"] == "WARN" && strings.Contains(l["error"].(string), "disk exploded") {

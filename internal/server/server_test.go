@@ -287,7 +287,7 @@ func TestBuildAppliesDefaults(t *testing.T) {
 	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 500<<20 || cfg.Tailscale.Capability != testCap {
+	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 8<<30 || cfg.Tailscale.Capability != testCap {
 		t.Fatalf("defaults not applied: %+v %+v", cfg.Limits, cfg.Tailscale)
 	}
 }

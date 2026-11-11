@@ -98,10 +98,12 @@ the first claiming source.
 `${file:/path}`. Limits (`max_upload_bytes`, `max_decompressed_bytes`,
 `max_archive_entries`, `max_artifact_bytes`, `requests_per_second`, `burst`,
 `upstream_fetches_per_second`) have defaults; see `internal/config`. Rates must
-be positive. `max_artifact_bytes` (default 500MiB) caps a registry dist download
-and a git-built archive; each is buffered in memory up to that size, so size
-the container's memory for it. `max_decompressed_bytes` applies to upload
-inspection.
+be positive. `max_artifact_bytes` (default 8GiB) caps an upstream artifact
+download. Downloads stream to clients while they arrive and are cached once
+their digest matches, so memory use doesn't grow with artifact size; size the
+cache's `max_size` for the largest artifacts you expect. Composer git-built
+archives are built in memory and capped at 512MiB (or `max_artifact_bytes`,
+if lower). `max_decompressed_bytes` applies to upload inspection.
 
 ## Client setup
 

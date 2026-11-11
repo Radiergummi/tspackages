@@ -78,8 +78,9 @@ func (s *Storage) Named() []NamedStore {
 type Limits struct {
 	MaxUploadBytes       ByteSize `yaml:"max_upload_bytes"`
 	MaxDecompressedBytes ByteSize `yaml:"max_decompressed_bytes"`
-	// MaxArtifactBytes caps a registry dist download or a git-built archive;
-	// both are held in memory up to this size.
+	// MaxArtifactBytes caps an upstream artifact download, which streams
+	// through the relay. Composer git-built archives are built in memory and
+	// capped at min(MaxArtifactBytes, composer.MaxGitArchiveBytes).
 	MaxArtifactBytes         ByteSize `yaml:"max_artifact_bytes"`
 	MaxArchiveEntries        int      `yaml:"max_archive_entries"`
 	RequestsPerSecond        float64  `yaml:"requests_per_second"`
@@ -168,7 +169,7 @@ func ApplyDefaults(c *Config) {
 	l := &c.Limits
 	setNum(&l.MaxUploadBytes, 100<<20)
 	setNum(&l.MaxDecompressedBytes, 500<<20)
-	setNum(&l.MaxArtifactBytes, 500<<20)
+	setNum(&l.MaxArtifactBytes, 8<<30)
 	setNum(&l.MaxArchiveEntries, 20000)
 	setNum(&l.RequestsPerSecond, 50)
 	setNum(&l.Burst, 100)
