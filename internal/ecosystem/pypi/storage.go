@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"time"
@@ -166,7 +167,7 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, u Up
 	}
 	key := fileKey(name, dist.version, u.Filename)
 	if _, err := s.d.PutIfAbsent(ctx, key, bytes.NewReader(data)); errors.Is(err, storage.ErrExists) {
-		if err := s.resumable(ctx, key, sha); err != nil {
+		if err := s.resumable(ctx, name, u.Filename, key, sha); err != nil {
 			return File{}, err
 		}
 	} else if err != nil {
@@ -189,9 +190,8 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, u Up
 	if err := s.putIfAbsent(ctx, key+".json", sidecar); err != nil {
 		return File{}, err
 	}
-	if err := s.addToIndex(ctx, name, sf); err != nil {
-		return File{}, err
-	}
+	// Records go first: being listed is what makes an upload finished, so a
+	// retry after any failure up to here completes it.
 	up := records.UploaderFrom(caller)
 	if err := s.rec.PutProvenance(ctx, records.Provenance{
 		Ecosystem: ecoName, Package: name, Version: dist.display, Source: s.name, SourceType: "storage",
@@ -202,6 +202,9 @@ func (s *StorageSource) Upload(ctx context.Context, caller identity.Caller, u Up
 	if err := s.rec.PutAudit(ctx, records.Audit{Time: time.Now().UTC(), Action: "publish", Ecosystem: ecoName,
 		Package: name, Version: dist.display, SHA256: sha, Uploader: up}); err != nil {
 		return File{}, fmt.Errorf("record audit: %w", err)
+	}
+	if err := s.addToIndex(ctx, name, sf); err != nil {
+		return File{}, err
 	}
 	return sf.file(), nil
 }
@@ -315,13 +318,15 @@ func (s *StorageSource) claim(ctx context.Context, name string, dist distributio
 }
 
 // resumable decides about a file that is already stored: a finished upload
-// (its sidecar exists) makes this one a duplicate; an interrupted one with the
-// same bytes is completed by this one.
-func (s *StorageSource) resumable(ctx context.Context, key, sha string) error {
-	if _, err := s.d.Stat(ctx, key+".json"); err == nil {
-		return ErrFileExists
-	} else if !errors.Is(err, storage.ErrNotFound) {
+// (the project lists it) makes this one a duplicate; an interrupted one with
+// the same bytes is completed by this one.
+func (s *StorageSource) resumable(ctx context.Context, name, filename, key, sha string) error {
+	files, err := s.files(ctx, name)
+	if err != nil && !errors.Is(err, resolve.ErrNotFound) {
 		return err
+	}
+	if slices.ContainsFunc(files, func(f storedFile) bool { return f.Filename == filename }) {
+		return ErrFileExists
 	}
 	rc, _, err := s.d.Get(ctx, key)
 	if err != nil {
@@ -396,7 +401,7 @@ func (s *StorageSource) scan(ctx context.Context, name string) ([]storedFile, er
 }
 
 func (s *StorageSource) addToIndex(ctx context.Context, name string, sf storedFile) error {
-	for range indexRetries {
+	for attempt := range indexRetries {
 		files, etag, err := s.loadIndex(ctx, name)
 		switch {
 		case errors.Is(err, storage.ErrNotFound), errors.Is(err, errCorruptIndex):
@@ -413,6 +418,12 @@ func (s *StorageSource) addToIndex(ctx context.Context, name string, sf storedFi
 		body, _ := json.Marshal(indexDoc{Files: files})
 		_, err = s.d.PutIfMatch(ctx, indexKey(name), bytes.NewReader(body), etag)
 		if errors.Is(err, storage.ErrPrecondition) {
+			// Jittered backoff: a matrix of wheels uploads at once.
+			select {
+			case <-time.After(time.Duration(rand.Int64N(int64(attempt+1) * int64(20*time.Millisecond)))): //nolint:gosec // jitter, not a secret
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			continue
 		}
 		return err

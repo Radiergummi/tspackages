@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/radiergummi/tspackages/internal/archive"
@@ -282,5 +284,49 @@ func TestIndexRebuilt(t *testing.T) {
 	p, err := e.src.Project(context.Background(), "acme-core")
 	if err != nil || len(p.Files) != 2 {
 		t.Fatalf("after losing the index: %d %v", len(p.Files), err)
+	}
+}
+
+// failIndexOnce fails the first index write after arm is set.
+type failIndexOnce struct {
+	storage.Driver
+	armed atomic.Bool
+}
+
+func (f *failIndexOnce) PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (storage.Info, error) {
+	if strings.HasSuffix(key, "index.json") && f.armed.CompareAndSwap(true, false) {
+		return storage.Info{}, errors.New("store unavailable")
+	}
+	return f.Driver.PutIfMatch(ctx, key, r, etag)
+}
+
+// TestUploadRetryCompletesAfterIndexFailure: an upload whose index write
+// failed is completed by the client's retry, not rejected as a duplicate.
+func TestUploadRetryCompletesAfterIndexFailure(t *testing.T) {
+	e := newStoreEnv(t)
+	fd := &failIndexOnce{Driver: e.d}
+	e.src = NewStorageSource("hosted", []string{"acme-*"}, fd, e.rec, testLimits, nil)
+	first := wheelOf(t, "acme_core", "1.0.0", metadataFor("acme-core", "1.0.0"))
+	if _, err := e.upload(t, "acme-core", "1.0.0", "acme_core-1.0.0-py3-none-any.whl", first, ""); err != nil {
+		t.Fatal(err)
+	}
+	whl := wheelOf(t, "acme_core", "1.1.0", metadataFor("acme-core", "1.1.0"))
+	fn := "acme_core-1.1.0-py3-none-any.whl"
+	fd.armed.Store(true)
+	if _, err := e.upload(t, "acme-core", "1.1.0", fn, whl, ""); err == nil {
+		t.Fatal("upload succeeded although its index write failed")
+	}
+	if _, err := e.upload(t, "acme-core", "1.1.0", fn, whl, ""); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	p, err := e.src.Project(context.Background(), "acme-core")
+	if err != nil || len(p.Files) != 2 {
+		t.Fatalf("files = %+v, %v", p.Files, err)
+	}
+	if _, err := e.rec.GetProvenance(context.Background(), "pypi", "acme-core", "1.1.0", sum256(whl)); err != nil {
+		t.Fatalf("provenance: %v", err)
+	}
+	if _, err := e.upload(t, "acme-core", "1.1.0", fn, whl, ""); !errors.Is(err, ErrFileExists) {
+		t.Fatalf("upload after completion: %v", err)
 	}
 }
