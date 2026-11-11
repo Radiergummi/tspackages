@@ -112,6 +112,93 @@ func (c *Cache) Get(ctx context.Context, key string) (io.ReadCloser, time.Time, 
 	return rc, info.ModTime, nil
 }
 
+// Open is Get with the object's size. Over a RangeGetter driver the reader
+// also implements io.Seeker, reopening the object at the new offset.
+func (c *Cache) Open(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	rc, info, err := c.d.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.forget(ctx, key)
+		}
+		return nil, 0, err
+	}
+	c.mu.Lock()
+	if el, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(el)
+	}
+	c.mu.Unlock()
+	if rg, ok := c.d.(RangeGetter); ok {
+		return &seekReader{ctx: ctx, rg: rg, key: key, size: info.Size, rc: rc}, info.Size, nil
+	}
+	return rc, info.Size, nil
+}
+
+// Delete removes key from the cache.
+func (c *Cache) Delete(ctx context.Context, key string) error {
+	defer c.lockKey(key)()
+	if err := c.d.Delete(ctx, key); err != nil {
+		return err
+	}
+	c.forgetIndexed(key)
+	return nil
+}
+
+// seekReader reads an object from off, reopening it with GetRange after a
+// Seek.
+type seekReader struct {
+	ctx       context.Context //nolint:containedctx // the reader outlives no request: it is closed with the response
+	rg        RangeGetter
+	key       string
+	size, off int64
+	rc        io.ReadCloser // nil after a Seek until the next Read
+}
+
+func (r *seekReader) Read(p []byte) (int, error) {
+	if r.rc == nil {
+		if r.off >= r.size {
+			return 0, io.EOF
+		}
+		rc, err := r.rg.GetRange(r.ctx, r.key, r.off, -1)
+		if err != nil {
+			return 0, err
+		}
+		r.rc = rc
+	}
+	n, err := r.rc.Read(p)
+	r.off += int64(n)
+	return n, err
+}
+
+func (r *seekReader) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = r.off + offset
+	case io.SeekEnd:
+		abs = r.size + offset
+	default:
+		return 0, errors.New("storage: invalid whence")
+	}
+	if abs < 0 {
+		return 0, errors.New("storage: negative position")
+	}
+	if abs != r.off && r.rc != nil {
+		r.rc.Close()
+		r.rc = nil
+	}
+	r.off = abs
+	return abs, nil
+}
+
+func (r *seekReader) Close() error {
+	if r.rc == nil {
+		return nil
+	}
+	return r.rc.Close()
+}
+
 // Put stores r under key, then evicts least-recently-used entries until the
 // total is at most maxSize.
 //

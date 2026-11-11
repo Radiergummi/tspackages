@@ -275,3 +275,44 @@ func TestNewCacheTrimFailureDoesNotFailStartup(t *testing.T) {
 		t.Fatalf("total=%d logs=%s", c.total, logs.String())
 	}
 }
+
+func TestCacheOpenSizeAndSeek(t *testing.T) {
+	d, err := NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCache(context.Background(), d, 1<<20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(context.Background(), "k", strings.NewReader("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	rc, size, err := c.Open(context.Background(), "k")
+	if err != nil || size != 10 {
+		t.Fatalf("Open: size %d, %v", size, err)
+	}
+	defer rc.Close()
+	rs, ok := rc.(io.ReadSeeker)
+	if !ok {
+		t.Fatal("not seekable over a RangeGetter driver")
+	}
+	if n, err := rs.Seek(-3, io.SeekEnd); err != nil || n != 7 {
+		t.Fatalf("Seek: %d %v", n, err)
+	}
+	b, _ := io.ReadAll(rs)
+	rs.Seek(0, io.SeekStart)
+	all, _ := io.ReadAll(rs)
+	if string(b) != "789" || string(all) != "0123456789" {
+		t.Fatalf("got %q then %q", b, all)
+	}
+	if _, _, err := c.Open(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+	if err := c.Delete(context.Background(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.Open(context.Background(), "k"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after Delete: %v", err)
+	}
+}
