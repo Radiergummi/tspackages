@@ -23,7 +23,6 @@ func TestVersionCanonical(t *testing.T) {
 		"1.0.0.dev1":    "1.dev1",
 		"1.2.0a":        "1.2a0",
 		"01.02.03":      "1.2.3",
-		" 1.0 ":         "1",
 		"1.0.dev":       "1.dev0",
 		"2.0.0b3.post2": "2b3.post2",
 	} {
@@ -40,6 +39,12 @@ func TestVersionCanonical(t *testing.T) {
 		if _, err := ParseVersion(bad); err == nil {
 			t.Errorf("ParseVersion(%q) accepted", bad)
 		}
+	}
+}
+
+func TestVersionSurroundingWhitespace(t *testing.T) {
+	if v, err := ParseVersion("\t1.0 "); err != nil || v.Canonical() != "1" {
+		t.Fatalf("%v %v", v, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package pypi
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -31,10 +32,8 @@ func ParseWheelFilename(f string) (WheelName, error) {
 	default:
 		return WheelName{}, fmt.Errorf("invalid wheel filename %q", f)
 	}
-	for _, p := range append([]string{w.Name, w.Version}, w.Tags...) {
-		if p == "" {
-			return WheelName{}, fmt.Errorf("invalid wheel filename %q", f)
-		}
+	if slices.Contains(parts, "") {
+		return WheelName{}, fmt.Errorf("invalid wheel filename %q", f)
 	}
 	if _, err := ParseVersion(w.Version); err != nil {
 		return WheelName{}, fmt.Errorf("invalid wheel filename %q: %w", f, err)

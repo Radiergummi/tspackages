@@ -9,9 +9,6 @@ import (
 	"strings"
 )
 
-// ecoName is the ecosystem name in config, capability rules and metrics.
-const ecoName = "pypi"
-
 var (
 	validNameRE = regexp.MustCompile(`(?i)^([a-z0-9]|[a-z0-9][a-z0-9._-]*[a-z0-9])$`) // PEP 508
 	separatorRE = regexp.MustCompile(`[-_.]+`)
