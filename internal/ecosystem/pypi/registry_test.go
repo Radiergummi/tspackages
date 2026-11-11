@@ -148,6 +148,7 @@ func TestRegistryProjectAllowlist(t *testing.T) {
 		map[string]any{"filename": "requests-2.0.1.tar.gz", "url": e.idx.srv.URL + "/files/x", "hashes": map[string]string{"md5": "00"}},
 		map[string]any{"filename": "requests-2.0.2.tar.gz", "url": "https://elsewhere.example/x", "hashes": map[string]string{"sha256": "aa"}},
 		map[string]any{"filename": "other-1.0.tar.gz", "url": e.idx.srv.URL + "/files/y", "hashes": map[string]string{"sha256": "bb"}},
+		map[string]any{"filename": "requests-2.0.3-py3-none-any#x.whl", "url": e.idx.srv.URL + "/files/z", "hashes": map[string]string{"sha256": strings.Repeat("d", 64)}},
 	)
 	doc["unknown-top-level"] = "x"
 	page, _ = json.Marshal(doc)
@@ -157,7 +158,7 @@ func TestRegistryProjectAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(p.Files) != 1 {
-		t.Fatalf("files = %+v (no sha256, foreign host and other project must be dropped)", p.Files)
+		t.Fatalf("files = %+v (no sha256, foreign host, other project and unsafe filename must be dropped)", p.Files)
 	}
 	f := p.Files[0]
 	if f.Filename != "requests-2.0.0-py3-none-any.whl" || f.SHA256 != sum256(wheel) || f.RequiresPython != ">=3.9" ||

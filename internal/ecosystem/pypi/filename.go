@@ -2,8 +2,16 @@ package pypi
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
+)
+
+// Wheel build and compatibility tags, as escaped by the binary distribution
+// format: runs of other characters become "_", and tag sets join with ".".
+var (
+	wheelTagRE   = regexp.MustCompile(`^[A-Za-z0-9_.]+$`)
+	wheelBuildRE = regexp.MustCompile(`^[0-9][A-Za-z0-9_.]*$`)
 )
 
 // WheelName is a wheel filename split into its parts (PEP 427/491), as
@@ -25,17 +33,17 @@ func ParseWheelFilename(f string) (WheelName, error) {
 	case 5:
 		w = WheelName{Name: parts[0], Version: parts[1], Tags: parts[2:]}
 	case 6:
-		if parts[2] == "" || parts[2][0] < '0' || parts[2][0] > '9' {
+		if !wheelBuildRE.MatchString(parts[2]) {
 			return WheelName{}, fmt.Errorf("invalid wheel build tag in %q", f)
 		}
 		w = WheelName{Name: parts[0], Version: parts[1], Build: parts[2], Tags: parts[3:]}
 	default:
 		return WheelName{}, fmt.Errorf("invalid wheel filename %q", f)
 	}
-	if slices.Contains(parts, "") {
+	if slices.Contains(parts, "") || slices.ContainsFunc(w.Tags, func(t string) bool { return !wheelTagRE.MatchString(t) }) {
 		return WheelName{}, fmt.Errorf("invalid wheel filename %q", f)
 	}
-	if _, err := ParseVersion(w.Version); err != nil {
+	if err := filenameVersion(w.Version); err != nil {
 		return WheelName{}, fmt.Errorf("invalid wheel filename %q: %w", f, err)
 	}
 	return w, nil
@@ -54,13 +62,23 @@ func ParseSdistFilename(f string) (name, version string, err error) {
 		return "", "", fmt.Errorf("invalid sdist filename %q", f)
 	}
 	name, version = stem[:i], stem[i+1:]
-	if _, err := ParseVersion(version); err != nil {
+	if err := filenameVersion(version); err != nil {
 		return "", "", fmt.Errorf("invalid sdist filename %q: %w", f, err)
 	}
 	if _, err := Normalize(name); err != nil {
 		return "", "", fmt.Errorf("invalid sdist filename %q: %w", f, err)
 	}
 	return name, version, nil
+}
+
+// filenameVersion checks a version as a filename writes it: valid, and
+// without the surrounding whitespace ParseVersion tolerates.
+func filenameVersion(v string) error {
+	if strings.TrimSpace(v) != v {
+		return fmt.Errorf("invalid version %q", v)
+	}
+	_, err := ParseVersion(v)
+	return err
 }
 
 // SdistFilename is the PEP 625 filename of the sdist of a normalised name
