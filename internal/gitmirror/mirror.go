@@ -585,13 +585,21 @@ func checkPath(p string) error {
 const MaxTreeEntries = 100_000
 
 // ErrTreeTooLarge is wrapped by ListTree for a tree with more than
-// MaxTreeEntries entries or a path over 1 MiB.
+// MaxTreeEntries entries, a path over MaxTreePath bytes or a listing over
+// maxTreeListing bytes.
 var ErrTreeTooLarge = errors.New("tree too large to list")
+
+// MaxTreePath caps a ListTree path, which ls-tree repeats in full for every
+// entry under it, and maxTreeListing the whole listing.
+const (
+	MaxTreePath    = 4 << 10
+	maxTreeListing = 64 << 20
+)
 
 // ListTree lists every file, symlink and submodule under dir ("" = the whole
 // tree) at commit, with paths from the repository root. The listing is parsed
-// while git writes it and stops at MaxTreeEntries or a path over 1 MiB
-// (ErrTreeTooLarge).
+// while git writes it and stops at MaxTreeEntries, a path over MaxTreePath
+// or a listing over maxTreeListing bytes (ErrTreeTooLarge).
 func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
@@ -621,11 +629,16 @@ func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry,
 type treeParser struct {
 	buf     []byte
 	entries []TreeEntry
+	read    int
 	err     error
 }
 
 func (tp *treeParser) Write(b []byte) (int, error) {
 	if tp.err != nil {
+		return 0, tp.err
+	}
+	if tp.read += len(b); tp.read > maxTreeListing {
+		tp.err = fmt.Errorf("gitmirror: %w: a listing over %d bytes", ErrTreeTooLarge, maxTreeListing)
 		return 0, tp.err
 	}
 	tp.buf = append(tp.buf, b...)
@@ -645,6 +658,8 @@ func (tp *treeParser) Write(b []byte) (int, error) {
 		switch {
 		case !ok || len(f) != 3:
 			tp.err = fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
+		case len(p) > MaxTreePath:
+			tp.err = fmt.Errorf("gitmirror: %w: a path over %d bytes", ErrTreeTooLarge, MaxTreePath)
 		case len(tp.entries) == MaxTreeEntries:
 			tp.err = fmt.Errorf("gitmirror: %w: more than %d entries", ErrTreeTooLarge, MaxTreeEntries)
 		}
@@ -654,8 +669,8 @@ func (tp *treeParser) Write(b []byte) (int, error) {
 		tp.entries = append(tp.entries, TreeEntry{Mode: f[0], Type: f[1], Object: f[2], Path: p})
 	}
 	tp.buf = append(tp.buf[:0], tp.buf[start:]...)
-	if len(tp.buf) > maxReadFile {
-		tp.err = fmt.Errorf("gitmirror: %w: a path over 1 MiB", ErrTreeTooLarge)
+	if len(tp.buf) > MaxTreePath+256 { // a record: mode, type, object, path
+		tp.err = fmt.Errorf("gitmirror: %w: a path over %d bytes", ErrTreeTooLarge, MaxTreePath)
 		return 0, tp.err
 	}
 	return len(b), nil

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -714,5 +715,41 @@ func TestDecomposedPaths(t *testing.T) {
 	}
 	if !bytes.Contains(buf.Bytes(), []byte(dir+"/x.py")) {
 		t.Fatal("archive lacks the file")
+	}
+}
+
+// TestListTreeBytesCapped: ls-tree repeats each entry's full path, so a
+// small tree can list gigabytes; a path over 4KiB, or a listing over
+// 64MiB, is ErrTreeTooLarge.
+func TestListTreeBytesCapped(t *testing.T) {
+	src := makeRepo(t)
+	run := func(in string, args ...string) string {
+		cmd := exec.Command("git", append([]string{"-c", "commit.gpgsign=false"}, args...)...)
+		cmd.Dir, cmd.Stdin = src, strings.NewReader(in)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@example.com")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	blob := run("x\n", "hash-object", "-w", "--stdin")
+	var sb strings.Builder
+	for i := range 17000 {
+		fmt.Fprintf(&sb, "100644 blob %s\tf%05d\n", blob, i)
+	}
+	wide := run(sb.String(), "mktree")
+	for name, top := range map[string]string{
+		"long path": run("100644 blob "+blob+"\t"+strings.Repeat("n", 5000)+"\n", "mktree"),
+		"listing":   run("040000 tree "+wide+"\t"+strings.Repeat("d", 4000)+"\n", "mktree"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			commit := run("", "commit-tree", "-m", name, top)
+			run("", "update-ref", "refs/tags/"+strings.ReplaceAll(name, " ", "-"), commit)
+			m := newMirror(t, src)
+			if _, err := m.ListTree(context.Background(), commit, ""); !errors.Is(err, ErrTreeTooLarge) {
+				t.Fatalf("err = %v", err)
+			}
+		})
 	}
 }

@@ -216,8 +216,11 @@ func TestDropSymlinks(t *testing.T) {
 // or as a file and a directory, has no single content for it.
 func TestDropSymlinksRefusesAmbiguousNames(t *testing.T) {
 	for name, in := range map[string][]byte{
-		"duplicate":    makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "composer.json", body: `{"name":"x/y"}`}),
-		"file and dir": makeZip(t, entry{name: "src", body: "x"}, entry{name: "src/a.php", body: "<?php"}),
+		"duplicate":     makeZip(t, entry{name: "composer.json", body: "{}"}, entry{name: "composer.json", body: `{"name":"x/y"}`}),
+		"file and dir":  makeZip(t, entry{name: "src", body: "x"}, entry{name: "src/a.php", body: "<?php"}),
+		"dir then file": makeZip(t, entry{name: "src/", mode: fs.ModeDir | 0o755}, entry{name: "src", body: "x"}),
+		"file then dir": makeZip(t, entry{name: "src", body: "x"}, entry{name: "src/", mode: fs.ModeDir | 0o755}),
+		"long name":     makeZip(t, entry{name: strings.Repeat("d/", 3000) + "x", body: "x"}),
 	} {
 		if _, _, err := DropSymlinks(in); !errors.As(err, new(*Error)) {
 			t.Errorf("%s: err = %v", name, err)

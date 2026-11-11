@@ -71,11 +71,10 @@ const (
 var errWorkspaceTooLarge = errors.New("workspace globs or member directories are too many or too long to match")
 
 // pyproject.toml caps: the TOML decoder's time and memory grow
-// quadratically with nesting and with dotted key segments.
+// quadratically with how deep tables, arrays and dotted keys nest.
 const (
 	maxPyprojectBytes = 256 << 10
 	maxTOMLDepth      = 64
-	maxTOMLSegments   = 64
 )
 
 // DiscoverPackages finds the packages of a repository: the root
@@ -173,7 +172,7 @@ func readPyproject(read func(string) ([]byte, error), p string) (map[string]any,
 		return nil, err
 	}
 	if len(b) > maxPyprojectBytes || tomlTooComplex(b) {
-		return nil, fmt.Errorf("%s: %w: over %d bytes, or nested or dotted more than %d deep", p, errBadPyproject, maxPyprojectBytes, maxTOMLDepth)
+		return nil, fmt.Errorf("%s: %w: over %d bytes, or tables, arrays and dotted keys nested more than %d deep", p, errBadPyproject, maxPyprojectBytes, maxTOMLDepth)
 	}
 	var doc map[string]any
 	if _, err := toml.NewDecoder(bytes.NewReader(b)).Decode(&doc); err != nil {
@@ -359,40 +358,69 @@ func matchable(globs, dirs []string) bool {
 	return globBytes*dirBytes <= maxMatchWork
 }
 
-// tomlTooComplex reports whether b, outside strings and comments, nests "["
-// and "{" deeper than maxTOMLDepth or has a key or table header of
-// maxTOMLSegments or more dotted segments. It scans b once.
+// tomlTooComplex reports whether b, read outside strings and comments,
+// nests tables, arrays and dotted keys more than maxTOMLDepth levels deep in
+// all: a table header's segments, each open "[" or "{" with the dotted
+// segments of the key it is the value of, and the key being read. It scans
+// b once.
 func tomlTooComplex(b []byte) bool {
-	depth, dots := 0, 0
+	var open []int // per open "[" or "{": the dotted segments of its key
+	sum := 0       // of open
+	header := 0    // levels of the current table header
+	inHeader, lineStart := false, true
+	key, dots := 0, 0 // segments of the key before "=", dots read since
 	for i := 0; i < len(b); i++ {
-		switch c := b[i]; c {
+		c := b[i]
+		switch c {
+		case ' ', '\t', '\r':
+			continue
+		case '\n':
+			key, dots, lineStart = 0, 0, true
+			continue
 		case '#':
-			for i < len(b) && b[i] != '\n' {
+			for i+1 < len(b) && b[i+1] != '\n' {
 				i++
 			}
-			dots = 0
+			continue
 		case '"', '\'':
 			i = stringEnd(b, i)
 		case '[', '{':
-			if depth++; depth > maxTOMLDepth {
-				return true
+			if c == '[' && lineStart && len(open) == 0 {
+				inHeader, header = true, 0
 			}
-			dots = 0
+			open = append(open, key)
+			sum += key
+			key, dots = 0, 0
 		case ']', '}':
-			depth--
-		case '.':
-			if dots++; dots >= maxTOMLSegments {
-				return true
+			if n := len(open); n > 0 {
+				sum -= open[n-1]
+				open = open[:n-1]
 			}
-		case '=', ',', '\n':
-			dots = 0
+			if inHeader && len(open) == 0 {
+				inHeader, header = false, dots+1
+			}
+			if !inHeader {
+				key, dots = 0, 0
+			}
+		case '.':
+			dots++
+		case '=':
+			key, dots = dots, 0
+		case ',':
+			key, dots = 0, 0
+		}
+		lineStart = false
+		if header+len(open)+sum+max(key, dots) > maxTOMLDepth {
+			return true
 		}
 	}
 	return false
 }
 
 // stringEnd returns the index of the last quote of the TOML string opening
-// at b[i] (a basic or literal string, single- or multi-line), or len(b).
+// at b[i] (a basic or literal string, single- or multi-line), or len(b). A
+// multi-line string may hold one or two quotes right before its closing
+// delimiter (”'a””' is "a”"), so those count as the string's.
 func stringEnd(b []byte, i int) int {
 	q := b[i]
 	if i+2 < len(b) && b[i+1] == q && b[i+2] == q {
@@ -401,7 +429,11 @@ func stringEnd(b []byte, i int) int {
 			case q == '"' && b[j] == '\\':
 				j++
 			case j+2 < len(b) && b[j] == q && b[j+1] == q && b[j+2] == q:
-				return j + 2
+				end := j + 2
+				for k := 0; k < 2 && end+1 < len(b) && b[end+1] == q; k++ {
+					end++
+				}
+				return end
 			}
 		}
 		return len(b)

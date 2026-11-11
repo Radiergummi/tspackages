@@ -157,15 +157,15 @@ extra, whose name and version make a filename longer than 148 bytes, or
 whose directory starts with `-` or holds a newline or carriage return, are
 refused and reported. The earliest tag of a version decides: if it is
 refused, so is the version, and a later tag doesn't stand in. A tag whose
-tree has more than 100,000 entries or a path over 1MiB, or whose workspace
-has more than 1,000 members, is refused as a whole; as no versions can be
-read from it, it doesn't block later tags. Until every remote has been
-indexed since tspackages started and every tag read, no new release is built
-(one may still be declared there), and a name without a stored release
-answers `502` instead of moving on to the next source. Files generated at
-build time but not committed aren't in the sdist, and setuptools includes
-non-Python package data only if `MANIFEST.in` or `package-data` lists it.
-Publish such packages through a `storage` source.
+tree has more than 100,000 entries, a path over 4KiB or a listing over
+64MiB, or whose workspace has more than 1,000 members, is refused as a
+whole; as no versions can be read from it, it doesn't block later tags.
+Until every remote has been indexed since tspackages started and every tag
+read, no new release is built (one may still be declared there), and a name
+without a stored release answers `502` instead of moving on to the next
+source. Files generated at build time but not committed aren't in the sdist,
+and setuptools includes non-Python package data only if `MANIFEST.in` or
+`package-data` lists it. Publish such packages through a `storage` source.
 
 ## Client setup
 

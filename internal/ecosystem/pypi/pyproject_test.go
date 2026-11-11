@@ -228,7 +228,13 @@ func TestPyprojectShapeLimits(t *testing.T) {
 		"arrays":        head + "x = " + strings.Repeat("[", n) + strings.Repeat("]", n) + "\n",
 		"dotted header": head + "[" + strings.Repeat("a.", n) + "a]\n",
 		"dotted key":    head + strings.Repeat("a.", n) + "a = 1\n",
-		"size":          head + "# " + strings.Repeat("x", 300<<10) + "\n",
+		// A multi-line string may end in up to two more quotes than its
+		// delimiter; the nesting after it on the same line still counts.
+		"extra basic quotes":   head + "b = [\"\"\"y\"\"\"\", " + strings.Repeat("{a=", 200) + "1" + strings.Repeat("}", 200) + "]\n",
+		"extra literal quotes": head + "b = ['''y''''', " + strings.Repeat("{a=", 200) + "1" + strings.Repeat("}", 200) + "]\n",
+		// Dotted keys inside nested inline tables add up.
+		"dotted keys in inline tables": head + "x = " + strings.Repeat("{"+strings.Repeat("a.", 30)+"a=", 30) + "1" + strings.Repeat("}", 30) + "\n",
+		"size":                         head + "# " + strings.Repeat("x", 300<<10) + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			start := time.Now()
