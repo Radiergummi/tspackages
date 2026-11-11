@@ -220,7 +220,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 	}
 	g.idx.Store(g.assemble())
 	g.prune()
-	metrics.SetGitLastSync(g.name, g.oldestSync())
+	metrics.SetGitLastSync(ecoName, g.name, g.oldestSync())
 	return nil
 }
 

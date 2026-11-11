@@ -28,6 +28,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `tspackages_git_last_sync_timestamp_seconds` has an `ecosystem` label, so
+  a Composer and a PyPI `git` source of the same name no longer share one
+  series. Queries and alerts that select on `source` alone may need it.
 - Upstream artifact downloads stream: the first client gets bytes while the
   archive is still downloading, concurrent clients share one upstream fetch,
   and the archive is cached only after its digest matched. The last byte is

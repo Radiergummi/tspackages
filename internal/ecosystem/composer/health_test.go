@@ -199,8 +199,13 @@ func TestGitHealth(t *testing.T) {
 	for _, f := range fams {
 		if f.GetName() == "tspackages_git_last_sync_timestamp_seconds" {
 			for _, m := range f.GetMetric() {
-				// The only label is the source; remotes never become label values.
-				if len(m.GetLabel()) == 1 && m.GetLabel()[0].GetName() == "source" && m.GetLabel()[0].GetValue() == "git" && m.GetGauge().GetValue() > 0 {
+				// The labels are the ecosystem and the source; remotes never
+				// become label values.
+				labels := map[string]string{}
+				for _, l := range m.GetLabel() {
+					labels[l.GetName()] = l.GetValue()
+				}
+				if len(labels) == 2 && labels["ecosystem"] == "composer" && labels["source"] == "git" && m.GetGauge().GetValue() > 0 {
 					found = true
 				}
 			}

@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -631,6 +632,68 @@ func TestTagMappingRootDir(t *testing.T) {
 	index(t, g)
 	if got := versionsOf(t, g, "acme-core"); len(got) != 1 {
 		t.Fatalf("root = %v", got)
+	}
+}
+
+// lastSyncGauge returns the git last-sync gauge of a pypi source, and
+// whether it is set.
+func lastSyncGauge(t *testing.T, source string) (float64, bool) {
+	t.Helper()
+	fams, err := metrics.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fams {
+		if f.GetName() != "tspackages_git_last_sync_timestamp_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if len(labels) == 2 && labels["ecosystem"] == "pypi" && labels["source"] == source {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// TestLastSyncMetric: the gauge is the oldest last successful sync among
+// the remotes, 0 while one never synced.
+func TestLastSyncMetric(t *testing.T) {
+	a := newRepo(t)
+	a.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0")})
+	a.tag("v1")
+	missing := filepath.Join(t.TempDir(), "later")
+	var mirrors []*gitmirror.Mirror
+	for _, r := range []string{a.dir, missing} {
+		m, err := gitmirror.New(gitmirror.Options{Remote: r, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mirrors = append(mirrors, m)
+	}
+	env := newGitEnv(t)
+	g, err := NewGitSource("metric-git", []string{"*"}, mirrors, nil, env.state, env.rec, 0, nil, MaxGitSdistBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index(t, g)
+	if v, ok := lastSyncGauge(t, "metric-git"); !ok || v != 0 {
+		t.Fatalf("with a remote that never synced: %v %v", v, ok)
+	}
+	b := &repo{t: t, dir: missing}
+	if err := os.MkdirAll(missing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Git(t, b.dir, "init", "-q")
+	b.write(map[string]string{"pyproject.toml": pyproject("acme-api", "1.0.0")})
+	index(t, g)
+	want := float64(min(mirrors[0].LastSync().Unix(), mirrors[1].LastSync().Unix()))
+	if v, _ := lastSyncGauge(t, "metric-git"); v != want {
+		t.Fatalf("gauge = %v, want the oldest sync %v", v, want)
 	}
 }
 

@@ -226,7 +226,7 @@ func TestMetricsExposed(t *testing.T) {
 	metrics.ObserveRequest("composer", "main", 200)
 	metrics.ObserveCacheHit("composer", "main")
 	metrics.ObserveUpstream("main", time.Second)
-	metrics.SetGitLastSync("git", time.Unix(1700000000, 0))
+	metrics.SetGitLastSync("composer", "git", time.Unix(1700000000, 0))
 	w := newWeb(nil)
 	metrics.SetRejected(func() uint64 { return 7 })
 	rec := serve(t, w, "/metrics", reader())
@@ -235,7 +235,7 @@ func TestMetricsExposed(t *testing.T) {
 		`tspackages_requests_total{code="200",ecosystem="composer",source="main"}`,
 		"tspackages_cache_hits_total",
 		"tspackages_upstream_request_duration_seconds_bucket",
-		`tspackages_git_last_sync_timestamp_seconds{source="git"} 1.7e+09`,
+		`tspackages_git_last_sync_timestamp_seconds{ecosystem="composer",source="git"} 1.7e+09`,
 		"tspackages_rate_limited_total 7",
 		"go_goroutines",
 	} {

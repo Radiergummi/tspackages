@@ -211,8 +211,24 @@ func (g *GitSource) Index(ctx context.Context) error {
 		return strings.Compare(a.Remote+a.Tag+a.Dir, b.Remote+b.Tag+b.Dir)
 	})
 	g.idx.Store(&gitIndex{releases: stored, withheld: withheld, pending: pending, conflicts: conflicts, skipped: skipped, complete: complete})
-	metrics.SetGitLastSync(g.name, time.Now())
+	metrics.SetGitLastSync(ecoName, g.name, g.oldestSync())
 	return nil
+}
+
+// oldestSync is the oldest last successful sync among the remotes, zero
+// while one never synced.
+func (g *GitSource) oldestSync() time.Time {
+	var oldest time.Time
+	for i, m := range g.mirrors {
+		t := m.LastSync()
+		if t.IsZero() {
+			return time.Time{}
+		}
+		if i == 0 || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return oldest
 }
 
 // scan is what scanRemote found at a remote's tags.

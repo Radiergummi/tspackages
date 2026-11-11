@@ -51,7 +51,7 @@ var (
 	gitLastSync = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "tspackages_git_last_sync_timestamp_seconds",
 		Help: "Unix time of the oldest last successful sync among a git source's remotes (0 while one never synced).",
-	}, []string{"source"})
+	}, []string{"ecosystem", "source"})
 
 	buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "tspackages_build_info",
@@ -118,11 +118,12 @@ func ObserveUpstream(source string, d time.Duration) {
 	upstreamDuration.WithLabelValues(source).Observe(d.Seconds())
 }
 
-// SetGitLastSync sets the source's last-sync gauge; a zero t is reported as 0.
-func SetGitLastSync(source string, t time.Time) {
+// SetGitLastSync sets the last-sync gauge of an ecosystem's git source; a
+// zero t is reported as 0.
+func SetGitLastSync(ecosystem, source string, t time.Time) {
 	v := 0.0
 	if !t.IsZero() {
 		v = float64(t.Unix())
 	}
-	gitLastSync.WithLabelValues(source).Set(v)
+	gitLastSync.WithLabelValues(ecosystem, source).Set(v)
 }
