@@ -36,6 +36,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Composer git-built archives are capped at 512MiB (or `max_artifact_bytes`,
   if lower), since they are built in memory.
 - S3 stores upload objects above 64MiB in parts, without buffering them.
+- Built with Go 1.27.4, which fixes an HTTP/1 server crash in `net/http`
+  (GO-2026-6859).
 - A Composer dist is served only by the source that resolution picks for the
   name: when several sources claim it, a dist URL naming a later source
   answers `404` while an earlier one knows the name. Lock files written

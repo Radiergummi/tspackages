@@ -32,8 +32,8 @@ go test ./internal/<pkg> -run '^$' -fuzz '^FuzzX$' -fuzztime 30s   # fuzz target
 ```
 
 S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
-(minioadmin/minioadmin by default). Go toolchain 1.27.3+ (required by
-tailscale.com).
+(minioadmin/minioadmin by default). Go toolchain 1.27.4+ (tailscale.com needs
+1.27.3; 1.27.4 fixes GO-2026-6859 in net/http).
 
 ## Layout
 
