@@ -499,7 +499,7 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 		RequiresPy: meta.RequiresPython, Remote: metrics.RedactRemote(m.Remote()), Tag: c.tag, Commit: c.commit,
 		UploadTime: when, SdistFormat: SdistFormat,
 	}
-	if !slices.ContainsFunc(meta.Dynamic, func(f string) bool { return strings.EqualFold(f, "Requires-Dist") }) {
+	if !dependenciesDynamic(meta) {
 		r.Metadata = digestOf(pkgInfo)
 	}
 	dir := g.releaseDir(r.Name, canon)

@@ -162,3 +162,24 @@ func TestWritePKGINFODynamicDependencies(t *testing.T) {
 		t.Fatalf("%s", out)
 	}
 }
+
+// TestWritePKGINFODynamicExtrasOnly: an extra's requirements are
+// Requires-Dist lines, so dynamic extras make Requires-Dist dynamic too, or
+// resolvers would trust a list missing them.
+func TestWritePKGINFODynamicExtrasOnly(t *testing.T) {
+	tr := tree{"pyproject.toml": "[project]\nname = \"a\"\nversion = \"1\"\ndependencies = [\"requests\"]\ndynamic = [\"optional-dependencies\"]\n" + buildSystem}
+	out, err := WritePKGINFO(discover(t, tr)[0], tr.read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(out), "Dynamic: Requires-Dist\n") != 1 || !strings.Contains(string(out), "Dynamic: Provides-Extra\n") {
+		t.Fatalf("%s", out)
+	}
+	m, err := ParseMetadata(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staticMetadata(distribution{sdist: true}, m) {
+		t.Fatal("metadata with dynamic extras is offered as static")
+	}
+}

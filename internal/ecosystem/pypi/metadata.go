@@ -82,8 +82,13 @@ func WritePKGINFO(p Package, read func(path string) ([]byte, error)) ([]byte, er
 			}
 		}
 	}
-	for _, d := range stringList(proj["dependencies"]) {
-		field("Requires-Dist", d)
+	// An extra's requirements are Requires-Dist lines: dynamic extras make
+	// the whole field dynamic, and it is then left out.
+	depsDynamic := isDynamic("dependencies") || isDynamic("optional-dependencies")
+	if !depsDynamic {
+		for _, d := range stringList(proj["dependencies"]) {
+			field("Requires-Dist", d)
+		}
 	}
 	if extras, ok := proj["optional-dependencies"].(map[string]any); ok {
 		for _, extra := range slices.Sorted(maps.Keys(extras)) {
@@ -111,7 +116,7 @@ func WritePKGINFO(p Package, read func(path string) ([]byte, error)) ([]byte, er
 		{"keywords", "Keywords"}, {"classifiers", "Classifier"}, {"urls", "Project-URL"},
 		{"authors", "Author"}, {"maintainers", "Maintainer"},
 	} {
-		if isDynamic(d.key) {
+		if isDynamic(d.key) || d.field == "Requires-Dist" && depsDynamic {
 			field("Dynamic", d.field)
 		}
 	}

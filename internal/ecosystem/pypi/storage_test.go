@@ -330,3 +330,10 @@ func TestUploadRetryCompletesAfterIndexFailure(t *testing.T) {
 		t.Fatalf("upload after completion: %v", err)
 	}
 }
+
+func TestStaticMetadataDynamicExtras(t *testing.T) {
+	m := Metadata{MetadataVersion: "2.2", Dynamic: []string{"Provides-Extra"}}
+	if staticMetadata(distribution{sdist: true}, m) {
+		t.Fatal("an sdist with dynamic Provides-Extra is offered static metadata")
+	}
+}

@@ -268,7 +268,16 @@ func staticMetadata(dist distribution, m Metadata) bool {
 	if err != nil || versionLess(v, "2.2") {
 		return false
 	}
-	return !slices.ContainsFunc(m.Dynamic, func(f string) bool { return strings.EqualFold(f, "Requires-Dist") })
+	return !dependenciesDynamic(m)
+}
+
+// dependenciesDynamic reports whether m's requirements may change in the
+// built wheel: Requires-Dist, or Provides-Extra (whose requirements are
+// Requires-Dist lines), is dynamic.
+func dependenciesDynamic(m Metadata) bool {
+	return slices.ContainsFunc(m.Dynamic, func(f string) bool {
+		return strings.EqualFold(f, "Requires-Dist") || strings.EqualFold(f, "Provides-Extra")
+	})
 }
 
 func versionLess(v Version, than string) bool {
