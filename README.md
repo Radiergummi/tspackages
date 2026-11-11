@@ -102,8 +102,9 @@ be positive. `max_artifact_bytes` (default 8GiB) caps an upstream artifact
 download. Downloads stream to clients while they arrive and are cached once
 their digest matches, so memory use doesn't grow with artifact size; size the
 cache's `max_size` for the largest artifacts you expect. Composer git-built
-archives are built in memory and capped at 512MiB (or `max_artifact_bytes`,
-if lower). `max_decompressed_bytes` applies to upload inspection.
+archives and PyPI git-built sdists are built in memory and capped at 512MiB
+(or `max_artifact_bytes`, if lower); a larger PyPI package is refused and
+reported. `max_decompressed_bytes` applies to upload inspection.
 
 ## PyPI sources
 

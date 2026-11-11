@@ -27,6 +27,10 @@ const lfsPointer = "version https://git-lfs.github.com/spec/v1\n"
 // RefusedError is a release that cannot be served as an sdist.
 type RefusedError struct{ Reason string }
 
+// MaxGitSdistBytes caps the archive of a package directory the git source
+// reads to build an sdist; sdists are built in memory.
+const MaxGitSdistBytes = 512 << 20
+
 func (e *RefusedError) Error() string { return e.Reason }
 
 // Identity is a release's identity: a digest over the sdist format, the tree

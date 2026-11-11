@@ -86,14 +86,15 @@ type gitIndex struct {
 // generated sdist. Releases are stored in the state store, keyed by name and
 // canonical version, and never change once stored.
 type GitSource struct {
-	name    string
-	claims  []string
-	mirrors []*gitmirror.Mirror
-	tags    map[string]map[string][]string
-	state   storage.Driver
-	rec     *records.Store
-	poll    time.Duration
-	log     *slog.Logger
+	maxBytes int64 // cap on a package directory's archive, built in memory
+	name     string
+	claims   []string
+	mirrors  []*gitmirror.Mirror
+	tags     map[string]map[string][]string
+	state    storage.Driver
+	rec      *records.Store
+	poll     time.Duration
+	log      *slog.Logger
 
 	mu       sync.Mutex             // serialises Index
 	byCommit map[string][]candidate // discovery per remote+commit; commits are immutable
@@ -114,7 +115,7 @@ var (
 // NewGitSource returns a git source; tags maps a remote to tag patterns and
 // the package directories each releases. poll <= 0 means one minute; log nil
 // means slog.Default().
-func NewGitSource(name string, claims []string, mirrors []*gitmirror.Mirror, tags map[string]map[string][]string, state storage.Driver, rec *records.Store, poll time.Duration, log *slog.Logger) (*GitSource, error) {
+func NewGitSource(name string, claims []string, mirrors []*gitmirror.Mirror, tags map[string]map[string][]string, state storage.Driver, rec *records.Store, poll time.Duration, log *slog.Logger, maxBytes int64) (*GitSource, error) {
 	if poll <= 0 {
 		poll = time.Minute
 	}
@@ -122,7 +123,7 @@ func NewGitSource(name string, claims []string, mirrors []*gitmirror.Mirror, tag
 		log = slog.Default()
 	}
 	g := &GitSource{
-		name: name, claims: claims, mirrors: mirrors, tags: tags, state: state, rec: rec, poll: poll, log: log,
+		name: name, claims: claims, mirrors: mirrors, tags: tags, state: state, rec: rec, poll: poll, log: log, maxBytes: maxBytes,
 		byCommit: map[string][]candidate{}, stored: map[string]release{}, health: map[string]error{},
 	}
 	g.idx.Store(&gitIndex{releases: map[string][]release{}, withheld: map[string]bool{}})
@@ -481,7 +482,13 @@ func (g *GitSource) build(ctx context.Context, c candidate) error {
 	if c.pkg.Dir != "" {
 		paths = []string{c.pkg.Dir}
 	}
-	if err := m.ArchiveTar(ctx, c.commit, paths, &tarBuf); err != nil {
+	// The sdist is built in memory, so its input is capped.
+	cw := &cappedWriter{w: &tarBuf, left: g.maxBytes}
+	if err := m.ArchiveTar(ctx, c.commit, paths, cw); err != nil {
+		// git dies of the broken pipe, so the error needn't be ours.
+		if cw.exceeded {
+			return &RefusedError{Reason: fmt.Sprintf("package directory is larger than %d bytes; publish it through a storage source", g.maxBytes)}
+		}
 		return err
 	}
 	when, err := m.CommitTime(ctx, c.commit)
@@ -726,4 +733,20 @@ func uniq[T any](xs []T, key func(T) string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// cappedWriter fails once more than left bytes were written.
+type cappedWriter struct {
+	w        io.Writer
+	left     int64
+	exceeded bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > c.left {
+		c.exceeded = true
+		return 0, errors.New("pypi: package directory too large")
+	}
+	c.left -= int64(len(p))
+	return c.w.Write(p)
 }

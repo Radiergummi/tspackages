@@ -60,8 +60,9 @@ func workspaceRoot() string {
 }
 
 type gitEnv struct {
-	state storage.Driver
-	rec   *records.Store
+	state    storage.Driver
+	rec      *records.Store
+	maxBytes int64 // 0 = MaxGitSdistBytes
 }
 
 func newGitEnv(t *testing.T) *gitEnv {
@@ -83,7 +84,11 @@ func (e *gitEnv) source(t *testing.T, tags map[string]map[string][]string, remot
 		}
 		mirrors = append(mirrors, m)
 	}
-	g, err := NewGitSource("git", []string{"*"}, mirrors, tags, e.state, e.rec, 0, nil)
+	maxBytes := e.maxBytes
+	if maxBytes == 0 {
+		maxBytes = MaxGitSdistBytes
+	}
+	g, err := NewGitSource("git", []string{"*"}, mirrors, tags, e.state, e.rec, 0, nil, maxBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,5 +435,23 @@ func TestBuildFailureIsNotNotFound(t *testing.T) {
 	g.Index(context.Background())
 	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("Project after a failed build: %v", err)
+	}
+}
+
+// TestOversizedPackageRefused: a package directory larger than the cap is
+// refused and reported instead of being read into memory whole.
+func TestOversizedPackageRefused(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-big", "1.0.0"), "blob.bin": strings.Repeat("x", 64<<10)})
+	r.tag("v1")
+	env := newGitEnv(t)
+	env.maxBytes = 16 << 10
+	g := env.source(t, nil, r.dir)
+	index(t, g)
+	if _, err := g.Project(context.Background(), "acme-big"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("oversized package served: %v", err)
+	}
+	if s := g.Skipped(); len(s) != 1 || !strings.Contains(s[0].Reason, "larger than") {
+		t.Fatalf("skipped = %+v", s)
 	}
 }

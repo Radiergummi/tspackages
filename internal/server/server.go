@@ -148,7 +148,8 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			if err != nil {
 				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
 			}
-			src, err := pypi.NewGitSource(s.Name, s.Claims, ms, s.Tags, stores.state, rec, s.PollInterval, log)
+			src, err := pypi.NewGitSource(s.Name, s.Claims, ms, s.Tags, stores.state, rec, s.PollInterval, log,
+				min(int64(l.MaxArtifactBytes), pypi.MaxGitSdistBytes))
 			if err != nil {
 				return fail(err)
 			}
