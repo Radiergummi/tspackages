@@ -9,54 +9,79 @@ standby. Everything below follows from that.
 
 ## Before the first start
 
-- **HTTPS in the tailnet.** Turn on MagicDNS and HTTPS certificates in the
-  admin console. Without them startup fails with `you must enable HTTPS in
-  the admin panel`.
+- **MagicDNS and HTTPS in the tailnet.** Turn on both in the admin console.
+  Without them startup fails with `you must enable MagicDNS in the DNS page
+  of the admin panel` or `you must enable HTTPS in the admin panel`.
 - **A tag and a key.** Give the node a tag (`tailscale.tags`, for example
-  `tag:registry`) and register it with one of:
-  - an auth key for that tag in `TS_AUTHKEY`;
-  - an OAuth client secret (`tskey-client-...`) in `TS_AUTHKEY` or
-    `TS_CLIENT_SECRET`. A node registered this way is ephemeral unless the
-    secret says otherwise, and an ephemeral node is removed soon after it
-    goes offline. Append `?ephemeral=false&preauthorized=true` to the secret.
-
-  The key is only needed until the node is registered. With an OAuth secret
-  set, every start calls the Tailscale API to mint a key, and a start fails
-  while that API is unreachable, so remove the secret from the environment
-  once the node is up. Tagged nodes don't expire.
+  `tag:registry`; tagged nodes don't expire) and register it with an auth key
+  or an OAuth client secret, as the
+  [README quick start](../README.md#quick-start) shows. With an OAuth client
+  secret (`tskey-client-...` in `TS_AUTHKEY` or `TS_CLIENT_SECRET`):
+  - the node is ephemeral unless the secret says otherwise, and an
+    ephemeral node is removed soon after it goes offline. Append
+    `?ephemeral=false&preauthorized=true` to the secret;
+  - every start calls the Tailscale API to mint a key, even for a
+    registered node, and fails while that API is unreachable. Remove the
+    secret from the environment once the node is up.
+- **Tailnet Lock.** With Tailnet Lock on, a new node must be signed before
+  it can talk to anyone: sign its node key with `tailscale lock sign` from a
+  signing node, or register it with an auth key you signed beforehand. Keys
+  minted from an OAuth secret can't be signed beforehand.
 - **Grants.** Write the tailnet policy as
   [README: Tailnet policy](../README.md#tailnet-policy) shows. A monitoring
   node needs a grant too (see [Monitoring](#monitoring)).
-- **Directories.** `tailscale.state_dir` and `storage.work_dir` must be
-  owned by the service user, mode 0700 and separate from each other and from
-  every `fs` store; `work_dir` must be absolute. tspackages creates missing
-  ones with mode 0700, and refuses to start on one with another owner or
-  mode, or on a symlink.
+- **Directories.** `tailscale.state_dir` and `storage.work_dir` follow the
+  rules in the [security notes on secrets and state](security.md#secrets-and-state)
+  and the README quick start. tspackages creates missing ones with mode 0700
+  and refuses to start on one with another owner or mode, or on a symlink.
 - **Stores.** Pick `fs` or `s3` for each of `storage.cache`, `storage.state`
-  and the hosted `storage.stores`. No two may share a location (one path
-  or prefix inside another counts). Keep the cache on local disk or in a bucket of its own: it deletes
-  objects all the time, which a versioned bucket keeps as noncurrent
-  versions. tspackages refuses to start while any store is unreachable.
+  and the hosted `storage.stores`. No two may share a location (one path or
+  prefix inside another counts). Keep the cache on local disk or in a bucket
+  of its own: it deletes objects all the time, which a versioned bucket
+  keeps as noncurrent versions. tspackages refuses to start while any store
+  is unreachable.
 - **git and ssh.** `git` sources run the `git` binary, and SSH remotes run
   `ssh`. The container image includes both; a host install needs them.
 
-Set `TS_NO_LOGS_NO_SUPPORT=1` unless you want tsnet's logs uploaded to
-Tailscale.
+## Getting the binary or image
 
-## Deploying the binary
+Release binaries and images come from a tagged release. Until the first one
+is tagged, build them from a checkout:
 
-Releases carry `tspackages_linux_amd64` and `tspackages_linux_arm64`, each
-with a `.sha256` file, a provenance bundle and an SBOM bundle:
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build   # ./tspackages
+docker build --build-arg VERSION=$(git describe --tags --always) \
+  --build-arg REVISION=$(git rev-parse HEAD) -t tspackages .
+```
+
+A release carries `tspackages_linux_amd64` and `tspackages_linux_arm64`,
+each with a `.sha256` file, a provenance bundle and an SBOM bundle:
 
 ```sh
 sha256sum -c tspackages_linux_amd64.sha256
 gh attestation verify tspackages_linux_amd64 --repo radiergummi/tspackages \
   --bundle tspackages_linux_amd64.provenance.sigstore.json
-install -m 0755 tspackages_linux_amd64 /usr/local/bin/tspackages
-useradd --system --home-dir /var/lib/tspackages --shell /usr/sbin/nologin tspackages
 ```
 
-A systemd unit, with the paths from
+and pushes the image `ghcr.io/radiergummi/tspackages` for `linux/amd64` and
+`linux/arm64`, tagged with its version without the `v` (`1.2.3`); `1.2`, `1`
+and `latest` move to the newest release. Pin an exact version or a digest,
+and verify it with
+`gh attestation verify oci://ghcr.io/radiergummi/tspackages:1.2.3 --repo radiergummi/tspackages`.
+
+## Running under systemd
+
+```sh
+install -m 0755 tspackages /usr/local/bin/tspackages
+useradd --system --home-dir /var/lib/tspackages --shell /usr/sbin/nologin tspackages
+install -d -m 0750 -g tspackages /etc/tspackages
+install -m 0640 -g tspackages config.yaml /etc/tspackages/config.yaml
+install -m 0600 env /etc/tspackages/env   # read by systemd as root
+```
+
+The config and any file it names with `${file:}` must be readable by the
+service user; owner root, group `tspackages` and mode 0640 keep them from
+everyone else. A unit, with the paths from
 [examples/config.yaml](../examples/config.yaml):
 
 ```ini
@@ -71,7 +96,6 @@ User=tspackages
 Group=tspackages
 ExecStart=/usr/local/bin/tspackages -config /etc/tspackages/config.yaml
 # TS_AUTHKEY=..., TS_NO_LOGS_NO_SUPPORT=1 and anything ${env:} names.
-# Owned by root, mode 0600.
 EnvironmentFile=/etc/tspackages/env
 StateDirectory=tspackages
 StateDirectoryMode=0700
@@ -92,18 +116,16 @@ WantedBy=multi-user.target
 `ProtectSystem=strict` leaves it as the only writable path. Put `fs` stores
 on another path and add it with `ReadWritePaths=`. Secrets can come from
 systemd credentials too: `LoadCredential=deploy_key:/etc/tspackages/deploy_key`
-and `ssh_key: ${file:/run/credentials/tspackages.service/deploy_key}`.
+and `ssh_key: ${file:/run/credentials/tspackages.service/deploy_key}`. That
+path exists only inside the service, though, which rules out the config check
+in [Upgrading](#upgrading).
 
-The process logs to stderr (JSON by default, `-log-format text` otherwise),
-so the journal has everything. A configuration error exits with status 1.
+Set `TS_NO_LOGS_NO_SUPPORT=1` unless you want tsnet's logs uploaded to
+Tailscale. The process logs to stderr (JSON by default, `-log-format text`
+otherwise), so the journal has everything. A configuration error exits with
+status 1.
 
-## Deploying the container
-
-The image is `ghcr.io/radiergummi/tspackages`, for `linux/amd64` and
-`linux/arm64`. Each release is tagged with its version without the `v`
-(`1.2.3`); `1.2`, `1` and `latest` move to the newest release. Pin an exact
-version or a digest, and verify it with
-`gh attestation verify oci://ghcr.io/radiergummi/tspackages:1.2.3 --repo radiergummi/tspackages`.
+## Running the container
 
 ```sh
 docker run -d --name tspackages --restart unless-stopped --stop-timeout 60 \
@@ -114,9 +136,11 @@ docker run -d --name tspackages --restart unless-stopped --stop-timeout 60 \
 ```
 
 The image runs as uid 10001, reads `/etc/tspackages/config.yaml` and declares
-`/var/lib/tspackages` a volume. Docker stops a container after 10 seconds
-by default, sooner than tspackages' 30-second drain, hence `--stop-timeout`. A bind
-mount instead of a named volume must be owned by uid 10001 with mode 0700.
+`/var/lib/tspackages` a volume. The config and the files it names must be
+readable by uid 10001 (for example group 10001, mode 0640). Docker stops a
+container after 10 seconds by default, sooner than tspackages' 30-second
+drain, hence `--stop-timeout`. A bind mount instead of a named volume must
+be owned by uid 10001 with mode 0700.
 
 There is no local health port: tspackages listens only on the tailnet, on
 443. A container health check from the host can't reach it; probe it from
@@ -146,8 +170,11 @@ rewritten on every upload and can be rebuilt from the other objects.
 The `fs` driver writes every object to a temp file, syncs it and renames it
 into place, so an object on disk is always complete. Its locks are held only
 for one operation each and don't cover a copy made from outside. A copy of
-a running store can catch an index older or newer than the files it lists. Copy either with the service stopped or from a filesystem snapshot
-(ZFS or LVM, for example):
+a running store can catch an index older or newer than the files it lists.
+Copy either with the service stopped or from a filesystem snapshot (ZFS or
+LVM, for example). For the layout in the README quick start, with `fs` stores at
+`/var/lib/tspackages/state` and `/var/lib/tspackages/hosted` (the example
+config uses S3 instead):
 
 ```sh
 systemctl stop tspackages
@@ -158,20 +185,24 @@ systemctl start tspackages
 
 The archive holds the node keys: encrypt it, or keep the state dir out of it
 and accept registering a new node after a loss. `#locks` and `*#tmp` files
-are recreated or removed at startup. A snapshot of
-a running store is as good as a crash: a publish that was in flight may be
-stored but not listed. Running that publish again with the same file
-completes it.
+are recreated or removed at startup. A snapshot of a running store is as
+good as a crash: a publish that was in flight may be stored but not listed.
+Running that publish again with the same file completes it.
 
 ### Stores in buckets
 
-- Turn on **versioning** on the state and hosted buckets, and
-  **Object Lock** with a default retention on the state bucket. tspackages
-  never overwrites or deletes in the state store, so a retention period
-  doesn't get in its way. Test an upload after turning it on: some
-  S3-compatible services want a checksum on every write to a locked bucket,
-  and with `endpoint` set tspackages sends checksums only where the API
-  requires them.
+- Turn on **versioning** on the state and hosted buckets, and **Object
+  Lock** with a default retention on the state bucket. tspackages never
+  overwrites or deletes in the state store, so a retention period doesn't
+  get in its way. Use separate buckets for the state store and the hosted
+  stores, so each gets its own settings.
+- Use **governance mode** if you may ever need to purge something, such as
+  a leaked secret: an account with the bypass permission can then remove
+  locked versions. Compliance mode allows that to nobody until the retention
+  ends.
+- Test an upload after turning on Object Lock: some S3-compatible services
+  want a checksum on every write to a locked bucket, and with `endpoint` set
+  tspackages sends checksums only where the API requires them.
 - **Replicate** both buckets to another region or account.
 - To restore, copy back the object versions that were current at the chosen
   time, or point the config at the replica.
@@ -183,21 +214,32 @@ completes it.
    two instances fight over indexes.
 2. Restore the tsnet state dir (owner and mode 0700 included), the state
    store and the hosted stores. Leave the cache and `work_dir` empty.
-3. Start tspackages. `/readyz` answers `ok` once every store is reachable.
-   Names served by git sources answer `502` until the first index pass,
-   which starts at once and clones the mirrors first.
-4. Run again the publishes that happened after the backup.
+3. If a hosted store was copied while tspackages ran, delete its
+   `index.json` files so they are rebuilt from the files they list. Composer
+   rebuilds an index on the next read. PyPI lists a package from its file
+   records at once, but the package stays out of the `/pypi/simple/` project
+   list until its next upload; pip and uv don't read that list.
+4. Start tspackages. `/readyz` answers `ok` once every store is reachable.
+   PyPI releases already in the state store are served at once. Names
+   claimed by a Composer git source, and PyPI git names without a stored
+   release, answer `502` until the first index pass, which starts at once
+   and clones the mirrors first.
+5. Publish again what was published after the backup, from the **original
+   artifacts**: the same zip, wheel or sdist bytes. A rebuilt file has
+   another `reference` or SHA256, and lock files that pinned the original
+   stop installing.
 
 The state store and the hosted stores don't have to come from the same
 moment: hosted packages need nothing from the state store.
 
 ### Losing a piece
 
-- **tsnet state dir.** The node needs a new key to register. Delete the old
-  machine in the admin console first: otherwise the new node gets a
-  numbered host name (`registry-1`) and clients' URLs stop working. The new
-  node fetches a new TLS certificate. Grants match its tag, so access is
-  unchanged.
+- **tsnet state dir.** The node needs a new key to register, and with
+  Tailnet Lock a new signature (see
+  [Before the first start](#before-the-first-start)). Delete the old machine
+  in the admin console first: otherwise the new node gets a numbered host
+  name (`registry-1`) and clients' URLs stop working. The new node fetches a
+  new TLS certificate. Grants match its tag, so access is unchanged.
 - **State store.** Tags are pinned again to whatever they point at now, so
   a tag moved since its first pin is accepted silently. Composer archives are
   rebuilt from git; if the bytes differ (another git version, for one), the
@@ -207,10 +249,9 @@ moment: hosted packages need nothing from the state store.
   Versions whose tags are gone upstream are lost. Provenance and audit
   records are lost, and the check for registry archives that changed
   upstream starts over.
-- **A hosted store.** Its packages are gone; only publishing them again
-  brings them back. A lost `index.json` alone is harmless: Composer rebuilds
-  it from the zips on the next read; PyPI lists the package from its file
-  records and rewrites the index on the next upload.
+- **A hosted store.** Its packages are gone; only publishing the original
+  artifacts again brings them back unchanged. A lost `index.json` alone is
+  harmless (see [Restoring](#restoring)).
 - **Cache.** Everything is fetched again. While an upstream is down, cached
   registry metadata is served stale; without a cache those requests fail.
 - **`work_dir`.** Mirrors are cloned again. A Composer remote that is
@@ -227,30 +268,23 @@ briefly. Stop the old one, then start the new one; the upgrade is a short
 outage.
 
 1. Read the CHANGELOG between the two versions. Look for config that stops
-   validating, layout changes in the stores and steps for clients.
+   validating, changes to the stores and steps for clients.
 2. Back up the state store, so a rollback has something to return to.
 3. Optionally check the config with the new binary while the old one still
-   runs: start it as the service user with the same environment.
+   runs. This works only if every secret comes from the environment or
+   from a file the service user can read, not from `LoadCredential`:
+
+   ```sh
+   systemd-run --wait --pty --uid=tspackages \
+     -p EnvironmentFile=/etc/tspackages/env \
+     /usr/local/bin/tspackages.new -config /etc/tspackages/config.yaml
+   ```
+
    Validation errors print at once. A valid config gets as far as the lock
    and logs `work_dir is locked by another instance; waiting`; stop it with
    Ctrl-C.
 4. Stop the old instance, replace the binary or image, start the new one.
 5. Check `/readyz`, the status page and `tspackages_build_info`.
-
-The current release notes (Unreleased in CHANGELOG.md) include these for
-anyone who ran an earlier build:
-
-- `fs` stores lock through a fixed set of files in `<path>/#locks`.
-  Earlier builds locked through one file per object. Don't run an earlier
-  build against the same `fs` store at the same time.
-- `fs` stores create directories mode 0700 and files 0600. Files from
-  earlier builds keep their modes; tighten them with
-  `chmod -R go-rwx <path>`.
-- A `storage` source whose claim overlaps a claim of an earlier source, or
-  a git remote over 156 bytes, now fails validation.
-- A Composer dist is served only by the source that resolution picks, so
-  lock files written before sources were reordered may need
-  `composer update`.
 
 ## Monitoring
 
@@ -272,9 +306,9 @@ Metrics:
 
 - `tspackages_requests_total{ecosystem,source,code}`: alert on a rising
   share of `5xx`.
-- `tspackages_git_last_sync_timestamp_seconds{source}`: the oldest
-  successful sync among a git source's remotes, `0` while one never synced.
-  Alert when it falls more than a few poll intervals behind.
+- `tspackages_git_last_sync_timestamp_seconds{ecosystem,source}`: the
+  oldest last successful sync among a git source's remotes, `0` while one
+  never synced. Alert when it falls more than a few poll intervals behind.
 - `tspackages_upstream_request_duration_seconds{source}`,
   `tspackages_cache_hits_total`, `tspackages_rate_limited_total` and
   `tspackages_build_info{version,commit}`.
@@ -293,7 +327,10 @@ worth an alert:
 | `composer git: tag moved upstream; serving the pinned commit` | warn | A tag was force-pushed. The pin keeps the first commit. |
 | `composer package declared by several remotes; not served` | error | Two remotes of one git source declare the same package. |
 | `composer git: serving pinned versions only` | warn | A remote can't be indexed, so only its pinned versions are served. |
+| `composer git: indexing failed; keeping previous index` | error | A remote couldn't be indexed; its previous versions stay served. |
 | `composer git sync failed; ...`, `pypi git sync failed; ...` | warn | A remote is unreachable. |
+| `pypi git: indexing a remote failed; its stored releases stay served` | warn | A remote couldn't be indexed. |
+| `pypi git index failed` | error | A whole index pass failed, for example reading the state store. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
 | `left symlinks out of a git archive` | warn | A git-built archive lacks the listed symlinks. |
 | `composer source failed`, `pypi source failed` | error | A request ended in `5xx`. |
@@ -315,19 +352,25 @@ Before you do:
   install from then on.
 - Publish the fix under a **new version**. Reusing a version number with
   other bytes breaks every lock file that pinned the old hash, and
-  Composer's `shasum` check.
+  Composer's `shasum` check. For PyPI uploads the version stays blocked for
+  a corrected file with another filename anyway (see
+  [An upload to a PyPI storage source](#an-upload-to-a-pypi-storage-source)).
 - Leave the provenance and audit records alone. They are the history of
   what was served.
-- With S3 versioning or Object Lock, a delete only hides the object; the
-  bytes stay as a noncurrent version until you remove that version or its
-  retention ends. For a leaked secret, remove those versions too and rotate
-  the secret regardless.
 - The order of the steps matters: in the order given, an upload or index
   rebuild that runs at the same time can't bring the version back. Pause
   publishes of the package anyway.
+- A mistyped key deletes nothing and reports no error: `rm -f` and S3
+  `DeleteObject` both succeed on a missing key. **List the prefix first**
+  and check that every key you are about to delete is in the listing.
+  Afterwards, fetch the file's old download URL and expect `404`.
+- In an `fs` store, delete each object's `<key>#etag` file with it.
 
-Some keys contain segments that tspackages encodes as lowercase
-base32hex without padding. This computes one:
+Names in keys are normalised: Composer's `<vendor>/<name>` is in lowercase;
+a PyPI name is normalised as PEP 503 says (lowercase; runs of `-`, `_` and
+`.` become `-`, so `Acme_Utils` is `acme-utils`). Some segments are then
+encoded as lowercase base32hex without padding. This computes one (Python
+3.10 or later):
 
 ```sh
 esc() { python3 -c 'import base64,sys; print(base64.b32hexencode(sys.argv[1].encode()).decode().rstrip("=").lower())' "$1"; }
@@ -346,7 +389,9 @@ Find the version's `version_normalized` (for example `1.0.0.0`) in
 3. `composer/<vendor>/<name>/index.json`
 
 The next read rebuilds the index from the remaining zips. No restart is
-needed. Nothing then stops the same version from being uploaded again.
+needed. Check that the old `dist.url` (from a `composer.lock`, under
+`/composer/dist/`) answers `404`. Nothing then stops the same version from being
+uploaded again.
 
 ### An upload to a PyPI storage source
 
@@ -362,10 +407,14 @@ Find the file's `version` (the canonical form, `1.0` is `1`) in
 Reads then list the package from the remaining `.json` records, and the next
 upload writes a new index. Until then the package is missing from the
 `/pypi/simple/` project list; pip and uv don't read that list. Between the
-first and the last step, downloads of the file fail with `502`. Leave the
-release's claim files (`<dir>/~sdist` and `<dir>/<esc(~wheel-<tags>)>`):
-they keep a different file from claiming the same release. The same
-filename can be uploaded again. No restart is needed.
+first and the last step, downloads of the file fail with `502`. Check that
+`/pypi/files/<source>/<name>/<filename>` answers `404`. No restart is
+needed.
+
+Leave the release's claim files (`<dir>/~sdist` and
+`<dir>/<esc(~wheel-<tags>)>`). They hold the filename: the same filename can
+be uploaded again, but a corrected file under another filename can't take
+that version's sdist or wheel. Publish a new version.
 
 ### A Composer version from a git tag
 
@@ -378,8 +427,9 @@ both:
 
 The next index pass drops the version. Delete the pin after the tag: a tag
 that still exists is pinned again on the next pass. The archive under
-`composer-git/` can stay; the archive of a commit is shared by every tag and
-branch that points at it.
+`composer-git/` can stay unless it holds a secret: the archive of a commit
+is shared by every tag and branch that points at it, and is built again
+while one does.
 
 ### A PyPI release from a git tag
 
@@ -401,12 +451,30 @@ A bad upstream release is for the upstream to yank. tspackages fetches its
 metadata again after `metadata_ttl`. Archives it already cached stay in the
 cache until evicted; to drop them, stop tspackages and empty the cache.
 
+### A leaked secret
+
+Removing the release isn't enough. The secret also lives in:
+
+- noncurrent versions in versioned buckets, and their replicas;
+- backups;
+- for a git-served version, the archives under `composer-git/<source>/`
+  (`<commit>.zip` and `<commit>.meta.json`) and the release directories
+  under `pypi-git/` in the state store;
+- the git mirror under `<work_dir>/git/`. Stop tspackages, delete the
+  mirror's directory and start it again; it clones the mirror again. Remove
+  the commit from the repository first, or the clone brings it back;
+- the cache, for a release from a registry source;
+- every client and CI cache that downloaded it.
+
+Rotate the secret regardless.
+
 ## When the registry is down
 
 While tspackages is stopped, clients can't reach `https://<hostname>.<tailnet>.ts.net`
 at all: connections fail, usually by timing out. Installs that need metadata
-or an archive fail, and so do publishes. Right after a start, names served
-by git sources answer `502` until the first index pass.
+or an archive fail, and so do publishes. Right after a start, names claimed
+by a Composer git source and PyPI git names without a stored release answer
+`502` until the first index pass.
 
 To keep that window small and harmless:
 
