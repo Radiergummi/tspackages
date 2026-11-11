@@ -126,29 +126,38 @@ func readPyproject(read func(string) ([]byte, error), p string) (map[string]any,
 // evaluate reads one package's [project] table and decides whether it can be
 // served; an error is a file that could not be read.
 func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any) (Package, error) {
+	p := evaluateProject(dir, doc)
+	if p.Skip != "" {
+		return p, nil
+	}
+	return p, checkFiles(read, &p)
+}
+
+// evaluateProject decides from the [project] table alone.
+func evaluateProject(dir string, doc map[string]any) Package {
 	p := Package{Dir: dir}
 	proj, ok := doc["project"].(map[string]any)
 	if !ok {
 		p.Skip = skipNoProject
-		return p, nil
+		return p
 	}
 	p.Project = proj
 	rawName, _ := proj["name"].(string)
 	name, err := Normalize(rawName)
 	if err != nil {
 		p.Skip = skipBadName
-		return p, nil
+		return p
 	}
 	p.Name = name
 	if uv, ok := table(doc, "tool", "uv"); ok {
 		if pkg, ok := uv["package"].(bool); ok && !pkg {
 			p.Skip = skipNotPackage
-			return p, nil
+			return p
 		}
 	}
 	if _, ok := doc["build-system"]; !ok {
 		p.Skip = skipNotPackage
-		return p, nil
+		return p
 	}
 	rawVersion, ok := proj["version"].(string)
 	if !ok {
@@ -157,36 +166,41 @@ func evaluate(read func(string) ([]byte, error), dir string, doc map[string]any)
 		} else {
 			p.Skip = skipBadVersion
 		}
-		return p, nil
+		return p
 	}
 	if p.Version, err = ParseVersion(rawVersion); err != nil {
 		p.Skip = skipBadVersion
-		return p, nil
 	}
-	for _, f := range referencedFiles(proj) {
-		repo, inside := inDir(dir, f)
+	return p
+}
+
+// checkFiles refuses a package whose readme or license file cannot go into
+// the sdist, and records the readme's path otherwise.
+func checkFiles(read func(string) ([]byte, error), p *Package) error {
+	for _, f := range referencedFiles(p.Project) {
+		repo, inside := inDir(p.Dir, f)
 		if !inside {
 			p.Skip = skipOutsideFile
-			return p, nil
+			return nil
 		}
 		switch _, err := read(repo); {
 		case errors.Is(err, resolve.ErrNotFound):
 			p.Skip = skipMissingFile
-			return p, nil
+			return nil
 		case errors.Is(err, errNotRegular):
 			p.Skip = skipNotRegular
-			return p, nil
+			return nil
 		case errors.Is(err, gitmirror.ErrTooLarge):
 			p.Skip = skipLargeFile
-			return p, nil
+			return nil
 		case err != nil:
-			return Package{}, err
+			return err
 		}
 	}
-	if f := readmeFile(proj); f != "" {
-		p.Readme, _ = inDir(dir, f)
+	if f := readmeFile(p.Project); f != "" {
+		p.Readme, _ = inDir(p.Dir, f)
 	}
-	return p, nil
+	return nil
 }
 
 // referencedFiles are the files [project] names by path: the readme and an
