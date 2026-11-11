@@ -46,7 +46,8 @@ var onMirror = func(*gitmirror.Mirror) {}
 // they have stopped (run it in a goroutine). Git mirrors live in
 // <work_dir>/git, and directories there that belong to no configured mirror
 // are removed; SSH key material is rewritten to <work_dir>/keys
-// (<source>.key, <source>.known_hosts) at every start.
+// (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources) at
+// every start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
 	if err := config.ValidateWith(cfg, config.ValidateOptions{
@@ -143,8 +144,12 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 				s.MetadataTTL, int64(l.MaxArtifactBytes), limits.UpstreamWait, log)
 			pySources, status = append(pySources, src), append(status, src)
 		case "git":
-			// Key files are per ecosystem: a composer source may share the name.
-			ms, err := sourceMirrors(s, filepath.Join(keyDir, "pypi-"+s.Name), gitDir, mirrors, h, log)
+			// Key files live in keys/pypi/, where no composer source's can.
+			pyKeyDir := filepath.Join(keyDir, "pypi")
+			if err := workdir.EnsurePrivateDir(pyKeyDir); err != nil {
+				return fail(err)
+			}
+			ms, err := sourceMirrors(s, filepath.Join(pyKeyDir, s.Name), gitDir, mirrors, h, log)
 			if err != nil {
 				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
 			}

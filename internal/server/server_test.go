@@ -370,19 +370,34 @@ func TestBuildWiresPyPI(t *testing.T) {
 	}
 }
 
-// A composer and a pypi git source may share a name; their key files must not.
+// A composer and a pypi git source may share a name, and a composer source
+// may be named like a prefixed pypi one; their key files must not collide.
 func TestBuildPyPIKeyFilesDoNotCollide(t *testing.T) {
-	cfg := gitConfig(t, sshSource)
+	prefixed := sshSource
+	prefixed.Name, prefixed.SSHKey, prefixed.Claims = "pypi-internal", "PREFIXED KEY", []string{"other/*"}
+	cfg := gitConfig(t, sshSource, prefixed)
 	pypiSSH := sshSource
 	pypiSSH.SSHKey = "PYPI KEY"
 	pypiSSH.Claims = []string{"acme-*"}
 	cfg.Ecosystems["pypi"] = config.Ecosystem{Sources: []config.Source{pypiSSH}}
+	got := captureMirrors(t)
 	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
-	composerKey, err1 := os.ReadFile(filepath.Join(cfg.Storage.WorkDir, "keys", "internal.key"))
-	pypiKey, err2 := os.ReadFile(filepath.Join(cfg.Storage.WorkDir, "keys", "pypi-internal.key"))
-	if err1 != nil || err2 != nil || !strings.HasPrefix(string(composerKey), "PRIVATE KEY MATERIAL") || !strings.HasPrefix(string(pypiKey), "PYPI KEY") {
-		t.Fatalf("keys: %q %v / %q %v", composerKey, err1, pypiKey, err2)
+	keys := filepath.Join(cfg.Storage.WorkDir, "keys")
+	for p, want := range map[string]string{
+		filepath.Join(keys, "internal.key"):         "PRIVATE KEY MATERIAL",
+		filepath.Join(keys, "pypi-internal.key"):    "PREFIXED KEY",
+		filepath.Join(keys, "pypi", "internal.key"): "PYPI KEY",
+	} {
+		if b, err := os.ReadFile(p); err != nil || !strings.HasPrefix(string(b), want) {
+			t.Errorf("%s: %q %v, want %s", p, b, err, want)
+		}
+	}
+	if m := mode(t, filepath.Join(keys, "pypi")); !m.IsDir() || m.Perm() != 0o700 {
+		t.Errorf("keys/pypi mode = %v, want 0700 dir", m)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("%d mirrors, want 3", len(*got))
 	}
 }
