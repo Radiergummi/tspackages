@@ -406,3 +406,29 @@ func TestLFSAttributesRefused(t *testing.T) {
 		t.Fatalf("skipped = %+v", s)
 	}
 }
+
+// failReleaseWrites fails every release record write, as an unreachable
+// state store would.
+type failReleaseWrites struct{ storage.Driver }
+
+func (f failReleaseWrites) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if strings.HasSuffix(key, "release.json") {
+		return storage.Info{}, errors.New("state store unavailable")
+	}
+	return f.Driver.PutIfAbsent(ctx, key, r)
+}
+
+// TestBuildFailureIsNotNotFound: a name whose only release failed to build
+// is unavailable, not missing, so a later claiming source isn't asked.
+func TestBuildFailureIsNotNotFound(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"pyproject.toml": pyproject("acme-core", "1.0.0"), "a.py": ""})
+	r.tag("v1")
+	env := newGitEnv(t)
+	env.state = failReleaseWrites{env.state}
+	g := env.source(t, nil, r.dir)
+	g.Index(context.Background())
+	if _, err := g.Project(context.Background(), "acme-core"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("Project after a failed build: %v", err)
+	}
+}

@@ -77,7 +77,7 @@ type candidate struct {
 type gitIndex struct {
 	releases  map[string][]release // by name
 	withheld  map[string]bool      // names not served at all
-	pending   map[string]bool      // names with a version withheld for divergent histories
+	pending   map[string]bool      // names with a version withheld for divergent histories or not built
 	conflicts []Conflict
 	skipped   []Skipped
 }
@@ -361,7 +361,10 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 			byVersion[canon] = append(byVersion[canon], c)
 		}
 		for _, canon := range sortedKeys(byVersion) {
-			c, skip := g.resolveVersion(ctx, name, canon, byVersion[canon], stored)
+			c, skip, failed := g.resolveVersion(ctx, name, canon, byVersion[canon], stored)
+			if failed {
+				pending[name] = true
+			}
 			if c != nil {
 				conflicts = append(conflicts, *c)
 				if c.Kind == ConflictDivergent {
@@ -378,13 +381,14 @@ func (g *GitSource) resolve(ctx context.Context, cands []candidate, stored map[s
 
 // resolveVersion handles one release: the stored one wins; otherwise the
 // candidate whose commit precedes all others is built; divergent contents are
-// withheld.
-func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs []candidate, stored map[string][]release) (*Conflict, *Skipped) {
+// withheld. failed reports a build that failed for a reason other than
+// refused content; the next pass tries again.
+func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs []candidate, stored map[string][]release) (c *Conflict, skip *Skipped, failed bool) {
 	slices.SortFunc(cs, func(a, b candidate) int { return strings.Compare(a.tag, b.tag) })
 	if i := slices.IndexFunc(stored[name], func(r release) bool { return r.Canonical == canon }); i >= 0 {
 		served := stored[name][i]
 		g.repair(ctx, served, cs)
-		return differing(name, cs, served.Identity, ConflictNoBump), nil
+		return differing(name, cs, served.Identity, ConflictNoBump), nil, false
 	}
 	winner := g.earliest(ctx, cs)
 	if winner == nil {
@@ -392,16 +396,16 @@ func (g *GitSource) resolveVersion(ctx context.Context, name, canon string, cs [
 		for _, c := range cs {
 			tags = append(tags, c.tag)
 		}
-		return &Conflict{Package: name, Version: cs[0].pkg.Version.String(), Kind: ConflictDivergent, Tags: tags}, nil
+		return &Conflict{Package: name, Version: cs[0].pkg.Version.String(), Kind: ConflictDivergent, Tags: tags}, nil, false
 	}
 	if err := g.build(ctx, *winner); err != nil {
 		if re, ok := errors.AsType[*RefusedError](err); ok {
-			return nil, &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: re.Reason}
+			return nil, &Skipped{Remote: metrics.RedactRemote(winner.remote.Remote()), Tag: winner.tag, Dir: winner.pkg.Dir, Package: name, Reason: re.Reason}, false
 		}
 		g.log.Error("pypi git: building a release failed", "source", g.name, "package", name, "version", winner.pkg.Version.String(), "tag", winner.tag, "error", err)
-		return nil, nil
+		return nil, nil, true
 	}
-	return differing(name, cs, winner.identity, ConflictNoBump), nil
+	return differing(name, cs, winner.identity, ConflictNoBump), nil, false
 }
 
 // repair rebuilds the sdist of a claimed release whose file was never
@@ -600,7 +604,7 @@ func (g *GitSource) Project(_ context.Context, name string) (Project, error) {
 			return Project{}, fmt.Errorf("%w: %s (not indexed yet)", ErrUnavailable, name)
 		}
 		if idx.pending[name] {
-			return Project{}, fmt.Errorf("%w: %s has a release withheld for divergent histories", ErrUnavailable, name)
+			return Project{}, fmt.Errorf("%w: %s has a release withheld for divergent histories or not built yet", ErrUnavailable, name)
 		}
 		return Project{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, name)
 	}
