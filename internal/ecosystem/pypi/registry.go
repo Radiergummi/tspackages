@@ -352,6 +352,9 @@ func (s *RegistrySource) File(ctx context.Context, name, filename string) (Artif
 	} else if _, v, err := ParseSdistFilename(strings.Replace(filename, ".zip", ".tar.gz", 1)); err == nil {
 		version = v
 	}
+	if v, err := ParseVersion(version); err == nil {
+		version = v.String() // as the storage and git sources record it
+	}
 	onCommit := func(ctx context.Context, res relay.Result) error {
 		if err := s.rec.PutProvenance(ctx, records.Provenance{
 			Ecosystem: ecoName, Package: name, Version: version, Source: s.name, SourceType: "registry",
