@@ -50,5 +50,30 @@ pre,code{background:#f1f3f5;border-radius:4px;padding:.1rem .3rem}pre{padding:.6
 <p>Upload a package:</p>
 <pre>curl -fT pkg.zip https://{{.Host}}/composer/upload/&lt;vendor&gt;/&lt;name&gt;/&lt;version&gt;</pre>
 {{end}}
+{{if .PyPI}}
+<h2>PyPI</h2>
+<p>pip (<code>pip.conf</code>):</p>
+<pre>[global]
+index-url = https://{{.Host}}/pypi/simple/</pre>
+<p>uv (<code>pyproject.toml</code> or <code>uv.toml</code>):</p>
+<pre>[[tool.uv.index]]
+name = "tspackages"
+url = "https://{{.Host}}/pypi/simple/"
+default = true</pre>
+<p>Don't add PyPI as an extra index: tspackages already passes public packages through.</p>
+<p>Upload:</p>
+<pre>uv publish --publish-url https://{{.Host}}/pypi/legacy/ --username x --password x dist/*
+twine upload --repository-url https://{{.Host}}/pypi/legacy/ -u x -p x dist/*</pre>
+<h3>Git releases not served as tagged</h3>
+{{if .PyPIConf}}<table>
+<tr><th>Package</th><th>Version</th><th>Problem</th><th>Tags</th><th>Remotes</th></tr>
+{{range .PyPIConf}}<tr><td>{{.Package}}</td><td>{{.Version}}</td><td>{{.Kind}}</td><td>{{range .Tags}}{{.}}<br>{{end}}</td><td>{{range .Remotes}}{{.}}<br>{{end}}</td></tr>
+{{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
+<h3>Packages skipped</h3>
+{{if .PyPISkip}}<table>
+<tr><th>Package</th><th>Remote</th><th>Tag</th><th>Directory</th><th>Reason</th></tr>
+{{range .PyPISkip}}<tr><td>{{.Package}}</td><td>{{.Remote}}</td><td>{{.Tag}}</td><td>{{.Dir}}</td><td>{{.Reason}}</td></tr>
+{{end}}</table>{{else}}<p class="muted">None.</p>{{end}}
+{{end}}
 </body>
 </html>

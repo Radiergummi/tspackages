@@ -16,6 +16,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
 	"github.com/radiergummi/tspackages/internal/ecosystem/composer"
+	"github.com/radiergummi/tspackages/internal/ecosystem/pypi"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/limits"
@@ -54,7 +55,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	}); err != nil {
 		return nil, nil, err
 	}
-	gitDir, keyDir, err := prepareWorkDir(cfg.Storage.WorkDir)
+	gitDir, keyDir, uploadDir, err := prepareWorkDir(cfg.Storage.WorkDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -100,50 +101,18 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			src := composer.NewStorageSource(s.Name, s.Claims, stores.hosted[s.Store], rec, archiveLimits, log)
 			sources, status = append(sources, src), append(status, src)
 		case "registry":
-			creds := maps.Clone(s.DownloadCredentials)
-			if s.Credentials != nil {
-				u, err := url.Parse(s.URL)
-				if err != nil {
-					return fail(fmt.Errorf("composer source %q: url: %w", s.Name, err))
-				}
-				if creds == nil {
-					creds = map[string]config.Credential{}
-				}
-				creds[u.Host] = *s.Credentials
+			client, err := upstreamClient(s, h)
+			if err != nil {
+				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
 			}
-			client := upstream.New(upstream.Options{
-				FetchHosts:             s.FetchHosts,
-				Credentials:            creds,
-				AllowPrivateForTesting: h.AllowPrivateUpstreams,
-			})
 			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rl, rec,
 				s.MetadataTTL, int64(l.MaxArtifactBytes), 0, limits.UpstreamWait, log)
 			sources, status = append(sources, src), append(status, src)
 			regSources = append(regSources, src)
 		case "git":
-			opts := gitmirror.Options{
-				BaseDir:                    gitDir,
-				Token:                      s.Token,
-				Logger:                     log,
-				AllowFileRemotesForTesting: h.AllowFileRemotes,
-			}
-			// One key per source, under a fixed name, so the mirror directory
-			// (derived from the key path) is stable across restarts.
-			prefix := filepath.Join(keyDir, s.Name)
-			if opts.SSHKeyPath, err = writeSecret(prefix+".key", s.SSHKey); err != nil {
+			ms, err := sourceMirrors(s, filepath.Join(keyDir, s.Name), gitDir, mirrors, h, log)
+			if err != nil {
 				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
-			}
-			if opts.KnownHostsPath, err = writeSecret(prefix+".known_hosts", s.KnownHosts); err != nil {
-				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
-			}
-			var ms []*gitmirror.Mirror
-			for _, remote := range s.Remotes {
-				opts.Remote = remote
-				m, err := mirrors.get(opts)
-				if err != nil {
-					return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
-				}
-				ms = append(ms, m)
 			}
 			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stores.state,
 				s.PollInterval, log, min(int64(l.MaxArtifactBytes), composer.MaxGitArchiveBytes))
@@ -152,6 +121,39 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			}
 			sources, status = append(sources, src), append(status, src)
 			gitSources = append(gitSources, src)
+		}
+	}
+
+	var (
+		pySources []pypi.Source
+		pyGit     []*pypi.GitSource
+	)
+	pyEco, hasPyPI := cfg.Ecosystems["pypi"]
+	for _, s := range pyEco.Sources {
+		switch s.Type {
+		case "storage":
+			src := pypi.NewStorageSource(s.Name, s.Claims, stores.hosted[s.Store], rec, archiveLimits, log)
+			pySources, status = append(pySources, src), append(status, src)
+		case "registry":
+			client, err := upstreamClient(s, h)
+			if err != nil {
+				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
+			}
+			src := pypi.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rl, rec,
+				s.MetadataTTL, int64(l.MaxArtifactBytes), limits.UpstreamWait, log)
+			pySources, status = append(pySources, src), append(status, src)
+		case "git":
+			// Key files are per ecosystem: a composer source may share the name.
+			ms, err := sourceMirrors(s, filepath.Join(keyDir, "pypi-"+s.Name), gitDir, mirrors, h, log)
+			if err != nil {
+				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
+			}
+			src, err := pypi.NewGitSource(s.Name, s.Claims, ms, s.Tags, stores.state, rec, s.PollInterval, log)
+			if err != nil {
+				return fail(err)
+			}
+			pySources, status = append(pySources, src), append(status, src)
+			pyGit = append(pyGit, src)
 		}
 	}
 
@@ -166,6 +168,25 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		c := composer.New(sources, archiveLimits, log)
 		c.Mount(mux)
 		ecos = append(ecos, c)
+	}
+	if hasPyPI {
+		p := pypi.New(pySources, int64(l.MaxUploadBytes), uploadDir, log)
+		p.Mount(mux)
+		ecos = append(ecos, p)
+	}
+	pypiConflicts := func() []pypi.Conflict {
+		var out []pypi.Conflict
+		for _, g := range pyGit {
+			out = append(out, g.Conflicts()...)
+		}
+		return out
+	}
+	pypiSkipped := func() []pypi.Skipped {
+		var out []pypi.Skipped
+		for _, g := range pyGit {
+			out = append(out, g.Skipped()...)
+		}
+		return out
 	}
 	conflicts := func() []composer.Conflict {
 		var out []composer.Conflict
@@ -192,13 +213,17 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 	metrics.SetRejected(limiter.Rejected)
 	web.New(web.Options{
 		Hostname: cfg.Tailscale.Hostname, Ecosystems: ecos, Sources: status,
-		Moved: pinStore.Moved, MovedPkg: movedPkg, Conflicts: conflicts, Changed: changed, Ready: stores.ready,
+		Moved: pinStore.Moved, MovedPkg: movedPkg, Conflicts: conflicts, Changed: changed,
+		PyPIConflicts: pypiConflicts, PyPISkipped: pypiSkipped, Ready: stores.ready,
 	}).Mount(mux)
 
 	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {
 		var wg sync.WaitGroup
 		for _, g := range gitSources {
+			wg.Go(func() { g.Run(ctx) })
+		}
+		for _, g := range pyGit {
 			wg.Go(func() { g.Run(ctx) })
 		}
 		<-ctx.Done()
@@ -302,25 +327,79 @@ func pruneMirrorDirs(gitDir string, mirrors mirrorSet) error {
 	return nil
 }
 
-// prepareWorkDir makes work_dir and its git/ and keys/ subdirectories
-// private, and empties keys/ so only the current key material remains.
-func prepareWorkDir(dir string) (gitDir, keyDir string, err error) {
-	gitDir, keyDir = filepath.Join(dir, "git"), filepath.Join(dir, "keys")
-	for _, d := range []string{dir, gitDir, keyDir} {
+// prepareWorkDir makes work_dir and its git/, keys/ and uploads/
+// subdirectories private, and empties keys/ (so only the current key material
+// remains) and uploads/ (spooled uploads an earlier run left behind).
+func prepareWorkDir(dir string) (gitDir, keyDir, uploadDir string, err error) {
+	gitDir, keyDir, uploadDir = filepath.Join(dir, "git"), filepath.Join(dir, "keys"), filepath.Join(dir, "uploads")
+	for _, d := range []string{dir, gitDir, keyDir, uploadDir} {
 		if err := workdir.EnsurePrivateDir(d); err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 	}
-	entries, err := os.ReadDir(keyDir)
-	if err != nil {
-		return "", "", err
-	}
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(keyDir, e.Name())); err != nil {
-			return "", "", fmt.Errorf("clear %s: %w", keyDir, err)
+	for _, d := range []string{keyDir, uploadDir} {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			return "", "", "", err
+		}
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(d, e.Name())); err != nil {
+				return "", "", "", fmt.Errorf("clear %s: %w", d, err)
+			}
 		}
 	}
-	return gitDir, keyDir, nil
+	return gitDir, keyDir, uploadDir, nil
+}
+
+// upstreamClient builds the HTTP client of a registry source: its fetch
+// hosts, download credentials, and its credentials for the URL's host.
+func upstreamClient(s config.Source, h Hooks) (*upstream.Client, error) {
+	creds := maps.Clone(s.DownloadCredentials)
+	if s.Credentials != nil {
+		u, err := url.Parse(s.URL)
+		if err != nil {
+			return nil, fmt.Errorf("url: %w", err)
+		}
+		if creds == nil {
+			creds = map[string]config.Credential{}
+		}
+		creds[u.Host] = *s.Credentials
+	}
+	return upstream.New(upstream.Options{
+		FetchHosts:             s.FetchHosts,
+		Credentials:            creds,
+		AllowPrivateForTesting: h.AllowPrivateUpstreams,
+	}), nil
+}
+
+// sourceMirrors writes a git source's SSH material to keyPrefix.key and
+// keyPrefix.known_hosts and returns a mirror per remote. One key per source,
+// under a fixed name, keeps the mirror directory (derived from the key path)
+// stable across restarts.
+func sourceMirrors(s config.Source, keyPrefix, gitDir string, mirrors mirrorSet, h Hooks, log *slog.Logger) ([]*gitmirror.Mirror, error) {
+	opts := gitmirror.Options{
+		BaseDir:                    gitDir,
+		Token:                      s.Token,
+		Logger:                     log,
+		AllowFileRemotesForTesting: h.AllowFileRemotes,
+	}
+	var err error
+	if opts.SSHKeyPath, err = writeSecret(keyPrefix+".key", s.SSHKey); err != nil {
+		return nil, err
+	}
+	if opts.KnownHostsPath, err = writeSecret(keyPrefix+".known_hosts", s.KnownHosts); err != nil {
+		return nil, err
+	}
+	var ms []*gitmirror.Mirror
+	for _, remote := range s.Remotes {
+		opts.Remote = remote
+		m, err := mirrors.get(opts)
+		if err != nil {
+			return nil, err
+		}
+		ms = append(ms, m)
+	}
+	return ms, nil
 }
 
 // writeSecret writes content plus a newline (ssh rejects a key without one)

@@ -15,6 +15,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/authz"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
 	"github.com/radiergummi/tspackages/internal/ecosystem/composer"
+	"github.com/radiergummi/tspackages/internal/ecosystem/pypi"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
@@ -38,6 +39,8 @@ type Web struct {
 	moved     func() []pins.MovedTag
 	conflicts func() []composer.Conflict
 	changed   func() []composer.ChangedDist
+	pypiConf  func() []pypi.Conflict
+	pypiSkip  func() []pypi.Skipped
 	ready     func(ctx context.Context) error
 
 	movedPkg     func(pins.MovedTag) string // package a moved tag's remote declares
@@ -57,13 +60,18 @@ type Options struct {
 	MovedPkg  func(pins.MovedTag) string
 	Conflicts func() []composer.Conflict
 	Changed   func() []composer.ChangedDist // dists whose upstream bytes changed
-	Ready     func(ctx context.Context) error
+	// PyPIConflicts and PyPISkipped report the pypi git sources' releases
+	// that are not served as tagged, and packages that cannot be served.
+	PyPIConflicts func() []pypi.Conflict
+	PyPISkipped   func() []pypi.Skipped
+	Ready         func(ctx context.Context) error
 }
 
 // New returns the status endpoints.
 func New(o Options) *Web {
 	w := &Web{hostname: o.Hostname, eco: o.Ecosystems, sources: o.Sources, moved: o.Moved, movedPkg: o.MovedPkg,
-		conflicts: o.Conflicts, changed: o.Changed, ready: o.Ready, readyTimeout: 5 * time.Second}
+		conflicts: o.Conflicts, changed: o.Changed, pypiConf: o.PyPIConflicts, pypiSkip: o.PyPISkipped,
+		ready: o.Ready, readyTimeout: 5 * time.Second}
 	if w.moved == nil || w.movedPkg == nil {
 		w.moved = func() []pins.MovedTag { return nil }
 	}
@@ -141,6 +149,9 @@ type pageData struct {
 	Conflicts  []conflictView
 	Changed    []composer.ChangedDist
 	Composer   bool
+	PyPI       bool
+	PyPIConf   []pypi.Conflict
+	PyPISkip   []pypi.Skipped
 }
 
 func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
@@ -156,8 +167,11 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 	d := pageData{Host: host}
 	for _, e := range w.eco {
 		d.Ecosystems = append(d.Ecosystems, e.Name())
-		if e.Name() == "composer" {
+		switch e.Name() {
+		case "composer":
 			d.Composer = true
+		case "pypi":
+			d.PyPI = true
 		}
 	}
 	slices.Sort(d.Ecosystems)
@@ -188,6 +202,24 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 			v.Remotes = append(v.Remotes, metrics.RedactRemote(r))
 		}
 		d.Conflicts = append(d.Conflicts, v)
+	}
+	pypiAllowed := func(pkg string) bool {
+		return pkg != "" && authz.Allowed(caller.Rules, "pypi", pkg, authz.Read, pypi.Match)
+	}
+	if w.pypiConf != nil {
+		for _, c := range w.pypiConf() {
+			if pypiAllowed(c.Package) {
+				d.PyPIConf = append(d.PyPIConf, c)
+			}
+		}
+	}
+	if w.pypiSkip != nil {
+		for _, s := range w.pypiSkip() {
+			if pypiAllowed(s.Package) {
+				s.Remote = metrics.RedactRemote(s.Remote)
+				d.PyPISkip = append(d.PyPISkip, s)
+			}
+		}
 	}
 	for _, c := range w.changed() {
 		if allowed(c.Package) {

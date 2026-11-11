@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -314,5 +315,74 @@ func TestStartReturnsAfterLoopsStop(t *testing.T) {
 	case <-done:
 	case <-time.After(15 * time.Second):
 		t.Fatal("start did not return after ctx ended")
+	}
+}
+
+func pypiUpload(t *testing.T, name, version, filename string, content []byte) (io.Reader, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for k, v := range map[string]string{":action": "file_upload", "name": name, "version": version} {
+		mw.WriteField(k, v)
+	}
+	fw, _ := mw.CreateFormFile("content", filename)
+	fw.Write(content)
+	mw.Close()
+	return &buf, mw.FormDataContentType()
+}
+
+func TestBuildWiresPyPI(t *testing.T) {
+	cfg := fsConfig(t)
+	cfg.Ecosystems["pypi"] = config.Ecosystem{Sources: []config.Source{
+		{Name: "hosted", Type: "storage", Claims: []string{"acme-*"}, Store: "main"},
+		{Name: "pypi", Type: "registry", URL: "https://pypi.org/simple/", FetchHosts: []string{"pypi.org", "files.pythonhosted.org"}},
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["pypi:acme-*"]}`), quiet, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	meta := "Metadata-Version: 2.1\nName: acme-core\nVersion: 1.0.0\n"
+	whl := testutil.ZipOf(t, map[string]string{"acme_core/__init__.py": "", "acme_core-1.0.0.dist-info/METADATA": meta})
+	body, ct := pypiUpload(t, "acme-core", "1.0.0", "acme_core-1.0.0-py3-none-any.whl", whl)
+	r := httptest.NewRequest("POST", "/pypi/legacy/", body)
+	r.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload = %d %s", w.Code, w.Body)
+	}
+	w = do(h, "GET", "/pypi/simple/acme-core/", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "acme_core-1.0.0-py3-none-any.whl") {
+		t.Fatalf("index = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/pypi/simple/") {
+		t.Fatalf("status page lacks the PyPI snippet: %d", w.Code)
+	}
+	entries, err := os.ReadDir(filepath.Join(cfg.Storage.WorkDir, "uploads"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("upload spool: %v %v", entries, err)
+	}
+	if st, err := os.Stat(filepath.Join(cfg.Storage.WorkDir, "uploads")); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("upload spool mode: %v %v", st, err)
+	}
+}
+
+// A composer and a pypi git source may share a name; their key files must not.
+func TestBuildPyPIKeyFilesDoNotCollide(t *testing.T) {
+	cfg := gitConfig(t, sshSource)
+	pypiSSH := sshSource
+	pypiSSH.SSHKey = "PYPI KEY"
+	pypiSSH.Claims = []string{"acme-*"}
+	cfg.Ecosystems["pypi"] = config.Ecosystem{Sources: []config.Source{pypiSSH}}
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	composerKey, err1 := os.ReadFile(filepath.Join(cfg.Storage.WorkDir, "keys", "internal.key"))
+	pypiKey, err2 := os.ReadFile(filepath.Join(cfg.Storage.WorkDir, "keys", "pypi-internal.key"))
+	if err1 != nil || err2 != nil || !strings.HasPrefix(string(composerKey), "PRIVATE KEY MATERIAL") || !strings.HasPrefix(string(pypiKey), "PYPI KEY") {
+		t.Fatalf("keys: %q %v / %q %v", composerKey, err1, pypiKey, err2)
 	}
 }

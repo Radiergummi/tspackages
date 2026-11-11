@@ -12,6 +12,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/authz"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
 	"github.com/radiergummi/tspackages/internal/ecosystem/composer"
+	"github.com/radiergummi/tspackages/internal/ecosystem/pypi"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
@@ -262,5 +263,39 @@ func TestStatusShowsChangedDistsByReadRules(t *testing.T) {
 	}
 	if strings.Contains(body, "b/x") || strings.Contains(body, "ref-b") {
 		t.Error("dist the caller may not read is shown")
+	}
+}
+
+type pypiEco struct{}
+
+func (pypiEco) Name() string             { return "pypi" }
+func (pypiEco) Mount(mux *http.ServeMux) {}
+
+func TestStatusShowsPyPIByReadRules(t *testing.T) {
+	w := New(Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{pypiEco{}},
+		PyPIConflicts: func() []pypi.Conflict {
+			return []pypi.Conflict{
+				{Package: "acme-core", Version: "1.0.0", Kind: pypi.ConflictNoBump, Tags: []string{"api@<2>"}},
+				{Package: "other-x", Version: "1.0", Kind: pypi.ConflictDivergent, Tags: []string{"secret-tag"}},
+			}
+		},
+		PyPISkipped: func() []pypi.Skipped {
+			return []pypi.Skipped{
+				{Remote: "https://h/mono.git", Tag: "v1", Dir: "packages/dyn", Package: "acme-dyn", Reason: "version is dynamic"},
+				{Remote: "https://h/x.git", Tag: "v1", Dir: "", Package: "", Reason: "name missing or invalid"},
+			}
+		},
+	})
+	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"pypi:acme-*"}}}}
+	body := serve(t, w, "/", c).Body.String()
+	for _, want := range []string{"PyPI", "index-url = https://pkgs.tail.ts.net/pypi/simple/", "acme-core", "changed without a version bump", "api@&lt;2&gt;", "acme-dyn", "version is dynamic"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q", want)
+		}
+	}
+	for _, hidden := range []string{"other-x", "secret-tag", "name missing or invalid"} {
+		if strings.Contains(body, hidden) {
+			t.Errorf("body shows %q to a caller who may not read it", hidden)
+		}
 	}
 }
