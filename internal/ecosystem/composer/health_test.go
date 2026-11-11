@@ -308,7 +308,8 @@ func TestRegistryObservesDistCacheHit(t *testing.T) {
 		io.ReadAll(a.Body)
 		a.Body.Close()
 	}
-	read() // metadata miss, dist miss
+	read()      // metadata miss, dist miss
+	e.rl.Wait() // the cache write may outlast the read
 	h0 := counter(t, "tspackages_cache_hits_total", hit)
 	read() // metadata hit, dist hit
 	if d := counter(t, "tspackages_cache_hits_total", hit) - h0; d != 2 {

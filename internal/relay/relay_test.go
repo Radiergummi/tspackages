@@ -135,6 +135,7 @@ func TestJoinersShareOneFetch(t *testing.T) {
 	if n := src.calls.Load(); n != 1 {
 		t.Fatalf("fetch called %d times", n)
 	}
+	r.Wait() // the cache write may outlast the reads
 	rc, size, hit, err := r.Open(context.Background(), "k", digestOf(data), src.fetch, nil)
 	if err != nil {
 		t.Fatal(err)
