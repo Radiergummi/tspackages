@@ -1,10 +1,12 @@
 package gitmirror
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -536,5 +538,110 @@ func TestSCPUserMustNotStartWithDash(t *testing.T) {
 	}
 	if !scpRe.MatchString("git@github.com:a/b.git") || !scpRe.MatchString("_x.y-z@github.com:a/b.git") {
 		t.Error("valid user rejected")
+	}
+}
+
+func TestListTree(t *testing.T) {
+	src := makeRepo(t)
+	write(t, src, "packages/a/pyproject.toml", "[project]\n")
+	testutil.Git(t, src, "add", ".")
+	head := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "update-index", "--add", "--cacheinfo", "160000,"+head+",packages/a/vendored")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+
+	all, err := m.ListTree(context.Background(), commit, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(all, func(e TreeEntry) bool {
+		return e.Path == "src/a.php" && e.Type == "blob" && e.Mode == "100644" && len(e.Object) == 40
+	}) {
+		t.Fatalf("whole tree: %+v", all)
+	}
+	sub, err := m.ListTree(context.Background(), commit, "packages/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sub) != 2 || !slices.ContainsFunc(sub, func(e TreeEntry) bool { return e.Path == "packages/a/vendored" && e.Type == "commit" }) {
+		t.Fatalf("subdir: %+v", sub)
+	}
+}
+
+func TestArchiveTar(t *testing.T) {
+	src := makeRepo(t)
+	write(t, src, "packages/a/x.py", "x")
+	write(t, src, "packages/a/secret.txt", "s")
+	write(t, src, ".gitattributes", "tests/ export-ignore\npackages/a/secret.txt export-ignore\n")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	var buf bytes.Buffer
+	if err := m.ArchiveTar(context.Background(), commit, []string{"packages/a", "composer.json"}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	tr := tar.NewReader(&buf)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if h.Typeflag == tar.TypeReg {
+			names = append(names, h.Name)
+		}
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"composer.json", "packages/a/x.py"}) {
+		t.Fatalf("entries: %v (secret.txt must be export-ignored, src/ not requested)", names)
+	}
+}
+
+func TestIsAncestorAndCommitTime(t *testing.T) {
+	src := makeRepo(t)
+	base := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "checkout", "-q", "-b", "left")
+	write(t, src, "l", "l")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "left")
+	left := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "checkout", "-q", "-b", "right", base)
+	write(t, src, "r", "r")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "right")
+	right := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{{base, left, true}, {left, base, false}, {left, right, false}, {right, left, false}, {base, base, true}} {
+		got, err := m.IsAncestor(ctx, c.a, c.b)
+		if err != nil || got != c.want {
+			t.Errorf("IsAncestor(%.7s, %.7s) = %v, %v; want %v", c.a, c.b, got, err, c.want)
+		}
+	}
+	ts, err := m.CommitTime(ctx, left)
+	if err != nil || time.Since(ts) > time.Hour || ts.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("CommitTime = %v, %v", ts, err)
+	}
+}
+
+func TestTreePathValidation(t *testing.T) {
+	src := makeRepo(t)
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	for _, p := range []string{"-x", "../x", "a/../b", "/abs", "a//b"} {
+		if _, err := m.ListTree(context.Background(), commit, p); err == nil {
+			t.Errorf("ListTree(%q) accepted", p)
+		}
+		if err := m.ArchiveTar(context.Background(), commit, []string{p}, io.Discard); err == nil {
+			t.Errorf("ArchiveTar(%q) accepted", p)
+		}
+	}
+	if _, err := m.IsAncestor(context.Background(), "main", commit); err == nil {
+		t.Error("non-sha commit accepted")
 	}
 }

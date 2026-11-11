@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -548,4 +549,104 @@ func (m *Mirror) redact(s string) string {
 		return s
 	}
 	return strings.NewReplacer(m.basic(), "***", m.opts.Token, "***").Replace(s)
+}
+
+// TreeEntry is one entry of a recursive tree listing. Type is "blob" for
+// files and symlinks and "commit" for submodules (gitlinks).
+type TreeEntry struct {
+	Mode, Type, Object, Path string
+}
+
+// checkPath accepts a clean, relative, repository path that git cannot read
+// as an option.
+func checkPath(p string) error {
+	if p == "" || strings.HasPrefix(p, "-") || strings.HasPrefix(p, "/") || strings.ContainsAny(p, "\x00\n") || path.Clean(p) != p {
+		return fmt.Errorf("gitmirror: invalid path %q", p)
+	}
+	for seg := range strings.SplitSeq(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("gitmirror: invalid path %q", p)
+		}
+	}
+	return nil
+}
+
+// ListTree lists every file, symlink and submodule under dir ("" = the whole
+// tree) at commit, with paths from the repository root.
+func (m *Mirror) ListTree(ctx context.Context, commit, dir string) ([]TreeEntry, error) {
+	if err := checkCommit(commit); err != nil {
+		return nil, err
+	}
+	args := []string{"ls-tree", "-r", "-z", "--full-tree", commit}
+	if dir != "" {
+		if err := checkPath(dir); err != nil {
+			return nil, err
+		}
+		args = append(args, "--", dir)
+	}
+	out, err := m.git(ctx, m.dir, nil, nil, args...)
+	if err != nil {
+		return nil, err
+	}
+	var entries []TreeEntry
+	for rec := range strings.SplitSeq(strings.TrimSuffix(string(out), "\x00"), "\x00") {
+		if rec == "" {
+			continue
+		}
+		meta, p, ok := strings.Cut(rec, "\t")
+		f := strings.Fields(meta)
+		if !ok || len(f) != 3 {
+			return nil, fmt.Errorf("gitmirror: unexpected ls-tree output %q", rec)
+		}
+		entries = append(entries, TreeEntry{Mode: f[0], Type: f[1], Object: f[2], Path: p})
+	}
+	return entries, nil
+}
+
+// ArchiveTar writes the tar archive of the given paths at commit, honouring
+// export-ignore from the commit's attributes.
+func (m *Mirror) ArchiveTar(ctx context.Context, commit string, paths []string, w io.Writer) error {
+	if err := checkCommit(commit); err != nil {
+		return err
+	}
+	args := []string{"archive", "--format=tar", commit, "--"}
+	for _, p := range paths {
+		if err := checkPath(p); err != nil {
+			return err
+		}
+		args = append(args, p)
+	}
+	_, err := m.git(ctx, m.dir, nil, w, args...)
+	return err
+}
+
+// IsAncestor reports whether commit a is an ancestor of (or equal to) b.
+func (m *Mirror) IsAncestor(ctx context.Context, a, b string) (bool, error) {
+	if err := checkCommit(a); err != nil {
+		return false, err
+	}
+	if err := checkCommit(b); err != nil {
+		return false, err
+	}
+	_, err := m.git(ctx, m.dir, nil, nil, "merge-base", "--is-ancestor", a, b)
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// CommitTime returns the committer time of commit.
+func (m *Mirror) CommitTime(ctx context.Context, commit string) (time.Time, error) {
+	if err := checkCommit(commit); err != nil {
+		return time.Time{}, err
+	}
+	out, err := m.git(ctx, m.dir, nil, nil, "show", "-s", "--format=%ct", commit+"^{commit}")
+	if err != nil {
+		return time.Time{}, err
+	}
+	sec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("gitmirror: unexpected commit time %q", out)
+	}
+	return time.Unix(sec, 0).UTC(), nil
 }
