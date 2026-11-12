@@ -435,7 +435,9 @@ func TestDistCacheHitRechecksDeclaredShasum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	io.ReadAll(a.Body)
 	a.Body.Close()
+	e.rl.Wait() // old is cached before upstream redeclares it
 	e.f.set("/p2/acme/pkg.json", distMeta(e.f.srv.URL, sum1(fresh), "r1"))
 	e.f.set("/dist/pkg.zip", fresh)
 	e.clock = e.clock.Add(time.Hour)

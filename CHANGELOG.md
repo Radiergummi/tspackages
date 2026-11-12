@@ -98,6 +98,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A dist request whose metadata declares a different digest than a download
+  of the same artifact still in progress no longer joins that download. It
+  waits for it to end, then fetches the artifact again if the bytes don't
+  match its own digest. Before, it could be served bytes checked only against
+  the other request's digest. When upstream declares a new checksum for a
+  Composer dist whose old bytes are still being cached, the eviction now
+  waits for that write, so the next request no longer gets a broken transfer.
 - `tailscale.state_dir` inside an `fs` store, or an `fs` store inside it, now
   fails validation, as docs/security.md said it would. Before, the cache could
   evict the node's keys.

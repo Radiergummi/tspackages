@@ -64,7 +64,42 @@ type Relay struct {
 
 	runs sync.WaitGroup // fetches still running, cache writes included
 
-	afterMiss func() // test hook: runs after Open's first cache miss
+	afterMiss    func() // test hook: runs after Open's first cache miss
+	beforeWait   func() // test hook: runs before Open or Evict waits for a download to end
+	beforeCommit func() // test hook: runs once a download is verified, before its cache write
+}
+
+// sameDigest reports whether a and b expect the same bytes: every field
+// equal, ignoring case. A field set on one side only makes them differ.
+func sameDigest(a, b Digest) bool {
+	return strings.EqualFold(a.SHA1, b.SHA1) && strings.EqualFold(a.SHA256, b.SHA256)
+}
+
+// Evict removes key from the cache. A download of key in flight is waited
+// out first, so its cache write can't land after the eviction.
+func (r *Relay) Evict(ctx context.Context, key string) error {
+	r.mu.Lock()
+	dl := r.inflight[key]
+	r.mu.Unlock()
+	if dl != nil {
+		if err := r.awaitEnd(ctx, dl); err != nil {
+			return err
+		}
+	}
+	return r.cache.Delete(ctx, key)
+}
+
+// awaitEnd waits until dl's run has ended, its cache write included.
+func (r *Relay) awaitEnd(ctx context.Context, dl *download) error {
+	if r.beforeWait != nil {
+		r.beforeWait()
+	}
+	select {
+	case <-dl.ended:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // New returns a Relay keeping downloads in progress in tmpDir, which it
@@ -100,6 +135,10 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 // hit is re-checked against want while it streams, its last byte likewise
 // withheld until the check passed: a mismatch fails the read and drops the
 // entry. The returned size is -1 when unknown; hit reports a cache hit.
+//
+// Only a download expecting the same digest (sameDigest) is joined. One
+// expecting another is waited out instead; if what it cached doesn't match
+// want, the entry is dropped and the artifact fetched again.
 func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (body io.ReadCloser, size int64, hit bool, err error) {
 	var dl *download
 	joined := false
@@ -122,6 +161,21 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 
 		r.mu.Lock()
 		dl, joined = r.inflight[key]
+		if joined && !sameDigest(dl.want, want) {
+			r.mu.Unlock()
+			if err := r.awaitEnd(ctx, dl); err != nil {
+				return nil, 0, false, err
+			}
+			dl.mu.Lock()
+			stale := dl.err == nil && check(want, dl.res) != nil
+			dl.mu.Unlock()
+			if stale {
+				if err := r.cache.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+					return nil, 0, false, err
+				}
+			}
+			continue
+		}
 		if !joined && r.finished != gen && !retried {
 			r.mu.Unlock()
 			continue
@@ -132,7 +186,7 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 		} else {
 			// The fetch outlives this request (others may join) but not its
 			// last reader: leave cancels it.
-			runCtx, dl = r.newDownload(ctx, key)
+			runCtx, dl = r.newDownload(ctx, key, want)
 		}
 		r.mu.Unlock()
 		if !joined {
@@ -165,9 +219,9 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 func (r *Relay) Wait() { r.runs.Wait() }
 
 // newDownload registers a download for key with one reader. r.mu is held.
-func (r *Relay) newDownload(ctx context.Context, key string) (context.Context, *download) {
+func (r *Relay) newDownload(ctx context.Context, key string, want Digest) (context.Context, *download) {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	dl := &download{key: key, readers: 1, ready: make(chan struct{}), cancel: cancel}
+	dl := &download{key: key, want: want, readers: 1, ready: make(chan struct{}), ended: make(chan struct{}), cancel: cancel}
 	dl.cond = sync.NewCond(&dl.mu)
 	r.inflight[key] = dl
 	return runCtx, dl
@@ -175,7 +229,9 @@ func (r *Relay) newDownload(ctx context.Context, key string) (context.Context, *
 
 type download struct {
 	key   string
+	want  Digest        // what the run checks the bytes against
 	ready chan struct{} // closed once the upstream answered (openErr or file set)
+	ended chan struct{} // closed once the run ended, its cache write included
 
 	openErr error
 	file    *os.File // temp file; read with ReadAt, closed once run ended and no reader is left
@@ -188,7 +244,8 @@ type download struct {
 	committing bool // digest matched; the last reader leaving no longer cancels
 	verified   bool // digest matched and onCommit succeeded: readers may finish
 	done       bool
-	err        error // final outcome once done; nil = verified and committed
+	err        error  // final outcome once done; nil = verified and committed
+	res        Result // what the run observed, once done without err
 
 	// Guarded by Relay.mu.
 	readers    int
@@ -197,6 +254,7 @@ type download struct {
 }
 
 func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) {
+	defer close(dl.ended)
 	cancel := dl.cancel
 	body, size, err := fetch(ctx)
 	if err == nil {
@@ -248,6 +306,9 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 		dl.verified = true
 		dl.cond.Broadcast()
 		dl.mu.Unlock()
+		if r.beforeCommit != nil {
+			r.beforeCommit()
+		}
 		err = r.commit(ctx, dl.key, path)
 	}
 	cancel()
@@ -259,7 +320,7 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	r.closeIfIdle(dl)
 	r.mu.Unlock()
 	dl.mu.Lock()
-	dl.done, dl.err = true, err
+	dl.done, dl.err, dl.res = true, err, res
 	dl.cond.Broadcast()
 	dl.mu.Unlock()
 	// The path is no longer needed: readers hold the open file.

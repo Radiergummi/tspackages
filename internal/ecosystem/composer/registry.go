@@ -409,7 +409,8 @@ func (s *RegistrySource) Dist(ctx context.Context, name, version, reference stri
 
 // evictIfRedeclared drops a cached dist whose recorded sha1 is not the one
 // upstream declares now, so the relay fetches it again instead of failing
-// the cached copy's check.
+// the cached copy's check. The relay waits out a download of it still being
+// cached, so the old bytes can't land after the eviction.
 func (s *RegistrySource) evictIfRedeclared(ctx context.Context, pkg, version, reference, shasum string) {
 	rc, _, err := s.cache.Get(ctx, s.distSumKey(pkg, version, reference))
 	if err != nil {
@@ -420,7 +421,7 @@ func (s *RegistrySource) evictIfRedeclared(ctx context.Context, pkg, version, re
 	if err != nil || strings.EqualFold(string(got), shasum) {
 		return
 	}
-	if err := s.cache.Delete(ctx, s.distKey(pkg, version, reference)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+	if err := s.relay.Evict(ctx, s.distKey(pkg, version, reference)); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		s.log.Warn("evicting a redeclared composer dist failed", "source", s.name, "package", pkg, "version", version, "error", err)
 	}
 }
