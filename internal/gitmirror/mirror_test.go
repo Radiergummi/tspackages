@@ -758,3 +758,208 @@ func TestListTreeBytesCapped(t *testing.T) {
 		})
 	}
 }
+
+// moduleRepo builds a repository whose attributes would change a module
+// archive if honoured.
+func moduleRepo(t *testing.T) (src, commit string) {
+	t.Helper()
+	src = t.TempDir()
+	testutil.Git(t, src, "init", "-q")
+	write(t, src, ".gitattributes", "secret export-ignore\nv.txt export-subst\n")
+	write(t, src, "secret", "s")
+	write(t, src, "v.txt", "$Format:%H$")
+	write(t, src, "tools/x.go", "package x")
+	write(t, src, "top.go", "package top")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "one")
+	return src, testutil.Git(t, src, "rev-parse", "HEAD")
+}
+
+func readZip(t *testing.T, b []byte) map[string]*zip.File {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]*zip.File{}
+	for _, f := range zr.File {
+		out[f.Name] = f
+	}
+	return out
+}
+
+func zipContent(t *testing.T, f *zip.File) string {
+	t.Helper()
+	r, err := f.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestModuleArchiveEnv(t *testing.T) {
+	m := newMirror(t, makeRepo(t))
+	args, env := m.moduleArchiveCmd(strings.Repeat("a", 40), "")
+	for _, want := range []string{"core.attributesFile=/dev/null", "core.autocrlf=input", "core.eol=lf", "-0", "--prefix=prefix/"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("args lack %q: %v", want, args)
+		}
+	}
+	for _, want := range []string{"GIT_ATTR_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"} {
+		if !slices.Contains(env, want) {
+			t.Errorf("env lacks %q", want)
+		}
+	}
+}
+
+func TestModuleArchiveIgnoresExportIgnore(t *testing.T) {
+	src, commit := moduleRepo(t)
+	m := newMirror(t, src)
+	var buf bytes.Buffer
+	if err := m.ArchiveModuleZip(context.Background(), commit, "", &buf); err != nil {
+		t.Fatal(err)
+	}
+	files := readZip(t, buf.Bytes())
+	if files["prefix/secret"] == nil {
+		t.Errorf("export-ignore honoured: %v", files)
+	}
+	if f := files["prefix/v.txt"]; f == nil || zipContent(t, f) != "$Format:%H$" {
+		t.Errorf("export-subst expanded")
+	}
+	buf.Reset()
+	if err := m.ArchiveZip(context.Background(), commit, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if readZip(t, buf.Bytes())["secret"] != nil {
+		t.Error("ArchiveZip no longer honours export-ignore")
+	}
+}
+
+func TestModuleArchiveStored(t *testing.T) {
+	src, commit := moduleRepo(t)
+	m := newMirror(t, src)
+	var buf bytes.Buffer
+	if err := m.ArchiveModuleZip(context.Background(), commit, "", &buf); err != nil {
+		t.Fatal(err)
+	}
+	for n, f := range readZip(t, buf.Bytes()) {
+		if f.Method != zip.Store {
+			t.Errorf("%s: method %d", n, f.Method)
+		}
+	}
+}
+
+func TestModuleArchiveSubdir(t *testing.T) {
+	src, commit := moduleRepo(t)
+	m := newMirror(t, src)
+	var buf bytes.Buffer
+	if err := m.ArchiveModuleZip(context.Background(), commit, "tools", &buf); err != nil {
+		t.Fatal(err)
+	}
+	var files int
+	for n, f := range readZip(t, buf.Bytes()) {
+		if !f.FileInfo().IsDir() {
+			files++
+		}
+		if n != "prefix/" && !strings.HasPrefix(n, "prefix/tools/") {
+			t.Errorf("entry %q outside prefix/tools/", n)
+		}
+	}
+	if files != 1 {
+		t.Errorf("files: %d", files)
+	}
+	for _, bad := range []string{"../x", "-x", "/x", "a\nb"} {
+		if err := m.ArchiveModuleZip(context.Background(), commit, bad, &buf); err == nil {
+			t.Errorf("subdir %q accepted", bad)
+		}
+	}
+}
+
+func TestModuleArchiveFailures(t *testing.T) {
+	src, commit := moduleRepo(t)
+	m := newMirror(t, src)
+	ctx := context.Background()
+	err := m.ArchiveModuleZip(ctx, strings.Repeat("0", 40), "", io.Discard)
+	if !errors.Is(err, ErrArchiveFailed) {
+		t.Errorf("unknown commit: %v", err)
+	}
+	if err := m.ArchiveModuleZip(ctx, commit, "nope", io.Discard); !errors.Is(err, ErrArchiveFailed) {
+		t.Errorf("missing subdir: %v", err)
+	}
+	// A writer that refuses (the caller's size cap) surfaces as its own error.
+	errCap := errors.New("cap")
+	if err := m.ArchiveModuleZip(ctx, commit, "", errWriter{errCap}); !errors.Is(err, errCap) || errors.Is(err, ErrArchiveFailed) {
+		t.Errorf("writer error: %v", err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := m.ArchiveModuleZip(cctx, commit, "", io.Discard); errors.Is(err, ErrArchiveFailed) {
+		t.Errorf("cancelled: %v", err)
+	}
+}
+
+type errWriter struct{ err error }
+
+func (w errWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestScratchRecreatedAfterPrune(t *testing.T) {
+	src, commit := moduleRepo(t)
+	m := newMirror(t, src)
+	ctx := context.Background()
+	if err := m.ArchiveModuleZip(ctx, commit, "", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	scratch := strings.TrimSuffix(m.Dir(), ".git") + ".go-archive"
+	if _, err := os.Stat(filepath.Join(scratch, "objects", "info", "alternates")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(scratch); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := m.ArchiveModuleZip(ctx, commit, "", &buf); err != nil {
+		t.Fatal(err)
+	}
+	if readZip(t, buf.Bytes())["prefix/secret"] == nil {
+		t.Error("recreated scratch repository lost its attributes")
+	}
+}
+
+func TestReadFileMax(t *testing.T) {
+	src := makeRepo(t)
+	write(t, src, "big", strings.Repeat("x", 2<<20))
+	if err := os.WriteFile(filepath.Join(src, "COPYING"), []byte("terms"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("COPYING", filepath.Join(src, "LICENSE")); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "big")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	if b, err := m.ReadFileMax(ctx, commit, "big", 16<<20); err != nil || len(b) != 2<<20 {
+		t.Errorf("16 MiB cap: %d, %v", len(b), err)
+	}
+	if _, err := m.ReadFileMax(ctx, commit, "big", 1<<20); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("1 MiB cap: %v", err)
+	}
+	if _, err := m.ReadFileMax(ctx, commit, "src", 16<<20); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("directory: %v", err)
+	}
+	if b, err := m.ReadFileMax(ctx, commit, "LICENSE", 16<<20); err != nil || string(b) != "COPYING" {
+		t.Errorf("symlink: %q, %v", b, err)
+	}
+	if _, err := m.ReadFileMax(ctx, commit, "a\rb", 16<<20); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("CR path: %v", err)
+	}
+	if _, err := m.ReadFile(ctx, commit, "big"); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("ReadFile keeps 1 MiB: %v", err)
+	}
+}

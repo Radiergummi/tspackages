@@ -72,6 +72,8 @@ type Mirror struct {
 	mu         sync.Mutex // serialises Sync; guards fetchClean
 	fetchClean bool       // the last fetch in this process completed, so no stale locks are left
 
+	scratchMu sync.Mutex // guards creation of the module-archive scratch repository; never held with mu
+
 	lastSync      atomic.Pointer[time.Time]
 	defaultBranch atomic.Pointer[string] // as last set from the remote by this process
 }
@@ -373,13 +375,20 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/heads/"), nil
 }
 
-// ErrTooLarge is wrapped by ReadFile for a file over its 1 MiB limit.
+// ErrTooLarge is wrapped by ReadFile and ReadFileMax for a file over the cap.
 var ErrTooLarge = errors.New("file over the read limit")
 
 // ReadFile returns the content of the regular file path at commit. A missing
 // path or commit wraps resolve.ErrNotFound; files over 1 MiB wrap ErrTooLarge
 // (this is for small manifests such as composer.json and go.mod).
 func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, error) {
+	return m.ReadFileMax(ctx, commit, path, maxReadFile)
+}
+
+// ReadFileMax is ReadFile with the cap max: a missing path or commit, or a
+// path naming a tree or gitlink, wraps resolve.ErrNotFound; a blob over max
+// wraps ErrTooLarge. A symlink's blob (its target text) is returned as is.
+func (m *Mirror) ReadFileMax(ctx context.Context, commit, path string, max int64) ([]byte, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
 	}
@@ -416,8 +425,8 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("gitmirror: unexpected cat-file output %q", lines[1])
 	}
-	if size > maxReadFile {
-		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes: %w of %d bytes", commit, path, size, ErrTooLarge, maxReadFile)
+	if size > max {
+		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes: %w of %d bytes", commit, path, size, ErrTooLarge, max)
 	}
 	return m.git(ctx, m.dir, nil, nil, "cat-file", "blob", commit+":"+path)
 }
@@ -431,6 +440,124 @@ func (m *Mirror) ArchiveZip(ctx context.Context, commit string, w io.Writer) err
 		return err
 	}
 	_, err := m.git(ctx, m.dir, nil, w, "archive", "--format=zip", commit)
+	return err
+}
+
+// ErrArchiveFailed is wrapped by ArchiveModuleZip when git archive exits
+// non-zero for a reason in the commit's content (an unknown commit or
+// subdirectory, an unreadable object), as opposed to a cancelled context or a
+// failing writer.
+var ErrArchiveFailed = errors.New("git archive failed")
+
+// moduleArchiveCmd returns the arguments (after --git-dir) and environment of
+// the module archive command. The -c options and GIT_ATTR_NOSYSTEM keep user
+// and system configuration and attributes out of the archive.
+func (m *Mirror) moduleArchiveCmd(commit, subdir string) (args, env []string) {
+	args = []string{
+		"-c", "core.autocrlf=input",
+		"-c", "core.eol=lf",
+		"-c", "core.attributesFile=/dev/null",
+		"archive", "--format=zip", "-0", "--prefix=prefix/", commit,
+	}
+	if subdir != "" {
+		args = append(args, "--", subdir)
+	}
+	return args, append(m.env(), "GIT_ATTR_NOSYSTEM=1")
+}
+
+// scratchDir is the module-archive scratch repository of this mirror.
+func (m *Mirror) scratchDir() string {
+	return strings.TrimSuffix(m.dir, ".git") + ".go-archive"
+}
+
+// ensureScratch creates the scratch repository if it is missing or lacks its
+// alternates file. It takes scratchMu, never mu: Sync can hold mu for minutes.
+// Its info/attributes switch export-subst and export-ignore off, which the
+// shared mirror must not do for other archives; alternates make the mirror's
+// objects readable (safe because the mirror runs with gc.auto=0 and fetch
+// --prune drops refs, not objects).
+func (m *Mirror) ensureScratch(ctx context.Context) (string, error) {
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+	dir := m.scratchDir()
+	if _, err := os.Stat(filepath.Join(dir, "objects", "info", "alternates")); err == nil {
+		return dir, nil
+	}
+	tmp := dir + ".tmp"
+	for _, d := range []string{tmp, dir} {
+		if err := os.RemoveAll(d); err != nil {
+			return "", fmt.Errorf("gitmirror: clear scratch repository: %w", err)
+		}
+	}
+	if _, err := m.git(ctx, "", nil, nil, "init", "--bare", "--quiet", tmp); err != nil {
+		return "", err
+	}
+	for name, content := range map[string]string{
+		filepath.Join("objects", "info", "alternates"): filepath.Join(m.dir, "objects") + "\n",
+		filepath.Join("info", "attributes"):            "* -export-subst -export-ignore\n",
+	} {
+		p := filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// failWriter remembers the first error of the wrapped writer.
+type failWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (f *failWriter) Write(b []byte) (int, error) {
+	n, err := f.w.Write(b)
+	if err != nil && f.err == nil {
+		f.err = err
+	}
+	return n, err
+}
+
+// ArchiveModuleZip writes `git archive --format=zip -0 --prefix=prefix/
+// <commit> [-- <subdir>]` to w, run in a scratch repository with export-ignore
+// and export-subst off and no user or system attributes. It never takes mu.
+// A writer error (such as the caller's size cap) is returned as is; a git
+// failure caused by content wraps ErrArchiveFailed. Anything already written
+// to w is invalid when an error is returned.
+func (m *Mirror) ArchiveModuleZip(ctx context.Context, commit, subdir string, w io.Writer) error {
+	if err := checkCommit(commit); err != nil {
+		return err
+	}
+	if subdir != "" {
+		if err := checkPath(subdir); err != nil {
+			return err
+		}
+	}
+	dir, err := m.ensureScratch(ctx)
+	if err != nil {
+		return err
+	}
+	args, env := m.moduleArchiveCmd(commit, subdir)
+	fw := &failWriter{w: w}
+	_, err = m.gitEnv(ctx, dir, env, nil, fw, args...)
+	switch {
+	case err == nil:
+		return nil
+	case fw.err != nil:
+		return fw.err
+	case ctx.Err() != nil:
+		return err
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.Exited() {
+		return fmt.Errorf("%w: %w", ErrArchiveFailed, err)
+	}
 	return err
 }
 
@@ -457,6 +584,11 @@ func (e *gitError) Unwrap() error { return e.err }
 // discovery). With a non-nil stdout writer the output is streamed there and
 // the returned bytes are nil.
 func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout io.Writer, args ...string) ([]byte, error) {
+	return m.gitEnv(ctx, gitDir, m.env(), stdin, stdout, args...)
+}
+
+// gitEnv is git with an explicit environment.
+func (m *Mirror) gitEnv(ctx context.Context, gitDir string, env []string, stdin io.Reader, stdout io.Writer, args ...string) ([]byte, error) {
 	fileAllow := "never"
 	if m.opts.AllowFileRemotesForTesting {
 		fileAllow = "always"
@@ -484,7 +616,7 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = m.opts.BaseDir
-	cmd.Env = m.env()
+	cmd.Env = env
 	cmd.Stdin = stdin
 	// Own process group, so cancellation also reaches ssh and remote helpers:
 	// SIGTERM to the group, SIGKILL to the group killDelay later.
@@ -509,9 +641,22 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 		kill.Stop() // git has exited; do not signal a group id that may be reused
 	}
 	if err != nil {
-		return nil, &gitError{args: args[0], err: err, stderr: m.redact(errBuf.String())}
+		return nil, &gitError{args: subcommand(args), err: err, stderr: m.redact(errBuf.String())}
 	}
 	return out.Bytes(), nil
+}
+
+// subcommand names the git command in args, skipping leading "-c <config>"
+// pairs.
+func subcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return ""
 }
 
 func (m *Mirror) env() []string {
