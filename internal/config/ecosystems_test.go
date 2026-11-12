@@ -7,11 +7,15 @@ import (
 )
 
 func TestEveryEcosystemHasRules(t *testing.T) {
-	if got := SupportedEcosystems(); !slices.Equal(got, []string{"composer", "pypi"}) {
+	if got := SupportedEcosystems(); !slices.Equal(got, []string{"composer", "go", "pypi"}) {
 		t.Fatalf("SupportedEcosystems = %v", got)
 	}
 	for name, r := range ecosystems {
-		for _, typ := range []string{"git", "storage", "registry"} {
+		want := []string{"git", "storage", "registry"}
+		if name == "go" {
+			want = []string{"git", "registry"} // Go hosts nothing: no uploads
+		}
+		for _, typ := range want {
 			if !slices.Contains(r.types, typ) {
 				t.Errorf("%s: type %s missing", name, typ)
 			}
