@@ -22,6 +22,7 @@ import (
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/metrics"
@@ -68,6 +69,7 @@ const (
 	RefusalSkipped         = "skipped"
 	RefusalRefused         = "refused"
 	RefusalMovedAfterStore = "tag moved after the version was stored"
+	RefusalCorruptPin      = "pin corrupt"
 )
 
 // versionRecord is a stored tag version's version.json.
@@ -139,8 +141,10 @@ type GitSource struct {
 	idx   atomic.Pointer[goIndex]
 	pubMu sync.Mutex // serialises publishing; never held while building
 
-	passMu sync.Mutex // serialises Index; guards loaded
-	loaded bool
+	passMu sync.Mutex // serialises Index and load
+	// loaded is set once the stored versions are loaded; until then a
+	// configured module answers ErrUnavailable.
+	loaded atomic.Bool
 
 	treeFlight singleflight.Group
 
@@ -164,6 +168,7 @@ type GitSource struct {
 	// commit, per remote as of its last pass.
 	movedStored map[string]map[verKey]Refusal
 	warnedMoves map[pins.MovedTag]bool
+	pinMemo     map[[2]string]string // (remote, tag) → the commit last pinned, current and recorded
 	// cands are each remote's candidates as of its last successful pass.
 	cands  map[string]map[jobKey]candidate
 	health map[string]error // last pass outcome per remote
@@ -172,6 +177,7 @@ type GitSource struct {
 	archive       func(ctx context.Context, m *gitmirror.Mirror, commit, dir string, w io.Writer) error
 	listTree      func(ctx context.Context, m *gitmirror.Mirror, commit, dir string) ([]gitmirror.TreeEntry, error)
 	beforeRecheck func(jobKey) // runs just before a job re-checks its tag
+	repairHook    func()       // runs at the start of every repair attempt
 }
 
 var _ Source = (*GitSource)(nil)
@@ -203,7 +209,7 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 		unlisted: map[verKey]versionRecord{}, recRefusals: map[verKey]Refusal{}, refusals: map[jobKey]Refusal{},
 		dirRefusals: map[dirKey]string{}, treeOK: map[dirKey]bool{}, failures: map[dirKey]map[uint64]bool{},
 		archives: map[dirKey]*archiveRun{}, movedStored: map[string]map[verKey]Refusal{},
-		warnedMoves: map[pins.MovedTag]bool{}, cands: map[string]map[jobKey]candidate{}, health: map[string]error{},
+		warnedMoves: map[pins.MovedTag]bool{}, pinMemo: map[[2]string]string{}, cands: map[string]map[jobKey]candidate{}, health: map[string]error{},
 		archive: func(ctx context.Context, m *gitmirror.Mirror, commit, dir string, w io.Writer) error {
 			return m.ArchiveModuleZip(ctx, commit, dir, w)
 		},
@@ -299,6 +305,12 @@ func (g *GitSource) load(ctx context.Context) error {
 	}
 	listed := map[verKey]versionRecord{}
 	unlisted := map[verKey]versionRecord{}
+	type badRecord struct {
+		vk     verKey
+		rec    versionRecord
+		reason string
+	}
+	var bad []badRecord
 	for _, dir := range slices.Sorted(maps.Keys(dirs)) {
 		if !dirs[dir].record {
 			continue
@@ -315,19 +327,21 @@ func (g *GitSource) load(ctx context.Context) error {
 		if _, ok := g.moduleFor(p); !ok {
 			continue // a module no longer configured
 		}
-		rec, err := g.readRecord(ctx, g.prefix()+dir+"version.json")
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			g.log.Warn("goproxy git: unreadable version record", "source", g.name, "module", p, "version", v, "error", err)
-			continue
-		}
-		if rec.Version != v {
-			g.log.Warn("goproxy git: version record for another version", "source", g.name, "module", p, "version", v, "recorded", rec.Version)
-			continue
-		}
 		vk := verKey{p, v}
+		rec, err := g.readRecord(ctx, g.prefix()+dir+"version.json")
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			continue // deleted since the listing
+		case errors.Is(err, errBadRecord):
+			bad = append(bad, badRecord{vk, versionRecord{Version: v}, "unreadable version record: " + err.Error()})
+			continue
+		case err != nil:
+			return err
+		}
+		if reason := checkRecord(rec, v); reason != "" {
+			bad = append(bad, badRecord{vk, rec, reason})
+			continue
+		}
 		if dirs[dir].zip {
 			listed[vk] = rec
 		} else {
@@ -347,7 +361,10 @@ func (g *GitSource) load(ctx context.Context) error {
 	for vk, rec := range unlisted {
 		g.enqueueRepair(vk, rec)
 	}
-	g.loaded = true
+	for _, b := range bad {
+		_ = g.refuseRecord(b.vk, b.rec, b.reason)
+	}
+	g.loaded.Store(true)
 	return nil
 }
 
@@ -358,8 +375,30 @@ func (g *GitSource) readRecord(ctx context.Context, key string) (versionRecord, 
 	}
 	defer rc.Close()
 	var r versionRecord
-	err = json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&r)
-	return r, err
+	if err := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&r); err != nil {
+		if ctx.Err() != nil {
+			return r, err
+		}
+		return r, fmt.Errorf("%w: %w", errBadRecord, err)
+	}
+	return r, nil
+}
+
+// errBadRecord marks a version.json that does not decode.
+var errBadRecord = errors.New("goproxy git: undecodable version record")
+
+// checkRecord returns why a decoded record of version v cannot be used, or
+// "".
+func checkRecord(rec versionRecord, v string) string {
+	switch {
+	case rec.Format != GoZipFormat:
+		return fmt.Sprintf("version record format %d; this tspackages reads format %d", rec.Format, GoZipFormat)
+	case rec.Version != v:
+		return "invalid version record: it is for version " + rec.Version
+	case !digest.IsHex(rec.Commit, 40, 64):
+		return fmt.Sprintf("invalid version record: commit %q", rec.Commit)
+	}
+	return ""
 }
 
 // Index runs one pass: per remote, sync, list the refs, pin the tags of
@@ -370,7 +409,7 @@ func (g *GitSource) readRecord(ctx context.Context, key string) (versionRecord, 
 func (g *GitSource) Index(ctx context.Context) error {
 	g.passMu.Lock()
 	defer g.passMu.Unlock()
-	if !g.loaded {
+	if !g.loaded.Load() {
 		if err := g.load(ctx); err != nil {
 			return fmt.Errorf("goproxy git: load stored versions: %w", err)
 		}
@@ -410,9 +449,7 @@ func (g *GitSource) passRemote(ctx context.Context, remote string) error {
 		c := cands[k]
 		vk := verKey{k.Path, k.Version}
 		if rec, ok := g.idx.Load().listed[vk]; ok {
-			if err := g.checkPin(ctx, c, rec, moved); err != nil {
-				return err
-			}
+			g.checkPin(ctx, c, rec, moved)
 			continue
 		}
 		g.mu.Lock()
@@ -472,19 +509,56 @@ func (g *GitSource) candidates(remote string, refs []gitmirror.Ref) map[jobKey]c
 // checkPin pins a stored version's tag to the tag's current commit. A
 // move is logged once and listed by the pin store; a pin on another commit
 // than the record's (re-pinned after an operator deleted the pin) is
-// reported in moved.
-func (g *GitSource) checkPin(ctx context.Context, c candidate, rec versionRecord, moved map[verKey]Refusal) error {
+// reported in moved. A tag last seen pinned to the record's commit and
+// still there is not pinned again until the tag moves or the process
+// restarts. A failed Pin keeps the version's previous row; a corrupt pin is
+// reported.
+func (g *GitSource) checkPin(ctx context.Context, c candidate, rec versionRecord, moved map[verKey]Refusal) {
+	vk := verKey{c.key.Path, c.key.Version}
+	mk := [2]string{c.key.Remote, c.tag}
+	g.mu.Lock()
+	memo := g.pinMemo[mk]
+	prev, hadPrev := g.movedStored[c.key.Remote][vk]
+	g.mu.Unlock()
+	if memo == c.key.Commit {
+		return
+	}
 	pinned, isMove, err := g.pins.Pin(ctx, ecoName, g.name, c.key.Remote, c.tag, c.key.Commit)
-	if err != nil {
-		return fmt.Errorf("pin %s: %w", c.tag, err)
+	switch {
+	case errors.Is(err, pins.ErrCorrupt):
+		g.log.Warn("goproxy git: corrupt pin; serving the stored version", "source", g.name, "tag", c.tag, "error", err)
+		moved[vk] = Refusal{
+			Module: vk.Path, Version: vk.Version, Remote: metrics.RedactRemote(c.key.Remote), Tag: c.tag, Commit: rec.Commit,
+			Kind: RefusalCorruptPin, Reason: err.Error(),
+		}
+		return
+	case err != nil:
+		g.log.Warn("goproxy git: pinning a stored version's tag failed", "source", g.name, "tag", c.tag, "error", err)
+		if hadPrev {
+			moved[vk] = prev
+		}
+		return
 	}
 	if isMove {
 		g.warnMove(c, pinned)
 	}
 	if pinned != rec.Commit {
-		moved[verKey{c.key.Path, c.key.Version}] = g.movedRefusal(c, rec, pinned)
+		moved[vk] = g.movedRefusal(c, rec, pinned)
 	}
-	return nil
+	g.memoPin(c.key.Remote, c.tag, c.key.Commit, pinned, rec.Commit, isMove)
+}
+
+// memoPin remembers a tag pinned to the commit it points at and its record
+// holds, and forgets any other outcome.
+func (g *GitSource) memoPin(remote, tag, current, pinned, recorded string, isMove bool) {
+	mk := [2]string{remote, tag}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !isMove && pinned == current && pinned == recorded {
+		g.pinMemo[mk] = current
+	} else {
+		delete(g.pinMemo, mk)
+	}
 }
 
 func (g *GitSource) warnMove(c candidate, pinned string) {
@@ -527,6 +601,11 @@ func (g *GitSource) prune(remote string, cands map[jobKey]candidate, moved map[v
 	maps.DeleteFunc(g.dirRefusals, func(k dirKey, _ string) bool { return stale(k) })
 	maps.DeleteFunc(g.treeOK, func(k dirKey, _ bool) bool { return stale(k) })
 	maps.DeleteFunc(g.failures, func(k dirKey, _ map[uint64]bool) bool { return stale(k) })
+	tags := map[string]bool{}
+	for _, c := range cands {
+		tags[c.tag] = true
+	}
+	maps.DeleteFunc(g.pinMemo, func(k [2]string, _ string) bool { return k[0] == remote && !tags[k[1]] })
 	g.movedStored[remote] = moved
 	g.cands[remote] = cands
 }
@@ -689,12 +768,17 @@ func (g *GitSource) build(ctx context.Context, m *gitmirror.Mirror, dk dirKey, m
 		return "", ZipResult{}, &RefusalError{Reason: reason}
 	}
 	var run *archiveRun
+	left := false // a follower stopped waiting for the shared archive
 	zipPath, res, err := BuildZip(ctx, BuildInput{
 		Version: mv,
 		Subdir:  dk.Dir,
 		GoMod:   gomod,
 		Archive: func(ctx context.Context, w io.Writer) error {
 			r, release, err := g.sharedArchive(ctx, m, dk)
+			if r == nil {
+				left = true
+				return err
+			}
 			run = r
 			if err != nil {
 				return err
@@ -725,7 +809,8 @@ func (g *GitSource) build(ctx context.Context, m *gitmirror.Mirror, dk dirKey, m
 		}
 		return "", ZipResult{}, err
 	}
-	if errors.Is(err, gitmirror.ErrArchiveFailed) || errors.Is(err, errArchiveTimeout) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	// A follower's wait is not an attempt: the leader counts the archive.
+	if !left && (errors.Is(err, gitmirror.ErrArchiveFailed) || errors.Is(err, errArchiveTimeout) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
 		g.mu.Lock()
 		id := run.idOrNext(g)
 		if g.failures[dk] == nil {
@@ -754,7 +839,7 @@ func (r *archiveRun) idOrNext(g *GitSource) uint64 {
 
 // sharedArchive spools git archive's output for dk once for every job that
 // asks while it runs or is still in use. release removes the spool after the
-// last user.
+// last user. A follower whose ctx ends while it waits gets a nil run.
 func (g *GitSource) sharedArchive(ctx context.Context, m *gitmirror.Mirror, dk dirKey) (r *archiveRun, release func(), err error) {
 	g.mu.Lock()
 	r = g.archives[dk]
@@ -786,7 +871,7 @@ func (g *GitSource) sharedArchive(ctx context.Context, m *gitmirror.Mirror, dk d
 		case <-r.done:
 		case <-ctx.Done():
 			release()
-			return r, nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 	}
 	if r.err != nil {
@@ -864,9 +949,17 @@ func (g *GitSource) store(ctx context.Context, m *gitmirror.Mirror, c candidate,
 			if !errors.Is(err, storage.ErrExists) {
 				return err
 			}
-			if rec, err = g.readRecord(ctx, key); err != nil {
+			stored, err := g.readRecord(ctx, key)
+			switch {
+			case errors.Is(err, errBadRecord):
+				return g.refuseRecord(vk, versionRecord{Version: k.Version}, "unreadable version record: "+err.Error())
+			case err != nil:
 				return err
 			}
+			if reason := checkRecord(stored, k.Version); reason != "" {
+				return g.refuseRecord(vk, stored, reason)
+			}
+			rec = stored
 		}
 		*claimed = &rec
 	}
@@ -881,6 +974,7 @@ func (g *GitSource) store(ctx context.Context, m *gitmirror.Mirror, c candidate,
 	if isMove {
 		g.warnMove(candidate{key: jobKey{Remote: k.Remote, Commit: rec.Commit}, tag: c.tag}, pinned)
 	}
+	g.memoPin(k.Remote, c.tag, k.Commit, pinned, rec.Commit, isMove)
 	if pinned != rec.Commit {
 		g.mu.Lock()
 		if g.movedStored[k.Remote] == nil {
@@ -892,41 +986,48 @@ func (g *GitSource) store(ctx context.Context, m *gitmirror.Mirror, c candidate,
 	return nil
 }
 
-// complete makes rec's version servable. When its zip is stored it is
-// published; otherwise the zip built from commit is written if its h1
-// hashes equal the record's. A record of another commit is left to a
-// repair.
+// complete makes rec's version servable. When its zip and go.mod are
+// stored it is published; otherwise the files built from commit are written
+// if their h1 hashes equal the record's. A record of another commit is left
+// to a repair.
 func (g *GitSource) complete(ctx context.Context, vk verKey, rec versionRecord, built ZipResult, commit string, gomod []byte, zipPath string) error {
 	dir := g.versionDir(vk)
-	_, err := g.state.Stat(ctx, dir+"module.zip")
+	_, zipErr := g.state.Stat(ctx, dir+"module.zip")
+	_, modErr := g.state.Stat(ctx, dir+"go.mod")
 	switch {
-	case err == nil:
+	case zipErr == nil && modErr == nil:
 		g.publish(vk, rec)
 		return nil
-	case !errors.Is(err, storage.ErrNotFound):
-		return err
+	case zipErr != nil && !errors.Is(zipErr, storage.ErrNotFound):
+		return zipErr
+	case modErr != nil && !errors.Is(modErr, storage.ErrNotFound):
+		return modErr
 	case commit != rec.Commit:
 		g.enqueueRepair(vk, rec)
 		return nil
 	case built.ZipHash != rec.ZipHash || built.ModHash != rec.ModHash:
 		return g.refuseRecord(vk, rec, "h1 differs from the record")
 	}
-	if err := putIfAbsent(ctx, g.state, dir+"go.mod", bytes.NewReader(gomod)); err != nil {
-		return err
+	if modErr != nil {
+		if err := putIfAbsent(ctx, g.state, dir+"go.mod", bytes.NewReader(gomod)); err != nil {
+			return err
+		}
 	}
-	if err := g.rec.PutProvenance(ctx, records.Provenance{
-		Ecosystem: ecoName, Package: vk.Path, Version: vk.Version, Source: g.name, SourceType: "git",
-		Remote: rec.Remote, Commit: rec.Commit, DeclaredDigest: rec.ZipHash, SHA256: built.SHA256,
-	}); err != nil {
-		return err
-	}
-	f, err := os.Open(zipPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := putIfAbsent(ctx, g.state, dir+"module.zip", f); err != nil {
-		return err
+	if zipErr != nil {
+		if err := g.rec.PutProvenance(ctx, records.Provenance{
+			Ecosystem: ecoName, Package: vk.Path, Version: vk.Version, Source: g.name, SourceType: "git",
+			Remote: rec.Remote, Commit: rec.Commit, DeclaredDigest: rec.ZipHash, SHA256: built.SHA256,
+		}); err != nil {
+			return err
+		}
+		f, err := os.Open(zipPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := putIfAbsent(ctx, g.state, dir+"module.zip", f); err != nil {
+			return err
+		}
 	}
 	g.publish(vk, rec)
 	return nil
@@ -946,15 +1047,22 @@ func (g *GitSource) enqueueRepair(vk verKey, rec versionRecord) {
 	g.unlisted[vk] = rec
 	g.mu.Unlock()
 	k := jobKey{Remote: mod.Remote, Commit: rec.Commit, Dir: mod.Dir, Path: vk.Path, Version: vk.Version}
-	g.q.enqueue(k, vk.Path, jobRepair, g.repairJob(g.mirrors[mod.Remote], vk, rec))
+	g.q.enqueue(k, vk.Path, jobRepair, g.repairJob(mod.Remote, g.mirrors[mod.Remote], vk, rec))
 }
 
 // repairJob rebuilds a stored version's missing zip from the recorded commit
-// and directory, and writes it only if its h1 hashes equal the record's.
-func (g *GitSource) repairJob(m *gitmirror.Mirror, vk verKey, rec versionRecord) func(context.Context) error {
+// and directory, and writes it only if its h1 hashes equal the record's. A
+// commit missing from a mirror that has not synced in this process may only
+// predate the record, so it is retried until the first sync.
+func (g *GitSource) repairJob(remote string, m *gitmirror.Mirror, vk verKey, rec versionRecord) func(context.Context) error {
 	return func(ctx context.Context) error {
+		if g.repairHook != nil {
+			g.repairHook()
+		}
 		gomod, err := m.ReadFileMax(ctx, rec.Commit, path.Join(rec.Dir, "go.mod"), MaxGoMod)
 		switch {
+		case errors.Is(err, gitmirror.ErrNoCommit) && m.LastSync().IsZero():
+			return err
 		case errors.Is(err, gitmirror.ErrNoCommit):
 			return g.refuseRecord(vk, rec, "zip missing and commit gone")
 		case errors.Is(err, resolve.ErrNotFound):
@@ -964,7 +1072,7 @@ func (g *GitSource) repairJob(m *gitmirror.Mirror, vk verKey, rec versionRecord)
 		case err != nil:
 			return err
 		}
-		dk := dirKey{m.Remote(), rec.Commit, rec.Dir}
+		dk := dirKey{remote, rec.Commit, rec.Dir}
 		zipPath, res, err := g.build(ctx, m, dk, module.Version{Path: vk.Path, Version: vk.Version}, gomod)
 		var ref *RefusalError
 		switch {
@@ -982,6 +1090,7 @@ func (g *GitSource) repairJob(m *gitmirror.Mirror, vk verKey, rec versionRecord)
 func (g *GitSource) publish(vk verKey, rec versionRecord) {
 	g.mu.Lock()
 	delete(g.unlisted, vk)
+	delete(g.recRefusals, vk)
 	g.mu.Unlock()
 	g.pubMu.Lock()
 	defer g.pubMu.Unlock()
@@ -997,12 +1106,24 @@ func (g *GitSource) publish(vk verKey, rec versionRecord) {
 	g.idx.Store(idx)
 }
 
+// checkModule answers ErrNotFound for a path no configured module serves
+// and ErrUnavailable while the stored versions are not loaded.
+func (g *GitSource) checkModule(p string) error {
+	if _, ok := g.moduleFor(p); !ok {
+		return fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
+	}
+	if !g.loaded.Load() {
+		return fmt.Errorf("%w: %s: stored versions not loaded yet", ErrUnavailable, p)
+	}
+	return nil
+}
+
 // lookup returns the stored record of a canonical version of a configured
 // module. A record that cannot be served (its zip missing, awaiting repair
 // or refused) is ErrUnavailable.
 func (g *GitSource) lookup(p, v string) (versionRecord, error) {
-	if _, ok := g.moduleFor(p); !ok {
-		return versionRecord{}, fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
+	if err := g.checkModule(p); err != nil {
+		return versionRecord{}, err
 	}
 	if !semver.IsValid(v) || semver.Canonical(v) != v {
 		return versionRecord{}, fmt.Errorf("%w: %s@%s", resolve.ErrNotFound, p, v)
@@ -1026,8 +1147,8 @@ func (g *GitSource) lookup(p, v string) (versionRecord, error) {
 
 // List returns the stored versions of p, sorted.
 func (g *GitSource) List(_ context.Context, p string) ([]string, error) {
-	if _, ok := g.moduleFor(p); !ok {
-		return nil, fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
+	if err := g.checkModule(p); err != nil {
+		return nil, err
 	}
 	return slices.Clone(g.idx.Load().versions[p]), nil
 }
@@ -1044,8 +1165,8 @@ func (g *GitSource) Info(_ context.Context, p, v string) (Info, error) {
 // Latest answers the highest stored release, else the highest stored
 // prerelease.
 func (g *GitSource) Latest(_ context.Context, p string) (Info, error) {
-	if _, ok := g.moduleFor(p); !ok {
-		return Info{}, fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
+	if err := g.checkModule(p); err != nil {
+		return Info{}, err
 	}
 	idx := g.idx.Load()
 	vs := idx.versions[p]
@@ -1073,12 +1194,23 @@ func (g *GitSource) Zip(ctx context.Context, p, v string) (Artifact, error) {
 }
 
 func (g *GitSource) open(ctx context.Context, p, v, file string) (Artifact, error) {
-	if _, err := g.lookup(p, v); err != nil {
+	rec, err := g.lookup(p, v)
+	if err != nil {
 		return Artifact{}, err
 	}
-	rc, size, err := storage.OpenObject(ctx, g.state, g.versionDir(verKey{p, v})+file)
+	vk := verKey{p, v}
+	rc, size, err := storage.OpenObject(ctx, g.state, g.versionDir(vk)+file)
 	if errors.Is(err, storage.ErrNotFound) {
-		return Artifact{}, fmt.Errorf("%w: %s@%s: stored %s is missing", ErrUnavailable, p, v, file)
+		// The version stays listed while its files are rebuilt; a rebuild
+		// already refused is not repeated.
+		g.mu.Lock()
+		refusal, refused := g.recRefusals[vk]
+		g.mu.Unlock()
+		if refused {
+			return Artifact{}, fmt.Errorf("%w: %s@%s: stored %s is missing: %s", ErrUnavailable, p, v, file, refusal.Reason)
+		}
+		g.enqueueRepair(vk, rec)
+		return Artifact{}, fmt.Errorf("%w: %s@%s: stored %s is missing; repairing", ErrUnavailable, p, v, file)
 	}
 	if err != nil {
 		return Artifact{}, err

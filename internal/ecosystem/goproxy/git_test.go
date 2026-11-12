@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
@@ -668,8 +670,23 @@ func TestRepairCommitGone(t *testing.T) {
 	if err := e.state.Delete(t.Context(), versionKey(modP, "v1.0.0", "module.zip")); err != nil {
 		t.Fatal(err)
 	}
-	g2 := e.source(rootMod())
-	settle(t, g2)
+	var attempts atomic.Int32
+	g2 := e.source(rootMod(), func(_ *GitOptions, g *GitSource) {
+		g.repairHook = func() { attempts.Add(1) }
+	})
+	// The on-disk mirror may predate the record until the remote synced in
+	// this process: the repair retries.
+	deadline := time.Now().Add(20 * time.Second)
+	for attempts.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("the repair did not retry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, ok := refusalFor(g2, modP, "v1.0.0"); ok {
+		t.Fatal("refused before the remote's first sync")
+	}
+	pass(t, g2)
 	wantRefused(t, g2, modP, "v1.0.0", RefusalRefused, "zip missing and commit gone")
 	if _, err := g2.Info(t.Context(), modP, "v1.0.0"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("Info = %v, want ErrUnavailable", err)
@@ -777,5 +794,238 @@ func TestMovedPackage(t *testing.T) {
 	}
 	if got := g.MovedPackage(pins.MovedTag{Ecosystem: "go", Source: "acme", Remote: "file:///elsewhere", Tag: "v1.0.0"}); got != "" {
 		t.Errorf("another remote's tag: %q", got)
+	}
+}
+
+// faultDriver fails List or Get of version records on demand and counts
+// pin writes.
+type faultDriver struct {
+	storage.Driver
+	failList, failGet atomic.Bool
+	pinPuts           atomic.Int32
+}
+
+var errFault = errors.New("injected store fault")
+
+func (d *faultDriver) List(ctx context.Context, prefix string) iter.Seq2[storage.Info, error] {
+	if d.failList.Load() {
+		return func(yield func(storage.Info, error) bool) { yield(storage.Info{}, errFault) }
+	}
+	return d.Driver.List(ctx, prefix)
+}
+
+func (d *faultDriver) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if d.failGet.Load() && strings.HasSuffix(key, "/version.json") {
+		return nil, storage.Info{}, errFault
+	}
+	return d.Driver.Get(ctx, key)
+}
+
+func (d *faultDriver) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if strings.HasPrefix(key, "pins/") {
+		d.pinPuts.Add(1)
+	}
+	return d.Driver.PutIfAbsent(ctx, key, r)
+}
+
+func (e *gitEnv) faults() *faultDriver {
+	d := &faultDriver{Driver: e.state}
+	e.state = d
+	return d
+}
+
+func wantUnavailable(t *testing.T, what string, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("%s = %v, want ErrUnavailable", what, err)
+	}
+}
+
+func TestFailedLoadAnswersUnavailable(t *testing.T) {
+	for _, mode := range []string{"list", "get"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newGitEnv(t)
+			fd := e.faults()
+			e.commit(map[string]string{"go.mod": gomodOf(modP)})
+			e.tag("v1.0.0")
+			pass(t, e.source(rootMod()))
+
+			fail := &fd.failList
+			if mode == "get" {
+				fail = &fd.failGet
+			}
+			fail.Store(true)
+			g := e.source(rootMod())
+			_, err := g.List(t.Context(), modP)
+			wantUnavailable(t, "List", err)
+			_, err = g.Info(t.Context(), modP, "v1.0.0")
+			wantUnavailable(t, "Info", err)
+			_, err = g.Latest(t.Context(), modP)
+			wantUnavailable(t, "Latest", err)
+			_, err = g.Zip(t.Context(), modP, "v1.0.0")
+			wantUnavailable(t, "Zip", err)
+			_, err = g.Mod(t.Context(), modP, "v1.0.0")
+			wantUnavailable(t, "Mod", err)
+			if _, err := g.List(t.Context(), "git.test/acme/other"); !errors.Is(err, resolve.ErrNotFound) {
+				t.Fatalf("an unconfigured path = %v", err)
+			}
+			if err := g.Index(t.Context()); err == nil {
+				t.Fatal("Index succeeded although the load failed")
+			}
+			fail.Store(false)
+			pass(t, g)
+			wantList(t, g, modP, "v1.0.0")
+		})
+	}
+}
+
+func TestBadRecordsReported(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0", "v1.1.0", "v1.2.0")
+	pass(t, e.source(rootMod()))
+	put := func(v string, body []byte) {
+		if _, err := e.state.Put(t.Context(), versionKey(modP, v, "version.json"), bytes.NewReader(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("v1.0.0", []byte("{"))
+	rec, _ := e.record(modP, "v1.1.0")
+	rec.Format = 99
+	body, _ := json.Marshal(rec)
+	put("v1.1.0", body)
+
+	g := e.sourceIn("", rootMod())
+	wantList(t, g, modP, "v1.2.0")
+	wantRefused(t, g, modP, "v1.0.0", RefusalRefused, "unreadable version record")
+	wantRefused(t, g, modP, "v1.1.0", RefusalRefused, "version record format 99")
+	_, err := g.Info(t.Context(), modP, "v1.0.0")
+	wantUnavailable(t, "Info of an unreadable record", err)
+}
+
+func TestCorruptPinReported(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0")
+	pass(t, e.source(rootMod()))
+	key := "pins/go/acme/" + storage.EscapeSegment(e.remote) + "/" + storage.EscapeSegment("v1.0.0") + ".json"
+	if _, err := e.state.Put(t.Context(), key, strings.NewReader("garbage")); err != nil {
+		t.Fatal(err)
+	}
+	e.tag("v1.2.0")
+	g := e.source(rootMod())
+	pass(t, g)
+	wantList(t, g, modP, "v1.0.0", "v1.2.0")
+	wantRefused(t, g, modP, "v1.0.0", RefusalCorruptPin, "")
+}
+
+func TestPinMemoised(t *testing.T) {
+	e := newGitEnv(t)
+	fd := e.faults()
+	e.commit(map[string]string{"go.mod": gomodOf(modP), "a.go": "package m\n"})
+	e.tag("v1.0.0")
+	g := e.source(rootMod())
+	pass(t, g)
+	pass(t, g)
+	n := fd.pinPuts.Load()
+	pass(t, g)
+	if got := fd.pinPuts.Load(); got != n {
+		t.Fatalf("an unmoved stored tag was pinned again (%d pin writes, then %d)", n, got)
+	}
+	e.commit(map[string]string{"a.go": "package m // moved\n"})
+	e.tag("v1.0.0")
+	pass(t, g)
+	if fd.pinPuts.Load() == n {
+		t.Fatal("a moved tag did not reach Pin")
+	}
+	if mv := g.pins.Moved(); len(mv) != 1 || mv[0].Tag != "v1.0.0" {
+		t.Fatalf("Moved() = %+v", mv)
+	}
+}
+
+func TestServeMissingZipRepairs(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP), "a.go": "package m\n"})
+	e.tag("v1.0.0")
+	g := e.sourceIn("", rootMod())
+	startQueue(t, g.q)
+	pass(t, g)
+	rec, _ := e.record(modP, "v1.0.0")
+	for _, f := range []string{"module.zip", "go.mod"} {
+		if err := e.state.Delete(t.Context(), versionKey(modP, "v1.0.0", f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := g.Zip(t.Context(), modP, "v1.0.0")
+	wantUnavailable(t, "Zip of a lost zip", err)
+	wantList(t, g, modP, "v1.0.0")
+	settle(t, g)
+	if h := zipHashOf(t, fetch(t, g.Zip, modP, "v1.0.0")); h != rec.ZipHash {
+		t.Fatalf("repaired zip h1 %s, want %s", h, rec.ZipHash)
+	}
+	if m := fetch(t, g.Mod, modP, "v1.0.0"); string(m) != gomodOf(modP) {
+		t.Fatalf("repaired go.mod %q", m)
+	}
+}
+
+func TestFollowerTimeoutNotCounted(t *testing.T) {
+	e := newGitEnv(t)
+	commit := e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0")
+	started, release := make(chan struct{}), make(chan struct{})
+	g := e.source(rootMod(), func(_ *GitOptions, g *GitSource) {
+		g.archive = func(context.Context, *gitmirror.Mirror, string, string, io.Writer) error {
+			close(started)
+			<-release
+			return fmt.Errorf("%w: exit status 128", gitmirror.ErrArchiveFailed)
+		}
+	})
+	m := g.mirrors[e.remote]
+	dk := dirKey{e.remote, commit, ""}
+	mv := module.Version{Path: modP, Version: "v1.0.0"}
+	leader := make(chan error, 1)
+	go func() {
+		_, _, err := g.build(context.Background(), m, dk, mv, []byte(gomodOf(modP)))
+		leader <- err
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := g.build(ctx, m, dk, mv, []byte(gomodOf(modP))); err == nil {
+		t.Fatal("the follower's build succeeded")
+	}
+	close(release)
+	if err := <-leader; !errors.Is(err, gitmirror.ErrArchiveFailed) {
+		t.Fatalf("leader: %v", err)
+	}
+	if reason := g.dirRefusal(dk); reason != "" {
+		t.Fatalf("one archive failure and a follower's timeout were refused: %s", reason)
+	}
+}
+
+func TestAdoptedRecordInvalid(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0")
+	g := e.source(rootMod())
+	body, _ := json.Marshal(versionRecord{Format: GoZipFormat, Version: "v9.9.9", Commit: "nothex"})
+	if _, err := e.state.Put(t.Context(), versionKey(modP, "v1.0.0", "version.json"), bytes.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	pass(t, g)
+	wantRefused(t, g, modP, "v1.0.0", RefusalRefused, "invalid version record")
+	_, err := g.Info(t.Context(), modP, "v1.0.0")
+	wantUnavailable(t, "Info", err)
+}
+
+func TestPublishClearsRecordRefusal(t *testing.T) {
+	e := newGitEnv(t)
+	g := e.sourceIn("", rootMod())
+	vk := verKey{modP, "v1.0.0"}
+	rec := versionRecord{Format: GoZipFormat, Version: "v1.0.0", Commit: strings.Repeat("ab", 20)}
+	_ = g.refuseRecord(vk, rec, "h1 differs from the record")
+	g.publish(vk, rec)
+	if rs := g.Refusals(); len(rs) != 0 {
+		t.Fatalf("Refusals() = %+v after another indexer completed the version", rs)
 	}
 }
