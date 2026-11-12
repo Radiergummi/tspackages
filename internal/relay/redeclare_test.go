@@ -90,19 +90,53 @@ func TestSameDigest(t *testing.T) {
 	}
 }
 
-// TestEvictWaitsForCommit: an eviction while a download's cache write is in
-// progress takes effect after that write, not before it.
+// TestEvictWaitsForCommit: an eviction while a download of other bytes is
+// still being cached takes effect after that write, not before it.
 func TestEvictWaitsForCommit(t *testing.T) {
 	r, cache, release := newHeldRelay(t)
-	body := []byte("redeclared")
+	old := []byte("redeclared")
 	var calls atomic.Int32
-	readAllOf(t, r, digestOf(body), bytesFetch(body, &calls))
+	readAllOf(t, r, digestOf(old), bytesFetch(old, &calls))
 	r.beforeWait = release
-	if err := r.Evict(context.Background(), "k"); err != nil {
+	if err := r.Evict(context.Background(), "k", digestOf([]byte("new"))); err != nil {
 		t.Fatal(err)
 	}
 	r.Wait()
 	if _, _, err := cache.Get(context.Background(), "k"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("after eviction: %v", err)
+	}
+}
+
+// TestEvictKeepsDownloadOfWantedBytes: an eviction for the digest a download
+// in flight already expects neither waits for it nor drops what it caches.
+func TestEvictKeepsDownloadOfWantedBytes(t *testing.T) {
+	r, cache, release := newHeldRelay(t)
+	fresh := []byte("fresh")
+	var calls atomic.Int32
+	readAllOf(t, r, digestOf(fresh), bytesFetch(fresh, &calls))
+	r.beforeWait = func() { t.Error("Evict waited for a download of the wanted bytes"); release() }
+	if err := r.Evict(context.Background(), "k", digestOf(fresh)); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	r.Wait()
+	if _, _, err := cache.Get(context.Background(), "k"); err != nil {
+		t.Fatalf("after eviction: %v", err)
+	}
+}
+
+// TestEvictKeepsCommittedWantedBytes: an eviction that waits out a download
+// expecting another digest keeps what it cached when that matches want.
+func TestEvictKeepsCommittedWantedBytes(t *testing.T) {
+	r, cache, release := newHeldRelay(t)
+	fresh := []byte("fresh")
+	var calls atomic.Int32
+	readAllOf(t, r, Digest{}, bytesFetch(fresh, &calls))
+	r.beforeWait = release
+	if err := r.Evict(context.Background(), "k", digestOf(fresh)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cache.Get(context.Background(), "k"); err != nil {
 		t.Fatalf("after eviction: %v", err)
 	}
 }

@@ -75,15 +75,27 @@ func sameDigest(a, b Digest) bool {
 	return strings.EqualFold(a.SHA1, b.SHA1) && strings.EqualFold(a.SHA256, b.SHA256)
 }
 
-// Evict removes key from the cache. A download of key in flight is waited
-// out first, so its cache write can't land after the eviction.
-func (r *Relay) Evict(ctx context.Context, key string) error {
+// Evict removes key from the cache unless it holds, or is about to hold,
+// bytes matching want. A download of key in flight expecting want is left
+// alone: it started on a cache miss. One expecting another digest is waited
+// out first, so its cache write can't land after the eviction, and what it
+// cached is kept if it matches want.
+func (r *Relay) Evict(ctx context.Context, key string, want Digest) error {
 	r.mu.Lock()
 	dl := r.inflight[key]
 	r.mu.Unlock()
 	if dl != nil {
+		if sameDigest(dl.want, want) {
+			return nil
+		}
 		if err := r.awaitEnd(ctx, dl); err != nil {
 			return err
+		}
+		dl.mu.Lock()
+		keep := dl.err == nil && check(want, dl.res) == nil
+		dl.mu.Unlock()
+		if keep {
+			return nil
 		}
 	}
 	return r.cache.Delete(ctx, key)
@@ -137,8 +149,11 @@ func New(cache *storage.Cache, tmpDir string, log *slog.Logger) (*Relay, error) 
 // entry. The returned size is -1 when unknown; hit reports a cache hit.
 //
 // Only a download expecting the same digest (sameDigest) is joined. One
-// expecting another is waited out instead; if what it cached doesn't match
-// want, the entry is dropped and the artifact fetched again.
+// found in flight expecting another is waited out instead; if what it cached
+// doesn't match want, the entry is dropped and the artifact fetched again.
+// A download that left the in-flight set between the cache miss and that
+// check isn't seen: its entry is a cache hit like any other, and a mismatch
+// fails that read as above.
 func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, onCommit func(context.Context, Result) error) (body io.ReadCloser, size int64, hit bool, err error) {
 	var dl *download
 	joined := false

@@ -104,7 +104,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   match its own digest. Before, it could be served bytes checked only against
   the other request's digest. When upstream declares a new checksum for a
   Composer dist whose old bytes are still being cached, the eviction now
-  waits for that write, so the next request no longer gets a broken transfer.
+  waits for that write, so their entry no longer outlives it. A request
+  arriving just as such a download finishes can still find the old bytes
+  cached; it then fails its transfer, as a mismatching cache hit always did.
 - `tailscale.state_dir` inside an `fs` store, or an `fs` store inside it, now
   fails validation, as docs/security.md said it would. Before, the cache could
   evict the node's keys.
