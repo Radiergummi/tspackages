@@ -54,12 +54,23 @@ func newTestSumDB(t *testing.T, signer string, mods map[string]string) *testSumD
 // serve replaces the database with a fresh one signed by signer that knows
 // mods ("path@version" → hash suffix).
 func (s *testSumDB) serve(signer string, mods map[string]string) {
+	recs := map[string]string{}
+	for pv, h := range mods {
+		path, vers, _ := strings.Cut(pv, "@")
+		recs[pv] = fmt.Sprintf("%s %s h1:zip%s=\n%s %s/go.mod h1:mod%s=\n", path, vers, h, path, vers, h)
+	}
+	s.serveRecords(signer, recs)
+}
+
+// serveRecords replaces the database with a fresh one signed by signer whose
+// records are recs ("path@version" → go.sum lines).
+func (s *testSumDB) serveRecords(signer string, recs map[string]string) {
 	ts := sumdb.NewTestServer(signer, func(path, vers string) ([]byte, error) {
-		h, ok := mods[path+"@"+vers]
+		r, ok := recs[path+"@"+vers]
 		if !ok {
 			return nil, os.ErrNotExist
 		}
-		return []byte(fmt.Sprintf("%s %s h1:zip%s=\n%s %s/go.mod h1:mod%s=\n", path, vers, h, path, vers, h)), nil
+		return []byte(r), nil
 	})
 	s.mu.Lock()
 	s.handler = sumdb.NewServer(ts)

@@ -18,6 +18,7 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
@@ -34,6 +35,8 @@ const (
 	maxList = 16 << 20
 	// maxInfo caps a .info or @latest body.
 	maxInfo = 64 << 10
+	// maxMod caps an upstream go.mod (cmd/go's codehost.MaxGoMod).
+	maxMod = 16 << 20
 )
 
 // notFoundMarker is cached for a miss the upstream answered with 404 or 410.
@@ -50,6 +53,7 @@ type RegistryOptions struct {
 	Records     *records.Store
 	TTL         time.Duration
 	MaxArtifact int64
+	Verifier    *Verifier                   // checks every .mod and .zip before it is cached
 	Wait        func(context.Context) error // called before every upstream request; nil = none
 	Log         *slog.Logger                // nil = slog.Default()
 }
@@ -57,7 +61,8 @@ type RegistryOptions struct {
 // RegistrySource passes through a GOPROXY. Version lists, @latest and
 // non-canonical .info answers are cached for the TTL and served stale when
 // the upstream fails; a canonical .info never changes and is cached for good.
-// Everything is validated before it is cached, and URLs are built from the
+// Everything is validated before it is cached: a .mod or .zip only once its
+// h1: hash matched the checksum database's line. URLs are built from the
 // module path and version, never taken from a response.
 type RegistrySource struct {
 	name   string
@@ -69,6 +74,11 @@ type RegistrySource struct {
 	wait   func(context.Context) error
 	log    *slog.Logger
 	now    func() time.Time // replaced in tests
+
+	relay       *relay.Relay
+	rec         *records.Store
+	verifier    *Verifier
+	maxArtifact int64
 
 	flight singleflight.Group
 
@@ -90,6 +100,7 @@ func NewRegistrySource(o RegistryOptions) *RegistrySource {
 	return &RegistrySource{
 		name: o.Name, claims: o.Claims, base: strings.TrimRight(o.BaseURL, "/"), c: o.Client, cache: o.Cache,
 		ttl: o.TTL, wait: o.Wait, log: o.Log, now: time.Now,
+		relay: o.Relay, rec: o.Records, verifier: o.Verifier, maxArtifact: o.MaxArtifact,
 	}
 }
 
@@ -164,14 +175,164 @@ func (s *RegistrySource) Latest(ctx context.Context, path string) (Info, error) 
 	return s.info(ctx, key, false, s.base+"/"+esc+"/@latest", path, "")
 }
 
-// Mod is not served yet.
-func (s *RegistrySource) Mod(context.Context, string, string) (Artifact, error) {
-	return Artifact{}, ErrUnavailable
+// artKey returns the cache key of a module version's file; ext is ".mod",
+// ".zip" or ".zip.sha256".
+func (s *RegistrySource) artKey(path, version, ext string) (string, error) {
+	vs, ok := versionSeg(version)
+	if !ok || len(vs)+len(".zip.sha256") > storage.MaxSegment {
+		return "", fmt.Errorf("%w: version too long", resolve.ErrNotFound)
+	}
+	return s.metaKey(path, vs+ext)
 }
 
-// Zip is not served yet.
-func (s *RegistrySource) Zip(context.Context, string, string) (Artifact, error) {
-	return Artifact{}, ErrUnavailable
+// artURL returns the upstream URL of a module version's file.
+func (s *RegistrySource) artURL(path, version, ext string) (string, error) {
+	esc, err := module.EscapePath(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", resolve.ErrNotFound, err) //nolint:errorlint // an unescapable path is a miss
+	}
+	escV, err := module.EscapeVersion(version)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", resolve.ErrNotFound, err) //nolint:errorlint // an unescapable version is a miss
+	}
+	return s.base + "/" + esc + "/@v/" + escV + ext, nil
+}
+
+// Mod returns the go.mod of a canonical version. A cached copy is served
+// without the checksum database; otherwise the database's line comes first,
+// and the upstream go.mod is cached only if its hash matches it.
+func (s *RegistrySource) Mod(ctx context.Context, path, version string) (Artifact, error) {
+	key, err := s.artKey(path, version, ".mod")
+	if err != nil {
+		return Artifact{}, err
+	}
+	rawURL, err := s.artURL(path, version, ".mod")
+	if err != nil {
+		return Artifact{}, err
+	}
+	if b, _, ok := s.readCached(ctx, key); ok {
+		metrics.ObserveCacheHit(ecoName, s.name)
+		return bytesArtifact(b), nil
+	}
+	b, err := flight.Do(ctx, &s.flight, key, func() ([]byte, error) {
+		l, err := s.verifier.Lookup(ctx, path, version)
+		if err != nil {
+			return nil, err
+		}
+		b, err := s.fetch(ctx, rawURL, maxMod, false, func(b []byte) ([]byte, error) { return b, nil })
+		if err != nil {
+			return nil, err
+		}
+		if b == nil {
+			return nil, fmt.Errorf("%w: no go.mod upstream for %s %s", resolve.ErrNotFound, path, version)
+		}
+		got, err := modHash(b)
+		if err != nil {
+			return nil, err
+		}
+		if got != l.ModHash {
+			return nil, fmt.Errorf("go.mod of %s %s hashes to %s, the checksum database says %s", path, version, got, l.ModHash)
+		}
+		if perr := s.cache.Put(ctx, key, bytes.NewReader(b)); perr != nil {
+			s.log.Warn("caching a go.mod failed", "source", s.name, "key", key, "error", perr)
+		}
+		return b, nil
+	})
+	if err != nil {
+		return Artifact{}, err
+	}
+	return bytesArtifact(b), nil
+}
+
+func bytesArtifact(b []byte) Artifact {
+	return Artifact{Body: io.NopCloser(bytes.NewReader(b)), Size: int64(len(b))}
+}
+
+// Zip streams the zip of a canonical version. A cached zip with its sha256
+// sidecar is served, re-checked against the sidecar, without the checksum
+// database; a cached zip without one is dropped as unverified. On a miss the
+// database's line comes first, then the download streams to the client
+// while its last byte is held back until the temp file passed verifyZip and
+// the sidecar and provenance are written; only then is the zip cached.
+func (s *RegistrySource) Zip(ctx context.Context, path, version string) (Artifact, error) {
+	key, err := s.artKey(path, version, ".zip")
+	if err != nil {
+		return Artifact{}, err
+	}
+	sideKey, err := s.artKey(path, version, ".zip.sha256")
+	if err != nil {
+		return Artifact{}, err
+	}
+	rawURL, err := s.artURL(path, version, ".zip")
+	if err != nil {
+		return Artifact{}, err
+	}
+	want, err := s.zipWant(ctx, key, sideKey)
+	if err != nil {
+		return Artifact{}, err
+	}
+	// fetch and onCommit run one after the other in the relay's download.
+	var l Lookup
+	fetch := func(ctx context.Context) (io.ReadCloser, int64, error) {
+		var err error
+		if l, err = s.verifier.Lookup(ctx, path, version); err != nil {
+			return nil, 0, err
+		}
+		if err := s.wait(ctx); err != nil {
+			return nil, 0, err
+		}
+		start := time.Now()
+		body, size, err := s.c.Open(ctx, rawURL, s.maxArtifact)
+		metrics.ObserveUpstream(s.name, time.Since(start))
+		if se, ok := errors.AsType[*upstream.StatusError](err); ok && se.Code == http.StatusGone {
+			return nil, 0, fmt.Errorf("%w: %v", resolve.ErrNotFound, err) //nolint:errorlint // 410 is a miss like 404
+		}
+		return body, size, err
+	}
+	onCommit := func(ctx context.Context, res relay.Result) error {
+		if err := verifyZip(res.Path, module.Version{Path: path, Version: version}, l.ZipHash); err != nil {
+			return err
+		}
+		if err := s.cache.Put(ctx, sideKey, strings.NewReader(res.SHA256)); err != nil {
+			return fmt.Errorf("cache zip sidecar: %w", err)
+		}
+		if err := s.rec.PutProvenance(ctx, records.Provenance{
+			Ecosystem: ecoName, Package: path, Version: version, Source: s.name, SourceType: "registry",
+			UpstreamURL: rawURL, DeclaredDigest: l.ZipHash, SHA1: res.SHA1, SHA256: res.SHA256,
+		}); err != nil {
+			return fmt.Errorf("record provenance: %w", err)
+		}
+		return nil
+	}
+	body, size, hit, err := s.relay.Open(ctx, key, want, fetch, onCommit)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if hit {
+		metrics.ObserveCacheHit(ecoName, s.name)
+	}
+	return Artifact{Body: body, Size: max(size, 0)}, nil
+}
+
+// zipWant returns the digest a cached zip must match: its sidecar's sha256
+// when both are cached, else none, after dropping a zip that has no sidecar
+// (the relay checks nothing against an empty digest).
+func (s *RegistrySource) zipWant(ctx context.Context, key, sideKey string) (relay.Digest, error) {
+	if side, _, ok := s.readCached(ctx, sideKey); ok && digest.IsHex(string(side), 64) {
+		rc, _, err := s.cache.Open(ctx, key)
+		if err == nil {
+			rc.Close()
+			return relay.Digest{SHA256: string(side)}, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return relay.Digest{}, err
+		}
+		return relay.Digest{}, nil
+	}
+	if err := s.relay.Evict(ctx, key, relay.Digest{}); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return relay.Digest{}, err
+	}
+	return relay.Digest{}, nil
 }
 
 func (s *RegistrySource) info(ctx context.Context, key string, immutable bool, rawURL, path, want string) (Info, error) {

@@ -1,19 +1,31 @@
 package goproxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
+	modzip "golang.org/x/mod/zip"
 
+	"github.com/radiergummi/tspackages/internal/records"
+	"github.com/radiergummi/tspackages/internal/relay"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/upstream"
@@ -315,16 +327,6 @@ func TestRegistryURLsEscaped(t *testing.T) {
 	}
 }
 
-func TestRegistryModZipUnavailable(t *testing.T) {
-	e := newRegEnv(t)
-	if _, err := e.src.Mod(context.Background(), "example.com/m", "v1.0.0"); !errors.Is(err, ErrUnavailable) {
-		t.Fatal(err)
-	}
-	if _, err := e.src.Zip(context.Background(), "example.com/m", "v1.0.0"); !errors.Is(err, ErrUnavailable) {
-		t.Fatal(err)
-	}
-}
-
 func mustSeg(s string) string { e, _ := seg(s); return e }
 
 func FuzzRegistryList(f *testing.F) {
@@ -371,4 +373,369 @@ func FuzzRegistryInfo(f *testing.F) {
 			t.Fatalf("want mismatch accepted: %q", out)
 		}
 	})
+}
+
+// testModule is a module version as a GOPROXY serves it.
+type testModule struct {
+	path, version string
+	gomod, zip    []byte
+}
+
+func newTestModule(t testing.TB, path, version string) testModule {
+	t.Helper()
+	dir := t.TempDir()
+	gomod := []byte("module " + path + "\n\ngo 1.22\n")
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), gomod, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m.go"), []byte("package m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := modzip.CreateFromDir(&buf, module.Version{Path: path, Version: version}, dir); err != nil {
+		t.Fatal(err)
+	}
+	return testModule{path: path, version: version, gomod: gomod, zip: buf.Bytes()}
+}
+
+// record returns the checksum database record for m's go.mod and zip.
+func (m testModule) record(t testing.TB) string {
+	t.Helper()
+	zh, err := dirhash.HashZip(writeTemp(t, m.zip), dirhash.Hash1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mh, err := modHash(m.gomod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%s %s %s\n%s %s/go.mod %s\n", m.path, m.version, zh, m.path, m.version, mh)
+}
+
+func (m testModule) url(ext string) string {
+	p, _ := module.EscapePath(m.path)
+	v, _ := module.EscapeVersion(m.version)
+	return "/" + p + "/@v/" + v + ext
+}
+
+type artEnv struct {
+	sum *sumEnv
+	px  *fakeProxy
+	rl  *relay.Relay
+	rec *records.Store
+	src *RegistrySource
+	c   *upstream.Client
+}
+
+// newArtEnv serves mods from a fake proxy; the test database knows the
+// records in recs ("path@version" → go.sum lines).
+func newArtEnv(t *testing.T, recs map[string]string, mods ...testModule) *artEnv {
+	t.Helper()
+	sum := newSumEnv(t)
+	sum.db.serveRecords(sum.signer, recs)
+	px := newFakeProxy(t)
+	for _, m := range mods {
+		px.set(m.url(".mod"), textCT, string(m.gomod))
+		px.set(m.url(".zip"), "application/zip", string(m.zip))
+	}
+	rl, err := relay.New(sum.cache, filepath.Join(t.TempDir(), "relay"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1"}, AllowPrivateForTesting: true})
+	e := &artEnv{sum: sum, px: px, rl: rl, rec: records.New(sum.state), c: c}
+	e.src = NewRegistrySource(RegistryOptions{
+		Name: "proxy", BaseURL: px.srv.URL, Client: c, Cache: sum.cache, Relay: rl, Records: e.rec,
+		Verifier: sum.verifier(), TTL: time.Minute, MaxArtifact: 64 << 20,
+	})
+	return e
+}
+
+func recordsOf(t testing.TB, mods ...testModule) map[string]string {
+	t.Helper()
+	recs := map[string]string{}
+	for _, m := range mods {
+		recs[m.path+"@"+m.version] = m.record(t)
+	}
+	return recs
+}
+
+func readArtifact(a Artifact, err error) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer a.Body.Close()
+	return io.ReadAll(a.Body)
+}
+
+func (e *artEnv) key(t testing.TB, m testModule, ext string) string {
+	t.Helper()
+	k, err := e.src.artKey(m.path, m.version, ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func (e *artEnv) cached(t testing.TB, key string) ([]byte, bool) {
+	t.Helper()
+	rc, _, err := e.sum.cache.Open(context.Background(), key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b, true
+}
+
+func TestRegistryZipVerified(t *testing.T) {
+	for _, mv := range []module.Version{
+		{Path: "example.com/m", Version: "v1.0.0"},
+		{Path: "golang.org/toolchain", Version: "v0.0.1-go1.27.4.linux-amd64"},
+	} {
+		t.Run(mv.Path, func(t *testing.T) {
+			m := newTestModule(t, mv.Path, mv.Version)
+			e := newArtEnv(t, recordsOf(t, m), m)
+			ctx := context.Background()
+			got, err := readArtifact(e.src.Zip(ctx, m.path, m.version))
+			if err != nil || !bytes.Equal(got, m.zip) {
+				t.Fatalf("zip: %d bytes, %v", len(got), err)
+			}
+			if got, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.gomod) {
+				t.Fatalf("mod: %q, %v", got, err)
+			}
+			e.rl.Wait()
+			sum := sha256.Sum256(m.zip)
+			sha := hex.EncodeToString(sum[:])
+			if z, ok := e.cached(t, e.key(t, m, ".zip")); !ok || !bytes.Equal(z, m.zip) {
+				t.Fatal("zip not cached")
+			}
+			if s, ok := e.cached(t, e.key(t, m, ".zip.sha256")); !ok || string(s) != sha {
+				t.Fatalf("sidecar %q", s)
+			}
+			if b, ok := e.cached(t, e.key(t, m, ".mod")); !ok || !bytes.Equal(b, m.gomod) {
+				t.Fatal("go.mod not cached")
+			}
+			p, err := e.rec.GetProvenance(ctx, "go", m.path, m.version, sha)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zh := strings.Fields(m.record(t))[2]
+			if p.SourceType != "registry" || p.Source != "proxy" || p.DeclaredDigest != zh || !strings.HasPrefix(zh, "h1:") ||
+				p.UpstreamURL != e.px.srv.URL+m.url(".zip") || p.SHA256 != sha {
+				t.Fatalf("provenance %+v", p)
+			}
+			// Served from the cache from now on.
+			for range 2 {
+				if got, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.zip) {
+					t.Fatalf("cached zip: %v", err)
+				}
+				if got, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.gomod) {
+					t.Fatalf("cached mod: %v", err)
+				}
+			}
+			if e.px.count(m.url(".zip")) != 1 || e.px.count(m.url(".mod")) != 1 {
+				t.Fatalf("upstream fetched %d zips, %d go.mods", e.px.count(m.url(".zip")), e.px.count(m.url(".mod")))
+			}
+		})
+	}
+}
+
+// localData returns the offset of the first entry's data in z.
+func localData(t testing.TB, z []byte) int {
+	t.Helper()
+	if binary.LittleEndian.Uint32(z) != 0x04034b50 {
+		t.Fatal("no local header")
+	}
+	return 30 + int(binary.LittleEndian.Uint16(z[26:])) + int(binary.LittleEndian.Uint16(z[28:]))
+}
+
+func TestRegistryZipTampered(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	flipped := bytes.Clone(m.zip)
+	flipped[localData(t, flipped)+1] ^= 0xff
+	// A well-formed zip of the same version with other contents.
+	other := manyEntryZip(t, 1, func(int) string { return "example.com/m@v1.0.0/go.mod" })
+	for name, bad := range map[string][]byte{"byte flipped": flipped, "other contents": other} {
+		t.Run(name, func(t *testing.T) {
+			e := newArtEnv(t, recordsOf(t, m), m)
+			e.px.set(m.url(".zip"), "application/zip", string(bad))
+			got, err := readArtifact(e.src.Zip(context.Background(), m.path, m.version))
+			if err == nil || len(got) >= len(bad) {
+				t.Fatalf("tampered zip served: %d of %d bytes, %v", len(got), len(bad), err)
+			}
+			e.rl.Wait()
+			if _, ok := e.cached(t, e.key(t, m, ".zip")); ok {
+				t.Fatal("tampered zip cached")
+			}
+			if _, ok := e.cached(t, e.key(t, m, ".zip.sha256")); ok {
+				t.Fatal("sidecar written for a tampered zip")
+			}
+		})
+	}
+}
+
+func TestRegistryZipTooManyEntries(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	prefix := m.path + "@" + m.version + "/"
+	m.zip = manyEntryZip(t, maxZipEntries+1, func(i int) string { return fmt.Sprintf("%sf%d", prefix, i) })
+	e := newArtEnv(t, map[string]string{m.path + "@" + m.version: m.record(t)}, m)
+	got, err := readArtifact(e.src.Zip(context.Background(), m.path, m.version))
+	if err == nil || len(got) >= len(m.zip) {
+		t.Fatalf("zip of %d entries served: %d of %d bytes, %v", maxZipEntries+1, len(got), len(m.zip), err)
+	}
+	e.rl.Wait()
+	if _, ok := e.cached(t, e.key(t, m, ".zip")); ok {
+		t.Fatal("zip cached")
+	}
+	if _, ok := e.cached(t, e.key(t, m, ".zip.sha256")); ok {
+		t.Fatal("sidecar cached")
+	}
+}
+
+func TestRegistryZipWithoutSidecarRefetched(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	ctx := context.Background()
+	// A zip in the cache that nothing verified.
+	if err := e.sum.cache.Put(ctx, e.key(t, m, ".zip"), strings.NewReader("not verified")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readArtifact(e.src.Zip(ctx, m.path, m.version))
+	if err != nil || !bytes.Equal(got, m.zip) {
+		t.Fatalf("zip: %q, %v", got, err)
+	}
+	if e.px.count(m.url(".zip")) != 1 {
+		t.Fatal("upstream not fetched")
+	}
+	e.rl.Wait()
+	sum := sha256.Sum256(m.zip)
+	if s, ok := e.cached(t, e.key(t, m, ".zip.sha256")); !ok || string(s) != hex.EncodeToString(sum[:]) {
+		t.Fatalf("sidecar %q", s)
+	}
+	if z, _ := e.cached(t, e.key(t, m, ".zip")); !bytes.Equal(z, m.zip) {
+		t.Fatal("verified zip not cached")
+	}
+}
+
+func TestRegistryCachedServedWhenSumDBDown(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	m2 := newTestModule(t, "example.com/m", "v1.1.0")
+	e := newArtEnv(t, recordsOf(t, m, m2), m, m2)
+	ctx := context.Background()
+	if _, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil {
+		t.Fatal(err)
+	}
+	e.rl.Wait()
+	// A verifier that can't reach any database and knows nothing.
+	e.sum.db.srv.Close()
+	fresh := newSumEnv(t)
+	fresh.db.srv.Close()
+	e.src.verifier = NewVerifier(VerifierOptions{Key: e.sum.key, URL: fresh.db.srv.URL, Client: e.c, State: fresh.state, Cache: fresh.cache, TTL: time.Minute})
+	if got, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.zip) {
+		t.Fatalf("cached zip: %v", err)
+	}
+	if got, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.gomod) {
+		t.Fatalf("cached mod: %v", err)
+	}
+	for name, f := range map[string]func(context.Context, string, string) (Artifact, error){"zip": e.src.Zip, "mod": e.src.Mod} {
+		if _, err := readArtifact(f(ctx, m2.path, m2.version)); err == nil || errors.Is(err, resolve.ErrNotFound) {
+			t.Fatalf("uncached %s with the database down: %v", name, err)
+		}
+	}
+	if e.px.count(m2.url(".zip")) != 0 || e.px.count(m2.url(".mod")) != 0 {
+		t.Fatal("upstream fetched without a checksum database answer")
+	}
+}
+
+func TestRegistryModMismatch(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	ctx := context.Background()
+	e.px.set(m.url(".mod"), textCT, "module example.com/m\n\ngo 1.23\n")
+	_, err := readArtifact(e.src.Mod(ctx, m.path, m.version))
+	if err == nil || resolve.HTTPStatus(resolve.Wrap("proxy", err)) != http.StatusBadGateway {
+		t.Fatalf("mismatching go.mod: %v", err)
+	}
+	if _, ok := e.cached(t, e.key(t, m, ".mod")); ok {
+		t.Fatal("mismatching go.mod cached")
+	}
+	e.px.set(m.url(".mod"), textCT, string(m.gomod))
+	if got, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.gomod) {
+		t.Fatalf("mod: %q, %v", got, err)
+	}
+}
+
+func TestRegistryModTooLarge(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	e.px.set(m.url(".mod"), textCT, strings.Repeat("x", maxMod+1))
+	if _, err := readArtifact(e.src.Mod(context.Background(), m.path, m.version)); !errors.Is(err, upstream.ErrTooLarge) {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistryNoSumDBLine(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, nil, m)
+	ctx := context.Background()
+	for name, f := range map[string]func(context.Context, string, string) (Artifact, error){"zip": e.src.Zip, "mod": e.src.Mod} {
+		_, err := readArtifact(f(ctx, m.path, m.version))
+		if !errors.Is(err, resolve.ErrNotFound) || resolve.HTTPStatus(resolve.Wrap("proxy", err)) != http.StatusNotFound {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if e.px.count(m.url(".zip")) != 0 || e.px.count(m.url(".mod")) != 0 {
+		t.Fatal("upstream fetched for a version the database doesn't know")
+	}
+}
+
+func TestRegistryUpstreamMissIsNotFound(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m))
+	e.px.mu.Lock()
+	e.px.pages[m.url(".zip")] = fakePage{status: http.StatusGone, body: "gone"}
+	e.px.mu.Unlock()
+	ctx := context.Background()
+	for name, f := range map[string]func(context.Context, string, string) (Artifact, error){"zip": e.src.Zip, "mod": e.src.Mod} {
+		if _, err := readArtifact(f(ctx, m.path, m.version)); !errors.Is(err, resolve.ErrNotFound) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestRegistrySecurityErrorFailsClosed(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	m2 := newTestModule(t, "example.com/m", "v1.1.0")
+	e := newArtEnv(t, recordsOf(t, m, m2), m, m2)
+	ctx := context.Background()
+	if _, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readArtifact(e.src.Mod(ctx, m.path, m.version)); err != nil {
+		t.Fatal(err)
+	}
+	e.rl.Wait()
+	(&verifierOps{v: e.src.verifier}).SecurityError("injected fork")
+	for name, f := range map[string]func(context.Context, string, string) (Artifact, error){"zip": e.src.Zip, "mod": e.src.Mod} {
+		if _, err := readArtifact(f(ctx, m.path, m.version)); err != nil {
+			t.Fatalf("cached %s: %v", name, err)
+		}
+		_, err := readArtifact(f(ctx, m2.path, m2.version))
+		if resolve.HTTPStatus(resolve.Wrap("proxy", err)) != http.StatusBadGateway {
+			t.Fatalf("uncached %s: %v", name, err)
+		}
+	}
+	if e.px.count(m2.url(".zip")) != 0 || e.px.count(m2.url(".mod")) != 0 {
+		t.Fatal("upstream fetched after a security error")
+	}
 }
