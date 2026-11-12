@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -79,10 +80,21 @@ func TestGoClaims(t *testing.T) {
 }
 
 func TestGoGitClaimRestrictions(t *testing.T) {
-	for _, c := range []string{"*", "*.com/x", "github.com", "github.com/*", "github.com/ac*", "gitlab.com/*", "bitbucket.org/x*"} {
-		got := goErrs(t, goGit([]string{c}, mods("github.com/acme/x", "https://github.com/acme/x.git")))
-		if !strings.Contains(got, "claim") {
-			t.Errorf("claim %q: errors %q", c, got)
+	for _, tc := range []struct{ claim, key, reason string }{
+		{"*", "github.com/acme/x", "covers every module"},
+		{"*.com/x", "a.com/x", "has a wildcard in the host"},
+		{"github.com", "github.com", "must name the owner under github.com"},
+		{"github.com/*", "github.com/acme/x", "must name the owner under github.com"},
+		{"github.com/ac*", "github.com/acme", "must name the owner under github.com"},
+		{"gitlab.com/*", "gitlab.com/acme/x", "must name the owner under gitlab.com"},
+		{"bitbucket.org/x*", "bitbucket.org/xy", "must name the owner under bitbucket.org"},
+	} {
+		got := goErrs(t, goGit([]string{tc.claim}, mods(tc.key, "https://h/x.git")))
+		if !strings.Contains(got, "claim "+strconv.Quote(tc.claim)+" "+tc.reason) {
+			t.Errorf("claim %q: errors %q", tc.claim, got)
+		}
+		if strings.Contains(got, "matched by no claim") {
+			t.Errorf("claim %q: fixture key %q is unclaimed: %q", tc.claim, tc.key, got)
 		}
 	}
 	got := goErrs(t, goGit([]string{"github.com/acme/*"}, mods("github.com/x*", "https://github.com/x.git")))
@@ -112,6 +124,14 @@ func TestGoMatch(t *testing.T) {
 		{"github.com/ac*/x", "github.com/ac/me/x", false},
 		{"*", "a/b/c", true},
 		{"github.com/acme", "github.com/acme", true},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v2", true},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v10", true},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v1", false},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v2x", false},
+		{"go.acme.dev/sdk", "go.acme.dev/sdkv2", false},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v2/x", false},
+		{"go.acme.dev/*", "go.acme.dev/x/v2", true},
+		{"gopkg.in/yaml", "gopkg.in/yaml.v3", false},
 	} {
 		if got := GoMatch(tc.pattern, tc.path); got != tc.want {
 			t.Errorf("GoMatch(%q, %q) = %v", tc.pattern, tc.path, got)

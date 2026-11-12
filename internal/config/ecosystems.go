@@ -136,11 +136,23 @@ func ValidGoPattern(p string) bool {
 func goOpen(segs []string) bool { return len(segs) > 1 && segs[len(segs)-1] == "*" }
 
 // GoMatch reports whether the lowercased module path matches the valid
-// pattern. It is goproxy.Match.
+// pattern. A modules entry serves every major version, so a trailing "/vN"
+// (N >= 2, as module.SplitPathVersion splits it; not gopkg.in ".vN") is
+// dropped before matching, and a path also matches when the pattern fits the
+// path with its suffix: "go.acme.dev/sdk" matches "go.acme.dev/sdk/v2" but
+// not "go.acme.dev/sdk/v1" or "go.acme.dev/sdkv2". It is goproxy.Match.
 func GoMatch(pattern, p string) bool {
 	if pattern == "*" {
 		return true
 	}
+	if goMatchExact(pattern, p) {
+		return true
+	}
+	prefix, major, ok := module.SplitPathVersion(p)
+	return ok && strings.HasPrefix(major, "/") && goMatchExact(pattern, prefix)
+}
+
+func goMatchExact(pattern, p string) bool {
 	ps, xs := strings.Split(pattern, "/"), strings.Split(p, "/")
 	if goOpen(ps) {
 		n := len(ps)
