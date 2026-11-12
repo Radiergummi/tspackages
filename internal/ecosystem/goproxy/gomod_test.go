@@ -222,6 +222,18 @@ func TestFindModuleIOError(t *testing.T) {
 	}
 }
 
+// A missing commit wraps resolve.ErrNotFound too, but is an error, not
+// "no go.mod".
+func TestFindModuleMissingCommit(t *testing.T) {
+	read := func(string) ([]byte, error) {
+		return nil, fmt.Errorf("x: %w: %w", gitmirror.ErrNoCommit, resolve.ErrNotFound)
+	}
+	_, reason, err := findModule(read, Module{Path: "github.com/acme/sdk"}, "github.com/acme/sdk")
+	if !errors.Is(err, gitmirror.ErrNoCommit) || reason != "" {
+		t.Fatalf("reason %q, err %v; want ErrNoCommit", reason, err)
+	}
+}
+
 func TestFindModuleWrongModule(t *testing.T) {
 	for _, p := range []string{"github.com/acme/other", "github.com/acme/sdk/v1", "github.com/acme/sdkv2", "github.com/acme/sdk/x"} {
 		_, _, err := findModule(readMap(nil), Module{Path: "github.com/acme/sdk"}, p)

@@ -378,6 +378,12 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 // ErrTooLarge is wrapped by ReadFile and ReadFileMax for a file over the cap.
 var ErrTooLarge = errors.New("file over the read limit")
 
+// ErrNoCommit is wrapped, together with resolve.ErrNotFound, by ReadFile and
+// ReadFileMax when the commit itself is missing, so callers can tell it from
+// a missing path (a mirror re-created from a remote that dropped the commit
+// is not the commit's content).
+var ErrNoCommit = errors.New("commit not in the mirror")
+
 // ReadFile returns the content of the regular file path at commit. A missing
 // path or commit wraps resolve.ErrNotFound; files over 1 MiB wrap ErrTooLarge
 // (this is for small manifests such as composer.json and go.mod).
@@ -386,8 +392,8 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 }
 
 // ReadFileMax is ReadFile with the cap max: a missing path or commit, or a
-// path naming a tree or gitlink, wraps resolve.ErrNotFound; a blob over max
-// wraps ErrTooLarge. A symlink's blob (its target text) is returned as is.
+// path naming a tree or gitlink, wraps resolve.ErrNotFound (a missing commit
+// also wraps ErrNoCommit); a blob over max wraps ErrTooLarge. A symlink's blob (its target text) is returned as is.
 func (m *Mirror) ReadFileMax(ctx context.Context, commit, path string, max int64) ([]byte, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
@@ -413,8 +419,11 @@ func (m *Mirror) ReadFileMax(ctx context.Context, commit, path string, max int64
 	if len(lines) != 2 {
 		return nil, fmt.Errorf("gitmirror: unexpected cat-file output %q", out)
 	}
+	if strings.HasSuffix(lines[0], " missing") {
+		return nil, fmt.Errorf("gitmirror: %s: %w: %w", commit, ErrNoCommit, resolve.ErrNotFound)
+	}
 	notFound := fmt.Errorf("gitmirror: %s:%s: %w", commit, path, resolve.ErrNotFound)
-	if strings.HasSuffix(lines[0], " missing") || strings.HasSuffix(lines[1], " missing") {
+	if strings.HasSuffix(lines[1], " missing") {
 		return nil, notFound
 	}
 	f := strings.Fields(lines[1]) // <sha> <type> <size>

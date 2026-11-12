@@ -70,15 +70,15 @@ func TestCountZipEntries(t *testing.T) {
 	if zr, err := zip.NewReader(bytes.NewReader(wrapped), int64(len(wrapped))); err != nil || len(zr.File) != 70_000 {
 		t.Fatalf("archive/zip: %v", err)
 	}
-	if n, err := countZipEntries(writeTemp(t, wrapped)); err != nil || n != 70_000 {
+	if n, err := countZipEntries(writeTemp(t, wrapped), maxZipEntries); err != nil || n != 70_000 {
 		t.Fatalf("wrapped: %d, %v", n, err)
 	}
 
 	// Over the cap, written with zip64 end records.
-	if n, err := countZipEntries(writeTemp(t, manyEntryZip(t, maxZipEntries+1, short))); err == nil {
+	if n, err := countZipEntries(writeTemp(t, manyEntryZip(t, maxZipEntries+1, short)), maxZipEntries); err == nil {
 		t.Fatalf("over the cap: %d entries accepted", n)
 	}
-	if n, err := countZipEntries(writeTemp(t, manyEntryZip(t, maxZipEntries, short))); err != nil || n != maxZipEntries {
+	if n, err := countZipEntries(writeTemp(t, manyEntryZip(t, maxZipEntries, short)), maxZipEntries); err != nil || n != maxZipEntries {
 		t.Fatalf("at the cap: %d, %v", n, err)
 	}
 
@@ -87,15 +87,15 @@ func TestCountZipEntries(t *testing.T) {
 	hdr := uint32(46 + len("f2"))
 	end := three[len(three)-22:]
 	full := binary.LittleEndian.Uint32(end[12:])
-	if n, err := countZipEntries(writeTemp(t, plainEnd(t, three, 3, full-hdr))); err == nil {
+	if n, err := countZipEntries(writeTemp(t, plainEnd(t, three, 3, full-hdr)), maxZipEntries); err == nil {
 		t.Fatalf("truncated directory: %d entries accepted", n)
 	}
-	if n, err := countZipEntries(writeTemp(t, plainEnd(t, three, 3, full))); err != nil || n != 3 {
+	if n, err := countZipEntries(writeTemp(t, plainEnd(t, three, 3, full)), maxZipEntries); err != nil || n != 3 {
 		t.Fatalf("intact: %d, %v", n, err)
 	}
 
 	// No end record.
-	if _, err := countZipEntries(writeTemp(t, three[:len(three)-22])); err == nil {
+	if _, err := countZipEntries(writeTemp(t, three[:len(three)-22]), maxZipEntries); err == nil {
 		t.Fatal("no end record accepted")
 	}
 }

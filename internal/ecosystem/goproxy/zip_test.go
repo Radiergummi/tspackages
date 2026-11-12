@@ -17,6 +17,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/resolve"
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 // archEntry is an entry of a fake git archive, named without "prefix/".
@@ -270,4 +271,101 @@ func TestBuildZipNoTempLeft(t *testing.T) {
 			}
 		})
 	}
+}
+
+// emptyDir fails unless dir holds nothing.
+func emptyDir(t *testing.T, dir string) {
+	t.Helper()
+	if ents, err := os.ReadDir(dir); err != nil || len(ents) != 0 {
+		t.Fatalf("%s holds %v, %v", dir, ents, err)
+	}
+}
+
+// git archive writes an entry for every tree it walks, and shared trees
+// make that many more than ls-tree -r lists, so the archive's entries are
+// counted (directories included) before archive/zip loads them.
+func TestBuildZipEntryCap(t *testing.T) {
+	data := manyEntryZip(t, maxArchiveEntries+1, func(i int) string { return fmt.Sprintf("prefix/d%d/", i) })
+	in := buildInput(t, "example.com/m", "", func(_ context.Context, w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+	_, _, err := BuildZip(t.Context(), in)
+	wantRefusal(t, err, fmt.Sprintf("archive over %d entries", maxArchiveEntries))
+	emptyDir(t, in.TmpDir)
+}
+
+// Many directories sharing one tree, with few distinct files, stay under the
+// cap and build.
+func TestBuildZipSharedTreesBuild(t *testing.T) {
+	src := t.TempDir()
+	testutil.Git(t, src, "init", "-q")
+	writeFiles(t, src, map[string]string{"go.mod": "module example.com/m\n"})
+	chain := strings.Repeat("a/", 10) + "f.go"
+	for i := range 300 {
+		writeFiles(t, src, map[string]string{fmt.Sprintf("d%03d/%s", i, chain): "package a\n"})
+	}
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "fan-out")
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m, err := gitmirror.New(gitmirror.Options{Remote: "file://" + src, BaseDir: t.TempDir(), AllowFileRemotesForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	in := buildInput(t, "example.com/m", "", func(ctx context.Context, w io.Writer) error {
+		return m.ArchiveModuleZip(ctx, commit, "", w)
+	})
+	path, _, err := BuildZip(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := zipFiles(t, path); len(got) != 301 {
+		t.Fatalf("zip has %d files, want 301", len(got))
+	}
+}
+
+func TestBuildZipInsecurePathRefuses(t *testing.T) {
+	t.Setenv("GODEBUG", "zipinsecurepath=0")
+	in := buildInput(t, "example.com/m", "", fakeArchive(t,
+		archEntry{name: "go.mod", body: "module example.com/m\n"},
+		archEntry{name: `a\b.go`, body: "package m\n"}))
+	_, _, err := BuildZip(t.Context(), in)
+	wantRefusal(t, err, "zip: ")
+	emptyDir(t, in.TmpDir)
+}
+
+// A missing commit is an error to retry, not an absent LICENSE.
+func TestBuildZipLicenseMissingCommit(t *testing.T) {
+	in := buildInput(t, "example.com/m/tools", "tools", fakeArchive(t,
+		archEntry{name: "tools/go.mod", body: "module example.com/m/tools\n"}))
+	in.License = func(context.Context) ([]byte, error) {
+		return nil, fmt.Errorf("x: %w: %w", gitmirror.ErrNoCommit, resolve.ErrNotFound)
+	}
+	_, _, err := BuildZip(t.Context(), in)
+	var r *RefusalError
+	if errors.As(err, &r) || !errors.Is(err, gitmirror.ErrNoCommit) {
+		t.Fatalf("err = %v, want ErrNoCommit and no refusal", err)
+	}
+	emptyDir(t, in.TmpDir)
+}
+
+// A context cancelled while Create reads the files is not a refusal.
+func TestBuildZipCancelledDuringCreate(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	archive := fakeArchive(t,
+		archEntry{name: "go.mod", body: "module example.com/m\n"},
+		archEntry{name: "a.go", body: "package m\n"})
+	in := buildInput(t, "example.com/m", "", func(_ context.Context, w io.Writer) error {
+		defer cancel() // the archive is complete; Create runs cancelled
+		return archive(t.Context(), w)
+	})
+	_, _, err := BuildZip(ctx, in)
+	var r *RefusalError
+	if errors.As(err, &r) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled and no refusal", err)
+	}
+	emptyDir(t, in.TmpDir)
 }

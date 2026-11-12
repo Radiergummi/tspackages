@@ -63,8 +63,9 @@ const reasonGoModTooLarge = "go.mod over 16 MiB"
 // only its major suffix. modPath is mod.Path or mod.Path+"/vN".
 //
 // read returns the file at the commit, wrapping resolve.ErrNotFound when it
-// is absent and gitmirror.ErrTooLarge over MaxGoMod. A non-empty reason is a
-// skip; a go.mod over MaxGoMod is a *RefusalError. With either, f.Dir is the
+// is absent and gitmirror.ErrTooLarge over MaxGoMod; a missing commit
+// (gitmirror.ErrNoCommit) is returned as an error, never taken for a missing
+// go.mod. A non-empty reason is a skip; a go.mod over MaxGoMod is a *RefusalError. With either, f.Dir is the
 // directory concerned and f.GoMod is nil. Any other error is read's.
 func findModule(read func(file string) ([]byte, error), mod Module, modPath string) (f Found, reason string, err error) {
 	pathMajor, err := requestedMajor(mod.Path, modPath)
@@ -159,6 +160,8 @@ func readGoMod(read func(string) ([]byte, error), dir string) (data []byte, ok b
 	switch {
 	case err == nil:
 		return data, true, nil
+	case errors.Is(err, gitmirror.ErrNoCommit):
+		return nil, false, err
 	case errors.Is(err, resolve.ErrNotFound):
 		return nil, false, nil
 	case errors.Is(err, gitmirror.ErrTooLarge):

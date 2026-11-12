@@ -29,6 +29,9 @@ const (
 	// GoZipFormat is the version of the zip algorithm below, recorded with
 	// every stored zip.
 	GoZipFormat = 1
+	// maxArchiveEntries caps the git archive's entries, directories
+	// included, before archive/zip loads them all.
+	maxArchiveEntries = 2 * gitmirror.MaxTreeEntries
 )
 
 // ZipResult describes a built module zip.
@@ -48,7 +51,8 @@ type BuildInput struct {
 	Archive func(ctx context.Context, w io.Writer) error
 	// License returns the repository root's LICENSE at the commit
 	// (ReadFileMax with MaxLICENSE): resolve.ErrNotFound when it is missing or
-	// not a blob, gitmirror.ErrTooLarge over the cap.
+	// not a blob, gitmirror.ErrNoCommit as well when the commit is missing,
+	// gitmirror.ErrTooLarge over the cap.
 	License  func(ctx context.Context) ([]byte, error)
 	TmpDir   string // <work_dir>/go-build
 	MaxBytes int64  // min(MaxArchiveBytes, max_artifact_bytes)
@@ -62,7 +66,7 @@ type BuildInput struct {
 // caller removes it) and hashes. Nothing is held in memory.
 //
 // A *RefusalError is derived from the commit's content: the archive over
-// MaxBytes, a root LICENSE over MaxLICENSE, or a zip that modzip.Create
+// MaxBytes or maxArchiveEntries, a root LICENSE over MaxLICENSE, or a zip that modzip.Create
 // rejects. Every other error (I/O, context, Archive's own, git archive
 // failing with gitmirror.ErrArchiveFailed) is returned as is; the caller
 // decides whether to retry.
@@ -73,11 +77,24 @@ func BuildZip(ctx context.Context, in BuildInput) (path string, res ZipResult, e
 	}
 	defer os.Remove(archive)
 
-	zr, err := zip.OpenReader(archive)
-	if err != nil {
+	// git archive writes an entry for every tree it walks, and identical
+	// trees are shared, so the tree cap doesn't bound this count.
+	if n, err := countZipEntries(archive, maxArchiveEntries); n > maxArchiveEntries {
+		return "", ZipResult{}, &RefusalError{Reason: fmt.Sprintf("archive over %d entries", maxArchiveEntries)}
+	} else if err != nil {
 		return "", ZipResult{}, fmt.Errorf("goproxy: read git archive: %w", err)
 	}
-	defer zr.Close()
+	zr, err := zip.OpenReader(archive)
+	if zr != nil {
+		defer zr.Close()
+	}
+	switch {
+	case errors.Is(err, zip.ErrInsecurePath):
+		// Only with GODEBUG=zipinsecurepath=0: a name such as a\b.go.
+		return "", ZipResult{}, &RefusalError{Reason: "zip: " + err.Error()}
+	case err != nil:
+		return "", ZipResult{}, fmt.Errorf("goproxy: read git archive: %w", err)
+	}
 
 	rec := &ioRecorder{ctx: ctx}
 	files, err := moduleFiles(ctx, in, zr.File, rec)
@@ -213,13 +230,14 @@ func moduleFiles(ctx context.Context, in BuildInput, entries []*zip.File, rec *i
 	if haveLICENSE || subdir == "" {
 		return files, nil
 	}
-	// Archive succeeded for this commit, so resolve.ErrNotFound here means
-	// the path is missing or not a blob, never a missing commit (mirrors keep
-	// their objects: gc.auto=0, fetch --prune drops only refs).
+	// A missing commit (a mirror re-created from a remote that dropped it)
+	// is an error to retry; only a missing path or non-blob is absent.
 	data, err := in.License(ctx)
 	switch {
 	case err == nil:
 		return append(files, dataFile{name: "LICENSE", data: data}), nil
+	case errors.Is(err, gitmirror.ErrNoCommit):
+		return nil, err
 	case errors.Is(err, resolve.ErrNotFound):
 		return files, nil
 	case errors.Is(err, gitmirror.ErrTooLarge):

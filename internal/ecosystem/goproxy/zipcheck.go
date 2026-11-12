@@ -32,7 +32,7 @@ const (
 )
 
 // countZipEntries walks the central directory of the zip at path in
-// constant memory and fails once it has seen maxZipEntries+1 headers.
+// constant memory and fails once it has seen limit+1 headers.
 //
 // archive/zip reads directory headers until one fails to parse, past the
 // declared count, and compares only the low 16 bits of the two; it loads
@@ -40,7 +40,7 @@ const (
 // does and reads headers the same way, keeping only a count. A directory
 // that isn't where the end record puts it (archive/zip would guess a base
 // offset) is refused; module zips never have one.
-func countZipEntries(path string) (int, error) {
+func countZipEntries(path string, limit int) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -80,8 +80,8 @@ func countZipEntries(path string) (int, error) {
 			return n, err
 		}
 		n++
-		if n > maxZipEntries {
-			return n, fmt.Errorf("zip has more than %d entries", maxZipEntries)
+		if n > limit {
+			return n, fmt.Errorf("zip has more than %d entries", limit)
 		}
 	}
 	if uint16(n) != uint16(records) { //nolint:gosec // archive/zip compares 16 bits
@@ -149,7 +149,7 @@ func zipDirectoryEnd(r io.ReaderAt, size int64) (endOff int64, records, dirSize,
 // verifyZip runs countZipEntries, modzip.CheckZip and dirhash.HashZip, and
 // fails unless the hash equals want.
 func verifyZip(path string, mv module.Version, want string) error {
-	if _, err := countZipEntries(path); err != nil {
+	if _, err := countZipEntries(path, maxZipEntries); err != nil {
 		return err
 	}
 	if _, err := modzip.CheckZip(mv, path); err != nil {

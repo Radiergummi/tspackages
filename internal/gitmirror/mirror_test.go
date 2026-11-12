@@ -953,6 +953,14 @@ func TestReadFileMax(t *testing.T) {
 	if _, err := m.ReadFileMax(ctx, commit, "src", 16<<20); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("directory: %v", err)
 	}
+	if _, err := m.ReadFileMax(ctx, commit, "nope", 16<<20); !errors.Is(err, resolve.ErrNotFound) || errors.Is(err, ErrNoCommit) {
+		t.Errorf("missing path: %v", err)
+	}
+	// A missing commit is told apart from a missing path, and still wraps
+	// resolve.ErrNotFound for callers that don't care.
+	if _, err := m.ReadFileMax(ctx, strings.Repeat("0", 40), "LICENSE", 16<<20); !errors.Is(err, ErrNoCommit) || !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("missing commit: %v", err)
+	}
 	if b, err := m.ReadFileMax(ctx, commit, "LICENSE", 16<<20); err != nil || string(b) != "COPYING" {
 		t.Errorf("symlink: %q, %v", b, err)
 	}

@@ -50,7 +50,8 @@ func writeFiles(t *testing.T, dir string, files map[string]string) {
 }
 
 // goldenRepo builds the fixture repository at <root>/acme/m and returns root.
-// Tags: v1.0.0 (go 1.23), tools/v0.1.0 and v2.0.0 on the first commit,
+// Tags: v1.0.0 (go 1.23), tools/v0.1.0, tools2/v0.1.0 (whose LICENSE is a
+// symlink) and v2.0.0 on the first commit,
 // v1.1.0 (go 1.24) on the second, and a third commit on main.
 func goldenRepo(t *testing.T) string {
 	t.Helper()
@@ -80,17 +81,21 @@ func goldenRepo(t *testing.T) string {
 		"vendor/x/y.go":      "package y\n",
 		"tools/go.mod":       "module " + goldenPath + "/tools\n\ngo 1.23\n",
 		"tools/t.go":         "package tools\n",
+		"tools2/go.mod":      "module " + goldenPath + "/tools2\n\ngo 1.23\n",
+		"tools2/t.go":        "package tools2\n",
 		"v2/go.mod":          "module " + goldenPath + "/v2\n\ngo 1.23\n",
 		"v2/v.go":            "package m\n\nconst V = 2\n",
 	})
-	if err := os.Symlink("go.mod", filepath.Join(dir, "link")); err != nil {
-		t.Fatal(err)
+	for target, link := range map[string]string{"go.mod": "link", "../LICENSE": "tools2/LICENSE"} {
+		if err := os.Symlink(target, filepath.Join(dir, filepath.FromSlash(link))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	goldenGit(t, dir, d1, "add", "-A")
 	// A submodule entry (gitlink) whose commit isn't in the repository.
 	goldenGit(t, dir, d1, "update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,sub")
 	goldenGit(t, dir, d1, "commit", "--quiet", "-m", "one")
-	for _, tag := range []string{"v1.0.0", "tools/v0.1.0", "v2.0.0"} {
+	for _, tag := range []string{"v1.0.0", "tools/v0.1.0", "tools2/v0.1.0", "v2.0.0"} {
 		goldenGit(t, dir, d1, "tag", tag)
 	}
 
@@ -175,6 +180,9 @@ func TestGoldenZipHashes(t *testing.T) {
 		{Module{Path: goldenPath}, goldenPath, "v1.0.0", "v1.0.0"},
 		{Module{Path: goldenPath}, goldenPath, "v1.1.0", "v1.1.0"},
 		{Module{Path: goldenPath + "/tools", Dir: "tools"}, goldenPath + "/tools", "tools/v0.1.0", "v0.1.0"},
+		// A LICENSE symlink counts as the module's LICENSE: no root copy, and
+		// modzip drops the symlink.
+		{Module{Path: goldenPath + "/tools2", Dir: "tools2"}, goldenPath + "/tools2", "tools2/v0.1.0", "v0.1.0"},
 		{Module{Path: goldenPath}, goldenPath + "/v2", "v2.0.0", "v2.0.0"},
 		{Module{Path: goldenPath}, goldenPath, "main", pseudo},
 	} {
