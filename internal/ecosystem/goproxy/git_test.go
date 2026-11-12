@@ -111,6 +111,8 @@ func (e *gitEnv) sourceIn(base string, mods []Module, opts ...srcOpt) *GitSource
 	}
 	g, err := newGitSource(o, func(g *GitSource) {
 		g.q.backoffMin, g.q.backoffMax = time.Millisecond, 10*time.Millisecond
+		g.syncEvery = 0 // every pass syncs; the throttle tests set it back
+		e.t.Cleanup(g.stopLife)
 		for _, f := range opts {
 			f(&o, g)
 		}
@@ -620,7 +622,9 @@ func TestRepairMissingZip(t *testing.T) {
 	}
 
 	g2 := e.sourceIn("", rootMod())
-	wantList(t, g2, modP)
+	if _, err := g2.List(t.Context(), modP); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("List before the first sync with nothing listed = %v, want ErrUnavailable", err)
+	}
 	if _, err := g2.Info(t.Context(), modP, "v1.0.0"); !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("Info of a record without its zip = %v, want ErrUnavailable", err)
 	}
@@ -642,7 +646,9 @@ func TestRepairMissingZip(t *testing.T) {
 	}
 	g3 := e.source(rootMod())
 	settle(t, g3)
-	wantList(t, g3, modP)
+	if _, err := g3.List(t.Context(), modP); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("List before the first sync with nothing listed = %v, want ErrUnavailable", err)
+	}
 	wantRefused(t, g3, modP, "v1.0.0", RefusalRefused, "h1 differs from the record")
 	if _, err := e.state.Stat(t.Context(), zipKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("a zip was written: %v", err)

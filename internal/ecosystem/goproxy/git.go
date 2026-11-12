@@ -173,7 +173,19 @@ type GitSource struct {
 	cands  map[string]map[jobKey]candidate
 	health map[string]error // last pass outcome per remote
 
-	// Test seams; production uses the mirror's methods and no hook.
+	// syncs are the remotes' throttles and restart gates, by mirror.
+	syncs map[*gitmirror.Mirror]*remoteState
+	// life is the source's lifetime: syncs run on it, whoever waits for
+	// them. Run cancels it when its context ends.
+	life     context.Context
+	stopLife context.CancelFunc
+
+	// Test seams; production uses time.Now, the mirror's methods, the
+	// package's syncEvery and requestWait, and no hook.
+	now           func() time.Time
+	syncEvery     time.Duration
+	requestWait   time.Duration
+	sync          func(ctx context.Context, m *gitmirror.Mirror) error
 	archive       func(ctx context.Context, m *gitmirror.Mirror, commit, dir string, w io.Writer) error
 	listTree      func(ctx context.Context, m *gitmirror.Mirror, commit, dir string) ([]gitmirror.TreeEntry, error)
 	beforeRecheck func(jobKey) // runs just before a job re-checks its tag
@@ -210,6 +222,9 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 		dirRefusals: map[dirKey]string{}, treeOK: map[dirKey]bool{}, failures: map[dirKey]map[uint64]bool{},
 		archives: map[dirKey]*archiveRun{}, movedStored: map[string]map[verKey]Refusal{},
 		warnedMoves: map[pins.MovedTag]bool{}, pinMemo: map[[2]string]string{}, cands: map[string]map[jobKey]candidate{}, health: map[string]error{},
+		syncs: map[*gitmirror.Mirror]*remoteState{},
+		now:   time.Now, syncEvery: syncEvery, requestWait: requestWait,
+		sync: func(ctx context.Context, m *gitmirror.Mirror) error { return m.Sync(ctx) },
 		archive: func(ctx context.Context, m *gitmirror.Mirror, commit, dir string, w io.Writer) error {
 			return m.ArchiveModuleZip(ctx, commit, dir, w)
 		},
@@ -223,9 +238,11 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 		}
 		if !slices.Contains(g.remotes, mod.Remote) {
 			g.remotes = append(g.remotes, mod.Remote)
+			g.syncs[g.mirrors[mod.Remote]] = &remoteState{}
 		}
 	}
 	slices.Sort(g.remotes)
+	g.life, g.stopLife = context.WithCancel(context.Background()) //nolint:gosec // Run calls stopLife when its context ends
 	g.idx.Store(&goIndex{listed: map[verKey]versionRecord{}, versions: map[string][]string{}})
 	if hook != nil {
 		hook(g)
@@ -265,6 +282,8 @@ func (g *GitSource) moduleFor(p string) (Module, bool) {
 // Run builds in the background and runs a pass every poll interval until
 // ctx is done.
 func (g *GitSource) Run(ctx context.Context) {
+	stopLife := context.AfterFunc(ctx, g.stopLife)
+	defer stopLife()
 	done := make(chan struct{})
 	go func() { g.q.run(ctx); close(done) }()
 	defer func() { <-done }()
@@ -401,11 +420,12 @@ func checkRecord(rec versionRecord, v string) string {
 	return ""
 }
 
-// Index runs one pass: per remote, sync, list the refs, pin the tags of
-// stored versions and enqueue a build for every candidate that is neither
-// stored, refused, skipped nor queued. It never waits for builds. A remote
-// that fails keeps its last pass's state; one that has not synced in this
-// process is not indexed from its mirror.
+// Index runs one pass: per remote, sync (sharing the on-demand throttle),
+// list the refs, pin the tags of stored versions and enqueue a build for
+// every candidate that is neither stored, refused, skipped nor queued. It
+// never waits for builds. A remote that fails keeps its last pass's state;
+// one that has not synced in this process (the restart gate) is not indexed
+// from its mirror.
 func (g *GitSource) Index(ctx context.Context) error {
 	g.passMu.Lock()
 	defer g.passMu.Unlock()
@@ -431,8 +451,8 @@ func (g *GitSource) Index(ctx context.Context) error {
 
 func (g *GitSource) passRemote(ctx context.Context, remote string) error {
 	m := g.mirrors[remote]
-	if err := m.Sync(ctx); err != nil {
-		if m.LastSync().IsZero() {
+	if err := g.syncRemote(ctx, m); err != nil {
+		if ctx.Err() != nil || !g.synced(remote) {
 			return err
 		}
 		g.log.Warn("goproxy git: sync failed; indexing the local mirror", "source", g.name, "remote", metrics.RedactRemote(remote), "error", err)
@@ -1061,7 +1081,7 @@ func (g *GitSource) repairJob(remote string, m *gitmirror.Mirror, vk verKey, rec
 		}
 		gomod, err := m.ReadFileMax(ctx, rec.Commit, path.Join(rec.Dir, "go.mod"), MaxGoMod)
 		switch {
-		case errors.Is(err, gitmirror.ErrNoCommit) && m.LastSync().IsZero():
+		case errors.Is(err, gitmirror.ErrNoCommit) && !g.synced(remote):
 			return err
 		case errors.Is(err, gitmirror.ErrNoCommit):
 			return g.refuseRecord(vk, rec, "zip missing and commit gone")
@@ -1106,56 +1126,55 @@ func (g *GitSource) publish(vk verKey, rec versionRecord) {
 	g.idx.Store(idx)
 }
 
-// checkModule answers ErrNotFound for a path no configured module serves
-// and ErrUnavailable while the stored versions are not loaded.
-func (g *GitSource) checkModule(p string) error {
-	if _, ok := g.moduleFor(p); !ok {
-		return fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
+// checkModule returns the configured module serving p: ErrNotFound for a
+// path no configured module serves and ErrUnavailable while the stored
+// versions are not loaded.
+func (g *GitSource) checkModule(p string) (Module, error) {
+	mod, ok := g.moduleFor(p)
+	if !ok {
+		return Module{}, fmt.Errorf("%w: %s is not a module of this source", resolve.ErrNotFound, p)
 	}
 	if !g.loaded.Load() {
-		return fmt.Errorf("%w: %s: stored versions not loaded yet", ErrUnavailable, p)
+		return Module{}, fmt.Errorf("%w: %s: stored versions not loaded yet", ErrUnavailable, p)
 	}
-	return nil
+	return mod, nil
 }
 
-// lookup returns the stored record of a canonical version of a configured
-// module. A record that cannot be served (its zip missing, awaiting repair
-// or refused) is ErrUnavailable.
-func (g *GitSource) lookup(p, v string) (versionRecord, error) {
-	if err := g.checkModule(p); err != nil {
+// lookup returns the stored record of version v of a configured module. A
+// record that cannot be served (its zip missing, awaiting repair or
+// refused) is ErrUnavailable; any other version is answered on demand.
+func (g *GitSource) lookup(ctx context.Context, p, v string) (versionRecord, error) {
+	mod, err := g.checkModule(p)
+	if err != nil {
 		return versionRecord{}, err
 	}
 	if !semver.IsValid(v) || semver.Canonical(v) != v {
-		return versionRecord{}, fmt.Errorf("%w: %s@%s", resolve.ErrNotFound, p, v)
+		return versionRecord{}, g.query(ctx, mod, p, v)
 	}
-	vk := verKey{p, v}
-	if rec, ok := g.idx.Load().listed[vk]; ok {
-		return rec, nil
+	if rec, ok, err := g.served(p, v); ok {
+		return rec, err
 	}
-	g.mu.Lock()
-	_, unlisted := g.unlisted[vk]
-	refusal, refused := g.recRefusals[vk]
-	g.mu.Unlock()
-	switch {
-	case refused:
-		return versionRecord{}, fmt.Errorf("%w: %s@%s: %s", ErrUnavailable, p, v, refusal.Reason)
-	case unlisted:
-		return versionRecord{}, fmt.Errorf("%w: %s@%s: its zip is being repaired", ErrUnavailable, p, v)
-	}
-	return versionRecord{}, fmt.Errorf("%w: %s@%s", resolve.ErrNotFound, p, v)
+	return g.demand(ctx, mod, p, v)
 }
 
-// List returns the stored versions of p, sorted.
+// List returns the stored versions of p, sorted. With none stored, a remote
+// not synced since the start answers ErrUnavailable.
 func (g *GitSource) List(_ context.Context, p string) ([]string, error) {
-	if err := g.checkModule(p); err != nil {
+	mod, err := g.checkModule(p)
+	if err != nil {
 		return nil, err
 	}
-	return slices.Clone(g.idx.Load().versions[p]), nil
+	vs := g.idx.Load().versions[p]
+	if len(vs) == 0 && !g.synced(mod.Remote) {
+		return nil, fmt.Errorf("%w: %s: its remote has not synced since the start", ErrUnavailable, p)
+	}
+	return slices.Clone(vs), nil
 }
 
-// Info answers a stored canonical version; any other query is not found.
-func (g *GitSource) Info(_ context.Context, p, v string) (Info, error) {
-	rec, err := g.lookup(p, v)
+// Info answers a stored canonical version, building a tag version on
+// demand; any other query is not found once the remote synced.
+func (g *GitSource) Info(ctx context.Context, p, v string) (Info, error) {
+	rec, err := g.lookup(ctx, p, v)
 	if err != nil {
 		return Info{}, err
 	}
@@ -1163,14 +1182,22 @@ func (g *GitSource) Info(_ context.Context, p, v string) (Info, error) {
 }
 
 // Latest answers the highest stored release, else the highest stored
-// prerelease.
+// prerelease. With none stored it is ErrUnavailable while the remote has
+// not synced since the start or a version of p is pending.
 func (g *GitSource) Latest(_ context.Context, p string) (Info, error) {
-	if err := g.checkModule(p); err != nil {
+	mod, err := g.checkModule(p)
+	if err != nil {
 		return Info{}, err
 	}
 	idx := g.idx.Load()
 	vs := idx.versions[p]
 	if len(vs) == 0 {
+		switch {
+		case !g.synced(mod.Remote):
+			return Info{}, fmt.Errorf("%w: %s: its remote has not synced since the start", ErrUnavailable, p)
+		case g.pendingWhere(p, func(string) bool { return true }):
+			return Info{}, fmt.Errorf("%w: %s: a version is pending", ErrUnavailable, p)
+		}
 		return Info{}, fmt.Errorf("%w: %s has no stored versions", resolve.ErrNotFound, p)
 	}
 	best := vs[len(vs)-1]
@@ -1194,7 +1221,7 @@ func (g *GitSource) Zip(ctx context.Context, p, v string) (Artifact, error) {
 }
 
 func (g *GitSource) open(ctx context.Context, p, v, file string) (Artifact, error) {
-	rec, err := g.lookup(p, v)
+	rec, err := g.lookup(ctx, p, v)
 	if err != nil {
 		return Artifact{}, err
 	}
