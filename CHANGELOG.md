@@ -4,7 +4,9 @@ All notable changes to tspackages are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [Unreleased]
+
+## [0.1.0] - 2026-11-12
 
 ### Added
 
@@ -129,3 +131,6 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   released, and a second signal exits at once.
 - The status page, `/readyz` and `/metrics` need a capability rule with at
   least one entry; an empty `{}` grant no longer opens them.
+
+[Unreleased]: https://github.com/Radiergummi/tspackages/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Radiergummi/tspackages/releases/tag/v0.1.0
