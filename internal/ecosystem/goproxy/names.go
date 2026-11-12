@@ -14,8 +14,6 @@ import (
 	"github.com/radiergummi/tspackages/internal/storage"
 )
 
-const ecoName = "go" //nolint:unused // used by the handler and sources added next
-
 var segmentRE = regexp.MustCompile(`^[a-z0-9._~*-]+$`)
 
 // ValidPattern reports whether p is a claim or rule: "*", or "/"-separated
