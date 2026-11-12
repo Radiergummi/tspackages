@@ -50,9 +50,17 @@ func TestMatchAgreesWithConfig(t *testing.T) {
 		if ValidPattern(pat) != config.ValidGoPattern(pat) {
 			t.Errorf("ValidPattern(%q) disagrees with config", pat)
 		}
+		if !ValidPattern(pat) {
+			for _, p := range paths {
+				if Match(pat, p) {
+					t.Errorf("invalid pattern %q matches %q", pat, p)
+				}
+			}
+			continue
+		}
 		for _, p := range paths {
 			n++
-			if Match(pat, p) != config.GoMatch(strings.ToLower(pat), strings.ToLower(p)) && ValidPattern(pat) {
+			if Match(pat, p) != config.GoMatch(pat, strings.ToLower(p)) {
 				t.Errorf("Match(%q, %q) = %v disagrees with config", pat, p, Match(pat, p))
 			}
 		}

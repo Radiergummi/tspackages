@@ -173,8 +173,19 @@ func goMatchExact(pattern, p string) bool {
 }
 
 // goClaimsOverlap reports whether some module path matches both valid
-// claims.
+// claims. It mirrors GoMatch: claims overlap as written, or when one of them
+// extended by a "/vN" segment overlaps the other. Claims ending in "/*"
+// already cover the suffix and are not extended. It is conservative: it may
+// report an overlap no real path has.
 func goClaimsOverlap(a, b string) bool {
+	if goOverlapExact(a, b) {
+		return true
+	}
+	ext := func(c string) bool { return c != "*" && !goOpen(strings.Split(c, "/")) }
+	return ext(a) && goOverlapExact(a+"/v*", b) || ext(b) && goOverlapExact(a, b+"/v*")
+}
+
+func goOverlapExact(a, b string) bool {
 	if a == "*" || b == "*" {
 		return true
 	}

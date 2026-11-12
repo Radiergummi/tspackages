@@ -145,7 +145,12 @@ func TestGoClaimsOverlap(t *testing.T) {
 		want bool
 	}{
 		{"github.com/acme/*", "github.com/acme/x/v2", true},
-		{"github.com/acme", "github.com/acme/*", false},
+		{"github.com/acme", "github.com/acme/*", true}, // github.com/acme/v2 is in both
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v2", true},
+		{"go.acme.dev/sdk", "go.acme.dev/sdk/v*", true},
+		{"go.acme.dev/s*", "go.acme.dev/s*/v2", true},
+		{"go.acme.dev/sdk", "go.acme.dev/other/v2", false},
+		{"go.acme.dev/sdk", "go.acme.dev/sdkv2", false},
 		{"github.com/a*/x", "github.com/*", true},
 		{"a/b/*", "a/*", true},
 		{"a/b", "a/c", false},
@@ -157,6 +162,18 @@ func TestGoClaimsOverlap(t *testing.T) {
 		if got := goClaimsOverlap(tc.b, tc.a); got != tc.want {
 			t.Errorf("goClaimsOverlap(%q, %q) = %v", tc.b, tc.a, got)
 		}
+	}
+}
+
+func TestGoRegistryMajorBeforeGit(t *testing.T) {
+	g := goGit([]string{"go.acme.dev/sdk"}, mods("go.acme.dev/sdk", "https://h/x.git"))
+	for _, c := range []string{"go.acme.dev/sdk/v2", "go.acme.dev/sdk/v*", "go.acme.dev/s*/v2"} {
+		if got := goErrs(t, goReg("pub", c), g); !strings.Contains(got, "overlaps") {
+			t.Errorf("registry claim %q before git claim: errors %q", c, got)
+		}
+	}
+	if got := goErrs(t, goReg("pub", "go.acme.dev/other/v2"), g); got != "" {
+		t.Errorf("disjoint claims: %q", got)
 	}
 }
 
