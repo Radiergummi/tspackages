@@ -127,7 +127,7 @@ func (s *RegistrySource) List(ctx context.Context, path string) ([]string, error
 
 // Info resolves version, a canonical version or a query, upstream.
 func (s *RegistrySource) Info(ctx context.Context, path, version string) (Info, error) {
-	canonical := module.CanonicalVersion(version) == version
+	canonical := version != "" && module.CanonicalVersion(version) == version
 	vs, ok := versionSeg(version)
 	if !ok {
 		return Info{}, fmt.Errorf("%w: version too long", resolve.ErrNotFound)
@@ -213,7 +213,8 @@ func (s *RegistrySource) meta(ctx context.Context, key string, immutable bool, f
 		return b, nil
 	})
 	if err != nil {
-		if haveCache {
+		// An expired miss is not served stale: only a definite answer is a miss.
+		if haveCache && !bytes.Equal(cached, notFoundMarker) {
 			s.log.Warn("serving stale go metadata", "source", s.name, "key", key, "error", err)
 			return unmarker(cached, key)
 		}
@@ -332,6 +333,9 @@ func cleanInfo(path, want string, b []byte) ([]byte, error) {
 	}
 	if want != "" && in.Version != want {
 		return nil, fmt.Errorf("upstream info names version %q, not %q", in.Version, want)
+	}
+	if module.CanonicalVersion(in.Version) != in.Version {
+		return nil, fmt.Errorf("upstream info version %q is not canonical", in.Version)
 	}
 	t, err := time.Parse(time.RFC3339, in.Time)
 	if err != nil {

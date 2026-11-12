@@ -2,6 +2,7 @@ package goproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -162,6 +163,9 @@ func TestRegistryInfoStripped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if b, _, ok := e.src.readCached(ctx, "go/proxy/"+mustSeg("example.com/m")+"/"+mustSeg("v1.0.0")+".info"); !ok || string(b) != `{"Version":"v1.0.0","Time":"2026-01-02T02:04:05Z"}` {
+		t.Fatalf("cached %q", b)
+	}
 	if in.Version != "v1.0.0" || !in.Time.Equal(time.Date(2026, 1, 2, 2, 4, 5, 0, time.UTC)) || in.Time.Location() != time.UTC {
 		t.Fatalf("got %+v", in)
 	}
@@ -194,6 +198,56 @@ func TestRegistryCanonicalInfoImmutable(t *testing.T) {
 	e.clock = e.clock.Add(24 * time.Hour)
 	if _, err := e.src.Info(context.Background(), "example.com/m", "v1.0.0"); err != nil || e.px.count(p) != 1 {
 		t.Fatalf("hits %d, %v", e.px.count(p), err)
+	}
+}
+
+func TestRegistryCanonicalInfoMissThenPublished(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	p := "/example.com/m/@v/v1.0.0.info"
+	if _, err := e.src.Info(ctx, "example.com/m", "v1.0.0"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	e.px.set(p, "application/json", `{"Version":"v1.0.0","Time":"2026-01-02T03:04:05Z"}`)
+	e.clock = e.clock.Add(2 * time.Minute)
+	if in, err := e.src.Info(ctx, "example.com/m", "v1.0.0"); err != nil || in.Version != "v1.0.0" {
+		t.Fatalf("got %+v, %v", in, err)
+	}
+	if n := e.px.count(p); n != 2 {
+		t.Fatalf("%d requests, want 2", n)
+	}
+}
+
+func TestRegistryExpiredMissRefreshFailureIsNotAMiss(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	if _, err := e.src.List(ctx, "example.com/m"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	e.px.setDown(true)
+	e.clock = e.clock.Add(2 * time.Minute)
+	if _, err := e.src.List(ctx, "example.com/m"); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("expired marker, upstream down: got %v", err)
+	}
+	// An unexpired marker is still a miss.
+	e.px.setDown(false)
+	if _, err := e.src.List(ctx, "example.com/m"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	e.clock = time.Now() // the cache stamps writes with the wall clock
+	e.px.setDown(true)
+	if _, err := e.src.List(ctx, "example.com/m"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("unexpired marker: got %v", err)
+	}
+}
+
+func TestRegistryQueryInfoMustBeCanonical(t *testing.T) {
+	e := newRegEnv(t)
+	for _, v := range []string{"v1.0", "1.0.0", "v1.0.0+meta"} {
+		e.px.set("/example.com/m/@v/main.info", "application/json", `{"Version":"`+v+`","Time":"2026-01-02T03:04:05Z"}`)
+		if _, err := e.src.Info(context.Background(), "example.com/m", "main"); err == nil {
+			t.Fatalf("%q accepted", v)
+		}
 	}
 }
 
@@ -271,6 +325,8 @@ func TestRegistryModZipUnavailable(t *testing.T) {
 	}
 }
 
+func mustSeg(s string) string { e, _ := seg(s); return e }
+
 func FuzzRegistryList(f *testing.F) {
 	for _, s := range []string{"v1.0.0\n", "<html>", "v1.0.0 x\r\nv2.0.0\n", "\xff", "v0.0.0-20260101000000-abcdefabcdef\n", "example.com/m v1.0.0"} {
 		f.Add(s)
@@ -303,6 +359,16 @@ func FuzzRegistryInfo(f *testing.F) {
 		}
 		if _, err := cleanInfo("example.com/m", "", out); err != nil {
 			t.Fatalf("served %q does not re-validate: %v", out, err)
+		}
+		var in Info
+		if json.Unmarshal(out, &in) != nil {
+			t.Fatalf("served %q does not decode", out)
+		}
+		if out2, err := cleanInfo("example.com/m", in.Version, out); err != nil || string(out2) != string(out) {
+			t.Fatalf("served %q with want %q: %q, %v", out, in.Version, out2, err)
+		}
+		if _, err := cleanInfo("example.com/m", "v9.9.9", out); err == nil && in.Version != "v9.9.9" {
+			t.Fatalf("want mismatch accepted: %q", out)
 		}
 	})
 }
