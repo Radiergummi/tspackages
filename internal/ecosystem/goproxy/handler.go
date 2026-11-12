@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
 	"golang.org/x/mod/module"
@@ -64,7 +63,7 @@ func setSecurityHeaders(h http.Header) {
 func textError(w http.ResponseWriter, msg string, status int) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = io.WriteString(w, msg+"\n")
+	_, _ = io.WriteString(w, msg+"\n") //nolint:gosec // text/plain with nosniff; never rendered as HTML
 }
 
 type statusWriter struct {
@@ -120,10 +119,14 @@ func (g *GoProxy) serve(rw http.ResponseWriter, r *http.Request) {
 	rest := r.PathValue("rest")
 	if sub, ok := strings.CutPrefix(rest, "sumdb/"); ok {
 		e.source = "sumdb"
-		if g.sumdb == nil {
-			textError(w, "not found", http.StatusNotFound)
-		} else {
-			g.sumdb.ServeSumDB(w, r, caller, sub)
+		// The rule check comes before the nil-SumDB 404, so a caller without
+		// a go: rule learns nothing about whether sumdb is configured.
+		if g.authorizeSumDB(w, caller, e, sub) {
+			if g.sumdb == nil {
+				textError(w, "not found", http.StatusNotFound)
+			} else {
+				g.sumdb.ServeSumDB(w, r, caller, sub)
+			}
 		}
 	} else {
 		g.module(w, r, caller, e, rest)
@@ -145,6 +148,52 @@ func (g *GoProxy) serve(rw http.ResponseWriter, r *http.Request) {
 		// transfer, not a short file.
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// authorizeSumDB answers 403 or 404 itself and returns false unless the caller
+// may use the checksum database path sub. A lookup needs a read rule for the
+// module it names; everything else (supported, tiles) needs any go: read rule.
+func (g *GoProxy) authorizeSumDB(w http.ResponseWriter, caller identity.Caller, e *entry, sub string) bool {
+	if _, after, ok := strings.Cut(sub, "/lookup/"); ok {
+		escPath, _, ok := strings.CutLast(after, "@")
+		if !ok {
+			textError(w, "not found", http.StatusNotFound)
+			return false
+		}
+		p, err := module.UnescapePath(escPath)
+		if err == nil {
+			err = module.CheckPath(p)
+		}
+		if err != nil {
+			textError(w, "not found", http.StatusNotFound)
+			return false
+		}
+		lower := strings.ToLower(p)
+		e.pkg = lower
+		if !authz.Allowed(caller.Rules, ecoName, lower, authz.Read, Match) {
+			textError(w, "forbidden: no go:"+lower+" read rule", http.StatusForbidden)
+			return false
+		}
+		return true
+	}
+	if !hasGoRead(caller.Rules) {
+		textError(w, "forbidden: no go: read rule", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+// hasGoRead reports whether any rule grants read on something in the Go
+// ecosystem: "*" or a "go:" entry.
+func hasGoRead(rules []authz.Rule) bool {
+	for _, r := range rules {
+		for _, x := range r.Read {
+			if x == "*" || strings.HasPrefix(x, ecoName+":") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (g *GoProxy) module(w http.ResponseWriter, r *http.Request, caller identity.Caller, e *entry, rest string) {
@@ -226,21 +275,16 @@ func (g *GoProxy) module(w http.ResponseWriter, r *http.Request, caller identity
 		if route.Kind == KindZip {
 			ct = "application/zip"
 		}
-		g.serveArtifact(w, r, e, art, ct)
+		g.serveArtifact(w, e, art, ct)
 	}
 }
 
-// serveArtifact streams art; a seekable body also answers range requests.
-func (g *GoProxy) serveArtifact(w http.ResponseWriter, r *http.Request, e *entry, art Artifact, contentType string) {
+// serveArtifact streams art whole. Range is not honoured: GOPROXY clients
+// never send it, and a ranged copy would skip the final-Read digest check and
+// the abort on read errors.
+func (g *GoProxy) serveArtifact(w http.ResponseWriter, e *entry, art Artifact, contentType string) {
 	defer art.Body.Close()
 	w.Header().Set("Content-Type", contentType)
-	// Ranges go through ServeContent. A whole file is copied to its end: a
-	// cache hit's digest check runs on the final Read, which ServeContent's
-	// size-bounded copy never makes, and a failure must break the transfer.
-	if rs, ok := art.Body.(io.ReadSeeker); ok && r.Header.Get("Range") != "" {
-		http.ServeContent(w, r, "", time.Time{}, rs)
-		return
-	}
 	if art.Size > 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(art.Size, 10))
 	}

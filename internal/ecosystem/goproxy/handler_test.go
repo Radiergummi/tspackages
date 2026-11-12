@@ -148,8 +148,8 @@ func TestModAndZip(t *testing.T) {
 	r.Header.Set("Range", "bytes=0-2")
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
-	if w.Code != http.StatusPartialContent || w.Body.String() != "ZIP" {
-		t.Fatalf("range: %d %q", w.Code, w.Body)
+	if w.Code != http.StatusOK || w.Body.String() != "ZIPBYTES" {
+		t.Fatalf("a Range request must get the whole body: %d %q", w.Code, w.Body)
 	}
 }
 
@@ -242,11 +242,11 @@ func TestHeadIs405(t *testing.T) {
 func TestSumDBRoutedWithoutParse(t *testing.T) {
 	sd := &fakeSumDB{}
 	f := &fakeSource{name: "s"}
-	w := do(server(t, one(f), sd, readAll), "GET", "/go/sumdb/sum.golang.org/supported")
+	w := do(server(t, one(f), sd, `{"read":["go:github.com/acme/*"]}`), "GET", "/go/sumdb/sum.golang.org/supported")
 	if w.Code != 200 || w.Body.String() != "sumdb:sum.golang.org/supported" || f.calls.Load() != 0 {
 		t.Fatalf("%d %q", w.Code, w.Body)
 	}
-	w = do(server(t, one(f), nil, readAll), "GET", "/go/sumdb/sum.golang.org/supported")
+	w = do(server(t, one(f), nil, `{"read":["go:*"]}`), "GET", "/go/sumdb/sum.golang.org/supported")
 	if w.Code != 404 {
 		t.Fatalf("nil sumdb: %d", w.Code)
 	}
@@ -296,4 +296,49 @@ func TestZipAbortsOnMidStreamError(t *testing.T) {
 	}()
 	do(h, "GET", "/go/github.com/acme/x/@v/v1.0.0.zip")
 	t.Fatal("handler returned normally")
+}
+
+func TestSumDBAuthz(t *testing.T) {
+	sd := &fakeSumDB{}
+	f := &fakeSource{name: "s"}
+	const lookup = "/go/sumdb/sum.golang.org/lookup/github.com/!acme/x@v1.0.0"
+	const tile = "/go/sumdb/sum.golang.org/tile/8/0/000"
+	for _, rules := range [][]string{nil, {`{"read":["npm:*"]}`}, {`{"write":["go:*"]}`}} {
+		for _, p := range []string{"/go/sumdb/sum.golang.org/supported", tile, lookup} {
+			if w := do(server(t, one(f), sd, rules...), "GET", p); w.Code != 403 {
+				t.Errorf("rules %v %s: %d", rules, p, w.Code)
+			}
+		}
+	}
+	// A rule for another module lets supported and tiles through, not this lookup.
+	other := server(t, one(f), sd, `{"read":["go:github.com/other/*"]}`)
+	if w := do(other, "GET", lookup); w.Code != 403 || !strings.Contains(w.Body.String(), "go:github.com/acme/x") {
+		t.Errorf("lookup for another module: %d %q", w.Code, w.Body)
+	}
+	for _, p := range []string{"/go/sumdb/sum.golang.org/supported", tile} {
+		if w := do(other, "GET", p); w.Code != 200 {
+			t.Errorf("%s: %d", p, w.Code)
+		}
+	}
+	for _, rule := range []string{`{"read":["go:github.com/acme/*"]}`, readAll} {
+		if w := do(server(t, one(f), sd, rule), "GET", lookup); w.Code != 200 {
+			t.Errorf("%s: %d", rule, w.Code)
+		}
+	}
+	if w := do(server(t, one(f), sd, readAll), "GET", "/go/sumdb/sum.golang.org/lookup/github.com/Acme/x@v1.0.0"); w.Code != 404 {
+		t.Errorf("unescaped upper case: %d", w.Code)
+	}
+}
+
+// Review Focus 1: a claimed module's failure never reaches the unclaimed source,
+// whatever its case or major-version suffix.
+func TestClaimedUnavailableNeverFallsThrough(t *testing.T) {
+	for _, p := range []string{"/go/github.com/!acme/x/v2/@v/list", "/go/github.com/!acme/!x/v2/@v/list"} {
+		git := &fakeSource{name: "git", claims: []string{"github.com/acme/x"}, err: fmt.Errorf("%w: conflict", ErrUnavailable)}
+		reg := &fakeSource{name: "registry", versions: []string{"v9.9.9"}}
+		w := do(server(t, []Source{git, reg}, nil, readAll), "GET", p)
+		if w.Code != 502 || git.calls.Load() != 1 || reg.calls.Load() != 0 {
+			t.Errorf("%s: %d git=%d reg=%d", p, w.Code, git.calls.Load(), reg.calls.Load())
+		}
+	}
 }
