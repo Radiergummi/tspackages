@@ -39,7 +39,7 @@ type testSumDB struct {
 	stop    chan struct{}
 }
 
-func newTestSumDB(t *testing.T, signer string, mods map[string]string) *testSumDB {
+func newTestSumDB(t testing.TB, signer string, mods map[string]string) *testSumDB {
 	t.Helper()
 	s := &testSumDB{
 		hits: map[string]int{}, bodies: map[string][]byte{}, fail: map[string]int{},
@@ -153,7 +153,7 @@ type sumEnv struct {
 
 var testMods = map[string]string{"example.com/m@v1.0.0": "AAAA", "example.com/m@v1.1.0": "BBBB"}
 
-func newSumEnv(t *testing.T) *sumEnv {
+func newSumEnv(t testing.TB) *sumEnv {
 	t.Helper()
 	signer, key, err := note.GenerateKey(rand.Reader, SumDBName)
 	if err != nil {
