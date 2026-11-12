@@ -551,7 +551,7 @@ func (s *StorageSource) Names(ctx context.Context) ([]string, error) {
 // Health reports whether the store answers.
 func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	if err := storage.Reachable(ctx, s.d); err != nil {
-		return []metrics.Health{{Name: s.name, OK: false, Detail: "store unreachable"}}
+		return []metrics.Health{{Name: s.name, Ecosystem: "pypi", OK: false, Detail: "store unreachable"}}
 	}
-	return []metrics.Health{{Name: s.name, OK: true, Detail: "store reachable"}}
+	return []metrics.Health{{Name: s.name, Ecosystem: "pypi", OK: true, Detail: "store reachable"}}
 }

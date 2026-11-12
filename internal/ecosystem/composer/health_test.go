@@ -179,7 +179,7 @@ func TestGitHealth(t *testing.T) {
 		t.Fatalf("%+v", h)
 	}
 	// Remote rows are scoped to the package the remote declares; unknown is "".
-	if !h[0].Scoped || h[0].Package != "matchory/a" || !h[1].Scoped || h[1].Package != "" {
+	if !h[0].Scoped || len(h[0].Packages) != 1 || h[0].Packages[0] != "matchory/a" || !h[1].Scoped || len(h[1].Packages) != 0 {
 		t.Fatalf("scoping: %+v", h)
 	}
 	g.now = func() time.Time { return time.Now().Add(10 * time.Minute) } // poll is 1m

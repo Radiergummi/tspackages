@@ -180,47 +180,53 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		p.Mount(mux)
 		ecos = append(ecos, p)
 	}
-	pypiConflicts := func() []pypi.Conflict {
-		var out []pypi.Conflict
-		for _, g := range pyGit {
-			out = append(out, g.Conflicts()...)
-		}
-		return out
+	var sections []web.Section
+	if hasComposer {
+		sections = append(sections, composer.StatusSection(
+			func() []composer.Conflict {
+				var out []composer.Conflict
+				for _, g := range gitSources {
+					out = append(out, g.Conflicts()...)
+				}
+				return out
+			},
+			func() []composer.ChangedDist {
+				var out []composer.ChangedDist
+				for _, r := range regSources {
+					out = append(out, r.ChangedDists()...)
+				}
+				return out
+			},
+			func(m pins.MovedTag) string {
+				for _, g := range gitSources {
+					if p := g.MovedPackage(m); p != "" {
+						return p
+					}
+				}
+				return ""
+			}))
 	}
-	pypiSkipped := func() []pypi.Skipped {
-		var out []pypi.Skipped
-		for _, g := range pyGit {
-			out = append(out, g.Skipped()...)
-		}
-		return out
-	}
-	conflicts := func() []composer.Conflict {
-		var out []composer.Conflict
-		for _, g := range gitSources {
-			out = append(out, g.Conflicts()...)
-		}
-		return out
-	}
-	changed := func() []composer.ChangedDist {
-		var out []composer.ChangedDist
-		for _, r := range regSources {
-			out = append(out, r.ChangedDists()...)
-		}
-		return out
-	}
-	movedPkg := func(m pins.MovedTag) string {
-		for _, g := range gitSources {
-			if p := g.MovedPackage(m); p != "" {
-				return p
-			}
-		}
-		return ""
+	if hasPyPI {
+		sections = append(sections, pypi.StatusSection(
+			func() []pypi.Conflict {
+				var out []pypi.Conflict
+				for _, g := range pyGit {
+					out = append(out, g.Conflicts()...)
+				}
+				return out
+			},
+			func() []pypi.Skipped {
+				var out []pypi.Skipped
+				for _, g := range pyGit {
+					out = append(out, g.Skipped()...)
+				}
+				return out
+			}))
 	}
 	metrics.SetRejected(limiter.Rejected)
 	web.New(web.Options{
 		Hostname: cfg.Tailscale.Hostname, Ecosystems: ecos, Sources: status,
-		Moved: pinStore.Moved, MovedPkg: movedPkg, Conflicts: conflicts, Changed: changed,
-		PyPIConflicts: pypiConflicts, PyPISkipped: pypiSkipped, Ready: stores.ready,
+		Moved: pinStore.Moved, Sections: sections, Ready: stores.ready,
 	}).Mount(mux)
 
 	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
