@@ -169,8 +169,17 @@ type GitSource struct {
 	movedStored map[string]map[verKey]Refusal
 	warnedMoves map[pins.MovedTag]bool
 	pinMemo     map[[2]string]string // (remote, tag) → the commit last pinned, current and recorded
-	// cands are each remote's candidates as of its last successful pass.
-	cands  map[string]map[jobKey]candidate
+	// cands are each remote's candidates from its latest scan of the refs
+	// (a pass or an on-demand rescan); candSeq is that scan's number from
+	// scanSeq, taken just before it read the refs. An older scan never
+	// replaces a newer one's candidates.
+	cands   map[string]map[jobKey]candidate
+	candSeq map[string]uint64
+	scanSeq uint64
+	// kicked are the remotes an on-demand sync asks a pass for; kick
+	// signals Run.
+	kicked map[string]bool
+	kick   chan struct{}
 	health map[string]error // last pass outcome per remote
 
 	// syncs are the remotes' throttles and restart gates, by mirror.
@@ -188,8 +197,9 @@ type GitSource struct {
 	sync          func(ctx context.Context, m *gitmirror.Mirror) error
 	archive       func(ctx context.Context, m *gitmirror.Mirror, commit, dir string, w io.Writer) error
 	listTree      func(ctx context.Context, m *gitmirror.Mirror, commit, dir string) ([]gitmirror.TreeEntry, error)
-	beforeRecheck func(jobKey) // runs just before a job re-checks its tag
-	repairHook    func()       // runs at the start of every repair attempt
+	beforeRecheck func(jobKey)        // runs just before a job re-checks its tag
+	afterRefs     func(remote string) // runs in a pass just after it read the refs
+	repairHook    func()              // runs at the start of every repair attempt
 }
 
 var _ Source = (*GitSource)(nil)
@@ -222,6 +232,7 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 		dirRefusals: map[dirKey]string{}, treeOK: map[dirKey]bool{}, failures: map[dirKey]map[uint64]bool{},
 		archives: map[dirKey]*archiveRun{}, movedStored: map[string]map[verKey]Refusal{},
 		warnedMoves: map[pins.MovedTag]bool{}, pinMemo: map[[2]string]string{}, cands: map[string]map[jobKey]candidate{}, health: map[string]error{},
+		candSeq: map[string]uint64{}, kicked: map[string]bool{}, kick: make(chan struct{}, 1),
 		syncs: map[*gitmirror.Mirror]*remoteState{},
 		now:   time.Now, syncEvery: syncEvery, requestWait: requestWait,
 		sync: func(ctx context.Context, m *gitmirror.Mirror) error { return m.Sync(ctx) },
@@ -279,22 +290,30 @@ func (g *GitSource) moduleFor(p string) (Module, bool) {
 	return Module{}, false
 }
 
-// Run builds in the background and runs a pass every poll interval until
-// ctx is done.
+// Run builds in the background and runs a pass every poll interval, and a
+// pass of the remotes an on-demand sync kicked, until ctx is done.
 func (g *GitSource) Run(ctx context.Context) {
 	stopLife := context.AfterFunc(ctx, g.stopLife)
 	defer stopLife()
 	done := make(chan struct{})
 	go func() { g.q.run(ctx); close(done) }()
 	defer func() { <-done }()
-	for {
-		if err := g.Index(ctx); err != nil && ctx.Err() == nil {
+	logPass := func(err error) {
+		if err != nil && ctx.Err() == nil {
 			g.log.Error("goproxy git: pass failed", "source", g.name, "error", err)
 		}
+	}
+	logPass(g.Index(ctx))
+	next := time.After(g.poll)
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(g.poll):
+		case <-g.kick:
+			logPass(g.indexRemotes(ctx, g.takeKicked()))
+		case <-next:
+			logPass(g.Index(ctx))
+			next = time.After(g.poll)
 		}
 	}
 }
@@ -427,6 +446,11 @@ func checkRecord(rec versionRecord, v string) string {
 // one that has not synced in this process (the restart gate) is not indexed
 // from its mirror.
 func (g *GitSource) Index(ctx context.Context) error {
+	return g.indexRemotes(ctx, g.remotes)
+}
+
+// indexRemotes runs a pass of remotes.
+func (g *GitSource) indexRemotes(ctx context.Context, remotes []string) error {
 	g.passMu.Lock()
 	defer g.passMu.Unlock()
 	if !g.loaded.Load() {
@@ -434,7 +458,7 @@ func (g *GitSource) Index(ctx context.Context) error {
 			return fmt.Errorf("goproxy git: load stored versions: %w", err)
 		}
 	}
-	for _, remote := range g.remotes {
+	for _, remote := range remotes {
 		err := g.passRemote(ctx, remote)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -459,9 +483,13 @@ func (g *GitSource) passRemote(ctx context.Context, remote string) error {
 	}
 	// Task 18: the stored commits' hidden refs are ensured here, after the
 	// sync.
+	seq := g.nextScan()
 	refs, err := m.Refs(ctx)
 	if err != nil {
 		return err
+	}
+	if g.afterRefs != nil {
+		g.afterRefs(remote)
 	}
 	cands := g.candidates(remote, refs)
 	moved := map[verKey]Refusal{}
@@ -481,7 +509,7 @@ func (g *GitSource) passRemote(ctx context.Context, remote string) error {
 		}
 		g.q.enqueue(k, k.Path, jobPass, g.tagJob(m, c))
 	}
-	g.prune(remote, cands, moved)
+	g.prune(remote, seq, cands, moved)
 	return nil
 }
 
@@ -600,11 +628,17 @@ func (g *GitSource) movedRefusal(c candidate, rec versionRecord, pinned string) 
 	}
 }
 
-// prune keeps the tag-keyed refusals and commit-level state of remote that
-// its current candidates (or a stored record awaiting repair) still use.
-func (g *GitSource) prune(remote string, cands map[jobKey]candidate, moved map[verKey]Refusal) {
+// prune records the pass's moved stored versions and keeps the tag-keyed
+// refusals and commit-level state of remote that its current candidates (or
+// a stored record awaiting repair) still use. A pass whose scan seq is older
+// than the stored candidates' prunes nothing and keeps them.
+func (g *GitSource) prune(remote string, seq uint64, cands map[jobKey]candidate, moved map[verKey]Refusal) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.movedStored[remote] = moved
+	if seq < g.candSeq[remote] {
+		return
+	}
 	commits := map[string]bool{}
 	for k := range cands {
 		commits[k.Commit] = true
@@ -626,8 +660,8 @@ func (g *GitSource) prune(remote string, cands map[jobKey]candidate, moved map[v
 		tags[c.tag] = true
 	}
 	maps.DeleteFunc(g.pinMemo, func(k [2]string, _ string) bool { return k[0] == remote && !tags[k[1]] })
-	g.movedStored[remote] = moved
 	g.cands[remote] = cands
+	g.candSeq[remote] = seq
 }
 
 // tagJob builds and stores a candidate. Once the job holds the version's

@@ -3,6 +3,8 @@ package goproxy
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
@@ -177,14 +179,13 @@ func (g *GitSource) demand(ctx context.Context, mod Module, p, v string) (versio
 			return versionRecord{}, err
 		}
 		m := g.mirrors[mod.Remote]
+		seq := g.nextScan()
 		refs, err := m.Refs(ctx)
 		if err != nil {
 			return versionRecord{}, fmt.Errorf("%w: %s@%s: reading the refs failed: %v", ErrUnavailable, p, v, err) //nolint:errorlint // a git failure is not a miss
 		}
 		cands := g.candidates(mod.Remote, refs)
-		g.mu.Lock()
-		g.cands[mod.Remote] = cands
-		g.mu.Unlock()
+		g.storeScan(mod.Remote, seq, cands)
 		if c, ok = findCandidate(cands, p, v); !ok {
 			return versionRecord{}, fmt.Errorf("%w: %s@%s: no such tag", resolve.ErrNotFound, p, v)
 		}
@@ -227,12 +228,65 @@ func (g *GitSource) query(ctx context.Context, mod Module, p, v string) error {
 // syncForRequest syncs mod's remote for a request and maps a failure to
 // ErrUnavailable: a 404 now could fall through to a later claimed source.
 func (g *GitSource) syncForRequest(ctx context.Context, mod Module, p, v string) error {
+	gated := !g.synced(mod.Remote)
 	err := g.syncRemote(ctx, g.mirrors[mod.Remote])
 	switch {
 	case err == nil:
+		if gated {
+			g.kickPass(mod.Remote) // the gate lifted: queue the remote's new tags now
+		}
 		return nil
 	case ctx.Err() != nil:
 		return fmt.Errorf("%w: %s@%s: its remote did not sync within %s", ErrUnavailable, p, v, g.requestWait)
 	}
 	return fmt.Errorf("%w: %s@%s: its remote's last sync failed: %v", ErrUnavailable, p, v, err) //nolint:errorlint // only ErrUnavailable is wrapped
+}
+
+// nextScan numbers a scan of a remote's refs; the caller reads the refs
+// after taking it.
+func (g *GitSource) nextScan() uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.scanSeq++
+	return g.scanSeq
+}
+
+// storeScan makes an on-demand rescan's candidates remote's current ones
+// unless a newer scan stored its own, and kicks a pass when they hold a tag
+// the previous ones did not.
+func (g *GitSource) storeScan(remote string, seq uint64, cands map[jobKey]candidate) {
+	g.mu.Lock()
+	if seq < g.candSeq[remote] {
+		g.mu.Unlock()
+		return
+	}
+	old := g.cands[remote]
+	g.cands[remote], g.candSeq[remote] = cands, seq
+	g.mu.Unlock()
+	for k := range cands {
+		if _, ok := old[k]; !ok {
+			g.kickPass(remote)
+			return
+		}
+	}
+}
+
+// kickPass asks Run for a pass of remote; kicks coalesce until it runs.
+func (g *GitSource) kickPass(remote string) {
+	g.mu.Lock()
+	g.kicked[remote] = true
+	g.mu.Unlock()
+	select {
+	case g.kick <- struct{}{}:
+	default:
+	}
+}
+
+// takeKicked returns and clears the kicked remotes, sorted.
+func (g *GitSource) takeKicked() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := slices.Sorted(maps.Keys(g.kicked))
+	clear(g.kicked)
+	return out
 }

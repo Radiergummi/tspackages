@@ -222,7 +222,9 @@ func TestRequestWaitCapped(t *testing.T) {
 	}
 }
 
-func TestPendingVersionUnavailable(t *testing.T) {
+// A pending version is promoted to an on-demand job and waited for up to
+// requestWait; it then answers ErrUnavailable, never ErrNotFound.
+func TestPendingVersionPromotedThenUnavailable(t *testing.T) {
 	e := newGitEnv(t)
 	e.commit(map[string]string{"go.mod": gomodOf(modP)})
 	e.tag("v1.0.0")
@@ -234,8 +236,23 @@ func TestPendingVersionUnavailable(t *testing.T) {
 	if !g.pending(modP, "v1.0.0") {
 		t.Fatal("a queued candidate is not pending")
 	}
+	start := time.Now()
 	_, err := g.Info(t.Context(), modP, "v1.0.0")
 	wantUnavailable(t, "Info of a pending version", err)
+	if d := time.Since(start); d < g.requestWait {
+		t.Fatalf("Info answered after %s, before requestWait", d)
+	}
+	g.q.mu.Lock()
+	promoted := 0
+	for _, j := range g.q.jobs {
+		if j.key.Version == "v1.0.0" && j.demand && j.pass {
+			promoted++
+		}
+	}
+	g.q.mu.Unlock()
+	if promoted != 1 {
+		t.Fatal("the pending pass job was not promoted to on-demand")
+	}
 	_, err = g.Mod(t.Context(), modP, "v1.0.0")
 	wantUnavailable(t, "Mod of a pending version", err)
 	release()
@@ -318,4 +335,78 @@ func TestRestartGateUntilSync(t *testing.T) {
 		t.Fatalf("Info after the on-demand sync = %+v, %v", info, err)
 	}
 	wantList(t, g2, modP+"/v2")
+}
+
+func TestStalePassKeepsFresherCandidates(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	block, _ := blockedArchive(t)
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	g := e.source(rootMod(), block, func(_ *GitOptions, g *GitSource) {
+		g.afterRefs = func(string) {
+			once.Do(func() {
+				close(entered)
+				<-proceed
+			})
+		}
+	})
+	// A slow pass read the refs before the tags existed.
+	passDone := make(chan error, 1)
+	go func() { passDone <- g.Index(context.Background()) }()
+	<-entered
+
+	// Meanwhile a request rescans: v2.0.0 of P/v2 is skipped (its go.mod
+	// declares P), and v1.0.0, now a known candidate, is built (blocked).
+	e.tag("v1.0.0", "v2.0.0")
+	_, err := g.Info(t.Context(), modP+"/v2", "v2.0.0")
+	wantNotFound(t, "Info of a skipped tag", err)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, err = g.Info(ctx, modP, "v1.0.0")
+	wantUnavailable(t, "Info of a blocked build", err)
+
+	close(proceed)
+	if err := <-passDone; err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Latest(t.Context(), modP)
+	wantUnavailable(t, "Latest after a stale pass ended", err)
+	if _, ok := refusalFor(g, modP+"/v2", "v2.0.0"); !ok {
+		t.Fatal("the stale pass pruned a fresher refusal")
+	}
+}
+
+func TestOnDemandSyncKicksPass(t *testing.T) {
+	e := newGitEnv(t)
+	e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0")
+	g := e.sourceIn("", rootMod())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	waitListed(t, g, "v1.0.0")
+
+	// Poll is an hour: only the kicked pass queues v1.2.0.
+	e.commit(map[string]string{"a.go": "package m\n"})
+	e.tag("v1.1.0", "v1.2.0")
+	if _, err := g.Info(t.Context(), modP, "v1.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	waitListed(t, g, "v1.2.0")
+}
+
+func waitListed(t *testing.T, g *GitSource, v string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, ok := g.idx.Load().listed[verKey{modP, v}]; ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s not listed", v)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
