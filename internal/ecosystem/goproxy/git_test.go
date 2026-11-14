@@ -1035,3 +1035,31 @@ func TestPublishClearsRecordRefusal(t *testing.T) {
 		t.Fatalf("Refusals() = %+v after another indexer completed the version", rs)
 	}
 }
+
+func TestGoSourceRecreatesStoredRefs(t *testing.T) {
+	e := newGitEnv(t)
+	c1 := e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	e.tag("v1.0.0")
+	c2 := e.commit(map[string]string{"a.go": "package m\n"})
+	e.tag("v1.1.0")
+	g := e.source(rootMod())
+	pass(t, g) // stores both versions
+	m := g.mirrors[e.remote]
+	hasRefs := func(when string) {
+		t.Helper()
+		refs := testutil.Git(t, m.Dir(), "show-ref")
+		for _, c := range []string{c1, c2} {
+			if !strings.Contains(refs, gitmirror.StoredRefPrefix+c) {
+				t.Fatalf("%s: no stored ref for %s in\n%s", when, c, refs)
+			}
+		}
+	}
+	pass(t, g)
+	hasRefs("after a sync")
+
+	if err := os.RemoveAll(m.Dir()); err != nil {
+		t.Fatal(err)
+	}
+	pass(t, g)
+	hasRefs("after the mirror was recreated")
+}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/gitmirror"
+	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/resolve"
 )
 
@@ -53,6 +54,9 @@ func (g *GitSource) syncRemote(ctx context.Context, m *gitmirror.Mirror) error {
 		st.running = a
 		go func() {
 			err := g.sync(g.life, m)
+			if err == nil {
+				g.ensureStoredRefs(m)
+			}
 			g.mu.Lock()
 			st.running = nil
 			st.lastAttempt, st.lastErr = g.now(), err
@@ -70,6 +74,31 @@ func (g *GitSource) syncRemote(ctx context.Context, m *gitmirror.Mirror) error {
 		return a.err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// ensureStoredRefs gives every stored commit of m's remote its hidden ref
+// in m, so a pruning fetch never drops a commit a stored version came from.
+// A failure is logged; the next sync tries again.
+func (g *GitSource) ensureStoredRefs(m *gitmirror.Mirror) {
+	commits := map[string]bool{}
+	add := func(vk verKey, rec versionRecord) {
+		if mod, ok := g.moduleFor(vk.Path); ok && g.mirrors[mod.Remote] == m {
+			commits[rec.Commit] = true
+		}
+	}
+	for vk, rec := range g.idx.Load().listed {
+		add(vk, rec)
+	}
+	g.mu.Lock()
+	unlisted := maps.Clone(g.unlisted)
+	g.mu.Unlock()
+	for vk, rec := range unlisted {
+		add(vk, rec)
+	}
+	if err := m.EnsureStoredRefs(g.life, slices.Sorted(maps.Keys(commits))); err != nil && g.life.Err() == nil {
+		g.log.Warn("goproxy git: keeping stored commits in the mirror failed", "source", g.name,
+			"remote", metrics.RedactRemote(m.Remote()), "error", err)
 	}
 }
 

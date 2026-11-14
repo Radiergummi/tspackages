@@ -481,8 +481,6 @@ func (g *GitSource) passRemote(ctx context.Context, remote string) error {
 		}
 		g.log.Warn("goproxy git: sync failed; indexing the local mirror", "source", g.name, "remote", metrics.RedactRemote(remote), "error", err)
 	}
-	// Task 18: the stored commits' hidden refs are ensured here, after the
-	// sync.
 	seq := g.nextScan()
 	refs, err := m.Refs(ctx)
 	if err != nil {

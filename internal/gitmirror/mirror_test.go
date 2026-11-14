@@ -971,3 +971,183 @@ func TestReadFileMax(t *testing.T) {
 		t.Errorf("ReadFile keeps 1 MiB: %v", err)
 	}
 }
+
+func TestResolveCommit(t *testing.T) {
+	src := makeRepo(t)
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	for _, hex := range []string{commit, commit[:7], commit[:12]} {
+		got, err := m.ResolveCommit(ctx, hex)
+		if err != nil || got != commit {
+			t.Errorf("ResolveCommit(%s) = %q, %v; want %s", hex, got, err, commit)
+		}
+	}
+	unknown := "0000000"
+	if commit[:7] == unknown {
+		unknown = "1111111"
+	}
+	if _, err := m.ResolveCommit(ctx, unknown); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("unknown prefix: %v, want ErrNotFound", err)
+	}
+	tree := testutil.Git(t, src, "rev-parse", "HEAD^{tree}")
+	if _, err := m.ResolveCommit(ctx, tree); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("a tree: %v, want ErrNotFound", err)
+	}
+	for _, bad := range []string{"xyz", commit[:6], strings.ToUpper(commit[:7]), "-" + commit[:7]} {
+		_, err := m.ResolveCommit(ctx, bad)
+		if err == nil || errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("ResolveCommit(%q) = %v, want an invalid-revision error", bad, err)
+		}
+	}
+}
+
+func TestParseBatchCheckAmbiguous(t *testing.T) {
+	if _, err := parseBatchCheck("abcdef0^{commit} ambiguous"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("ambiguous: %v, want ErrNotFound", err)
+	}
+	if _, err := parseBatchCheck("abcdef0^{commit} missing"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("missing: %v, want ErrNotFound", err)
+	}
+	sha := strings.Repeat("a", 40)
+	if got, err := parseBatchCheck(sha + " commit 200"); err != nil || got != sha {
+		t.Errorf("found: %q, %v", got, err)
+	}
+	if _, err := parseBatchCheck("garbage"); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("garbage: %v, want a non-miss error", err)
+	}
+}
+
+// sideCommit commits on a new branch side of src and returns to main.
+func sideCommit(t *testing.T, src string) string {
+	t.Helper()
+	testutil.Git(t, src, "checkout", "-q", "-b", "side")
+	write(t, src, "side", "s")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "side")
+	c := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "checkout", "-q", "main")
+	return c
+}
+
+func showRefs(t *testing.T, m *Mirror) string {
+	t.Helper()
+	return testutil.Git(t, m.Dir(), "show-ref")
+}
+
+func TestContainingRefs(t *testing.T) {
+	src := makeRepo(t)
+	base := testutil.Git(t, src, "rev-parse", "HEAD")
+	side := sideCommit(t, src)
+	m := newMirror(t, src)
+	ctx := context.Background()
+
+	got, err := m.ContainingRefs(ctx, base)
+	if err != nil || !slices.Equal(got, []string{"refs/heads/main", "refs/heads/side"}) {
+		t.Fatalf("ContainingRefs(base) = %v, %v", got, err)
+	}
+	got, err = m.ContainingRefs(ctx, side)
+	if err != nil || !slices.Equal(got, []string{"refs/heads/side"}) {
+		t.Fatalf("ContainingRefs(side) = %v, %v", got, err)
+	}
+
+	// The branch goes; the stored ref keeps the commit reachable.
+	if err := m.EnsureStoredRefs(ctx, []string{side}); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Git(t, src, "branch", "-q", "-D", "side")
+	if err := m.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err = m.ContainingRefs(ctx, side)
+	if err != nil || !slices.Equal(got, []string{StoredRefPrefix + side}) {
+		t.Fatalf("ContainingRefs(side) after the branch went = %v, %v", got, err)
+	}
+	if _, err := m.ContainingRefs(ctx, "main"); err == nil {
+		t.Error("a non-commit-id argument was accepted")
+	}
+}
+
+func TestMergedTags(t *testing.T) {
+	src := makeRepo(t)
+	base := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "tag", "-a", "v1.0.0", "-m", "rel")
+	testutil.Git(t, src, "tag", "v1.0.1")
+	write(t, src, "x", "x")
+	testutil.Git(t, src, "add", ".")
+	testutil.Git(t, src, "commit", "-q", "-m", "two")
+	head := testutil.Git(t, src, "rev-parse", "HEAD")
+	testutil.Git(t, src, "tag", "v1.1.0")
+	m := newMirror(t, src)
+	ctx := context.Background()
+
+	got, err := m.MergedTags(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Ref{
+		{Name: "refs/tags/v1.0.0", Short: "v1.0.0", Commit: base, IsTag: true},
+		{Name: "refs/tags/v1.0.1", Short: "v1.0.1", Commit: base, IsTag: true},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergedTags(base) = %+v, want %+v", got, want)
+	}
+	got, err = m.MergedTags(ctx, head)
+	if err != nil || len(got) != 3 || got[2].Commit != head {
+		t.Fatalf("MergedTags(head) = %+v, %v", got, err)
+	}
+}
+
+func TestStoredRefsSurviveSync(t *testing.T) {
+	src := makeRepo(t)
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	if err := m.EnsureStoredRefs(ctx, []string{commit}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnsureStoredRefs(ctx, []string{commit}); err != nil {
+		t.Fatalf("a second EnsureStoredRefs: %v", err)
+	}
+	if err := m.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(showRefs(t, m), StoredRefPrefix+commit) {
+		t.Fatal("the stored ref did not survive a pruning fetch")
+	}
+	refs, err := m.Refs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range refs {
+		if strings.HasPrefix(r.Name, StoredRefPrefix) {
+			t.Fatalf("Refs lists a stored ref: %+v", r)
+		}
+	}
+}
+
+func TestEnsureStoredRefsSkipsAbsent(t *testing.T) {
+	src := makeRepo(t)
+	commit := testutil.Git(t, src, "rev-parse", "HEAD")
+	m := newMirror(t, src)
+	ctx := context.Background()
+	absent := strings.Repeat("0", 40)
+	if err := m.EnsureStoredRefs(ctx, []string{absent, commit}); err != nil {
+		t.Fatal(err)
+	}
+	refs := showRefs(t, m)
+	if strings.Contains(refs, absent) || !strings.Contains(refs, StoredRefPrefix+commit) {
+		t.Fatalf("refs = %s", refs)
+	}
+	if err := m.EnsureStoredRefs(ctx, []string{"HEAD"}); err == nil {
+		t.Error("a non-commit-id argument was accepted")
+	}
+	ok, err := m.HasCommit(ctx, commit)
+	if err != nil || !ok {
+		t.Errorf("HasCommit(present) = %v, %v", ok, err)
+	}
+	ok, err = m.HasCommit(ctx, absent)
+	if err != nil || ok {
+		t.Errorf("HasCommit(absent) = %v, %v", ok, err)
+	}
+}
