@@ -78,8 +78,9 @@ func (g *GitSource) syncRemote(ctx context.Context, m *gitmirror.Mirror) error {
 }
 
 // ensureStoredRefs gives every stored commit of m's remote its hidden ref
-// in m, so a pruning fetch never drops a commit a stored version came from.
-// A failure is logged; the next sync tries again.
+// in m, so it stays reachable for pseudo-versions after its tag is gone
+// and after the mirror is recreated. A failure is logged; the next sync
+// tries again.
 func (g *GitSource) ensureStoredRefs(m *gitmirror.Mirror) {
 	commits := map[string]bool{}
 	add := func(vk verKey, rec versionRecord) {

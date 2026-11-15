@@ -990,6 +990,17 @@ func TestResolveCommit(t *testing.T) {
 	if _, err := m.ResolveCommit(ctx, unknown); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("unknown prefix: %v, want ErrNotFound", err)
 	}
+	// An annotated tag object peels to its commit, whose id differs.
+	testutil.Git(t, src, "tag", "-a", "v1.0.0", "-m", "rel")
+	tagObj := testutil.Git(t, src, "rev-parse", "v1.0.0")
+	if err := m.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, hex := range []string{tagObj, tagObj[:12]} {
+		if got, err := m.ResolveCommit(ctx, hex); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("a tag object's id %s = %q, %v; want ErrNotFound", hex, got, err)
+		}
+	}
 	tree := testutil.Git(t, src, "rev-parse", "HEAD^{tree}")
 	if _, err := m.ResolveCommit(ctx, tree); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("a tree: %v, want ErrNotFound", err)

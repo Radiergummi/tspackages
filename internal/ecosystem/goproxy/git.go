@@ -1049,6 +1049,7 @@ func (g *GitSource) complete(ctx context.Context, vk verKey, rec versionRecord, 
 	switch {
 	case zipErr == nil && modErr == nil:
 		g.publish(vk, rec)
+		g.keepCommit(ctx, vk, rec)
 		return nil
 	case zipErr != nil && !errors.Is(zipErr, storage.ErrNotFound):
 		return zipErr
@@ -1082,7 +1083,23 @@ func (g *GitSource) complete(ctx context.Context, vk verKey, rec versionRecord, 
 		}
 	}
 	g.publish(vk, rec)
+	g.keepCommit(ctx, vk, rec)
 	return nil
+}
+
+// keepCommit gives the commit of a version just published its hidden ref,
+// so it is reachable for pseudo-versions at once rather than after the next
+// sync. A failure is logged; the next sync's ensureStoredRefs retries.
+func (g *GitSource) keepCommit(ctx context.Context, vk verKey, rec versionRecord) {
+	mod, ok := g.moduleFor(vk.Path)
+	if !ok {
+		return
+	}
+	m := g.mirrors[mod.Remote]
+	if err := m.EnsureStoredRefs(ctx, []string{rec.Commit}); err != nil && ctx.Err() == nil {
+		g.log.Warn("goproxy git: keeping a stored commit in the mirror failed", "source", g.name,
+			"remote", metrics.RedactRemote(m.Remote()), "commit", rec.Commit, "error", err)
+	}
 }
 
 func putIfAbsent(ctx context.Context, d storage.Driver, key string, r io.Reader) error {

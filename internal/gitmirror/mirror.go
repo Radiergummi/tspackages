@@ -883,7 +883,9 @@ func (m *Mirror) ResolveCommit(ctx context.Context, hex string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if res[0] == "" {
+	// ^{commit} peels a tag object to a commit with another id; only a
+	// commit named by hex itself counts.
+	if res[0] == "" || !strings.HasPrefix(res[0], hex) {
 		return "", fmt.Errorf("gitmirror: revision %s: %w", hex, resolve.ErrNotFound)
 	}
 	return res[0], nil
@@ -945,7 +947,8 @@ func parseBatchCheck(line string) (string, error) {
 }
 
 // ContainingRefs lists the refs under refs/heads and StoredRefPrefix that
-// contain commit, sorted by name.
+// contain commit, sorted by name. commit must be in the mirror (see
+// HasCommit and ResolveCommit); git fails for an absent one.
 func (m *Mirror) ContainingRefs(ctx context.Context, commit string) ([]string, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err

@@ -1054,8 +1054,7 @@ func TestGoSourceRecreatesStoredRefs(t *testing.T) {
 			}
 		}
 	}
-	pass(t, g)
-	hasRefs("after a sync")
+	hasRefs("once stored")
 
 	if err := os.RemoveAll(m.Dir()); err != nil {
 		t.Fatal(err)
