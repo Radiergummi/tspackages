@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/mod/module"
+	modzip "golang.org/x/mod/zip"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/radiergummi/tspackages/internal/digest"
@@ -55,6 +56,7 @@ type RegistryOptions struct {
 	MaxArtifact int64
 	Verifier    *Verifier                   // checks every .mod and .zip before it is cached
 	Wait        func(context.Context) error // called before every upstream request; nil = none
+	Private     func(path string) bool      // true for a path a git source claims; nil = none
 	Log         *slog.Logger                // nil = slog.Default()
 }
 
@@ -64,21 +66,23 @@ type RegistryOptions struct {
 // Everything is validated before it is cached: a .mod or .zip only once its
 // h1: hash matched the checksum database's line. URLs are built from the
 // module path and version, never taken from a response.
+// A path a git source claims is a miss before any request.
 type RegistrySource struct {
-	name   string
-	claims []string
-	base   string // no trailing "/"
-	c      *upstream.Client
-	cache  *storage.Cache
-	ttl    time.Duration
-	wait   func(context.Context) error
-	log    *slog.Logger
-	now    func() time.Time // replaced in tests
+	name    string
+	claims  []string
+	base    string // no trailing "/"
+	c       *upstream.Client
+	cache   *storage.Cache
+	ttl     time.Duration
+	wait    func(context.Context) error
+	private func(path string) bool
+	log     *slog.Logger
+	now     func() time.Time // replaced in tests
 
 	relay       *relay.Relay
 	rec         *records.Store
 	verifier    *Verifier
-	maxArtifact int64
+	maxArtifact int64 // caps a zip download: max_artifact_bytes, at most modzip.MaxZipFile
 
 	flight singleflight.Group
 
@@ -97,15 +101,28 @@ func NewRegistrySource(o RegistryOptions) *RegistrySource {
 	if o.Wait == nil {
 		o.Wait = func(context.Context) error { return nil }
 	}
+	if o.Private == nil {
+		o.Private = func(string) bool { return false }
+	}
 	return &RegistrySource{
 		name: o.Name, claims: o.Claims, base: strings.TrimRight(o.BaseURL, "/"), c: o.Client, cache: o.Cache,
-		ttl: o.TTL, wait: o.Wait, log: o.Log, now: time.Now,
-		relay: o.Relay, rec: o.Records, verifier: o.Verifier, maxArtifact: o.MaxArtifact,
+		ttl: o.TTL, wait: o.Wait, private: o.Private, log: o.Log, now: time.Now,
+		relay: o.Relay, rec: o.Records, verifier: o.Verifier, maxArtifact: min(o.MaxArtifact, modzip.MaxZipFile),
 	}
 }
 
 func (s *RegistrySource) Name() string     { return s.name }
 func (s *RegistrySource) Claims() []string { return s.claims }
+
+// privateMiss answers a path a git source claims with a definite miss, so
+// nothing about it reaches the upstream or the checksum database, whatever
+// the source order.
+func (s *RegistrySource) privateMiss(path string) error {
+	if s.private(path) {
+		return fmt.Errorf("%w: %s is private", resolve.ErrNotFound, path)
+	}
+	return nil
+}
 
 // metaKey returns the cache key of a metadata file; name is "list", "latest"
 // or "<version seg>.info".
@@ -119,6 +136,9 @@ func (s *RegistrySource) metaKey(path, name string) (string, error) {
 
 // List returns the canonical, non-pseudo versions the upstream lists.
 func (s *RegistrySource) List(ctx context.Context, path string) ([]string, error) {
+	if err := s.privateMiss(path); err != nil {
+		return nil, err
+	}
 	key, err := s.metaKey(path, "list")
 	if err != nil {
 		return nil, err
@@ -138,6 +158,9 @@ func (s *RegistrySource) List(ctx context.Context, path string) ([]string, error
 
 // Info resolves version, a canonical version or a query, upstream.
 func (s *RegistrySource) Info(ctx context.Context, path, version string) (Info, error) {
+	if err := s.privateMiss(path); err != nil {
+		return Info{}, err
+	}
 	canonical := version != "" && module.CanonicalVersion(version) == version
 	vs, ok := versionSeg(version)
 	if !ok {
@@ -164,6 +187,9 @@ func (s *RegistrySource) Info(ctx context.Context, path, version string) (Info, 
 
 // Latest returns the upstream's latest version.
 func (s *RegistrySource) Latest(ctx context.Context, path string) (Info, error) {
+	if err := s.privateMiss(path); err != nil {
+		return Info{}, err
+	}
 	key, err := s.metaKey(path, "latest")
 	if err != nil {
 		return Info{}, err
@@ -202,6 +228,9 @@ func (s *RegistrySource) artURL(path, version, ext string) (string, error) {
 // without the checksum database; otherwise the database's line comes first,
 // and the upstream go.mod is cached only if its hash matches it.
 func (s *RegistrySource) Mod(ctx context.Context, path, version string) (Artifact, error) {
+	if err := s.privateMiss(path); err != nil {
+		return Artifact{}, err
+	}
 	key, err := s.artKey(path, version, ".mod")
 	if err != nil {
 		return Artifact{}, err
@@ -210,7 +239,7 @@ func (s *RegistrySource) Mod(ctx context.Context, path, version string) (Artifac
 	if err != nil {
 		return Artifact{}, err
 	}
-	if b, _, ok := s.readCached(ctx, key); ok {
+	if b, _, err := s.readCached(ctx, key); err == nil {
 		metrics.ObserveCacheHit(ecoName, s.name)
 		return bytesArtifact(b), nil
 	}
@@ -255,6 +284,9 @@ func bytesArtifact(b []byte) Artifact {
 // while its last byte is held back until the temp file passed verifyZip and
 // the sidecar and provenance are written; only then is the zip cached.
 func (s *RegistrySource) Zip(ctx context.Context, path, version string) (Artifact, error) {
+	if err := s.privateMiss(path); err != nil {
+		return Artifact{}, err
+	}
 	key, err := s.artKey(path, version, ".zip")
 	if err != nil {
 		return Artifact{}, err
@@ -315,10 +347,15 @@ func (s *RegistrySource) Zip(ctx context.Context, path, version string) (Artifac
 }
 
 // zipWant returns the digest a cached zip must match: its sidecar's sha256
-// when both are cached, else none, after dropping a zip that has no sidecar
-// (the relay checks nothing against an empty digest).
+// when both are cached, else none, after dropping a zip whose sidecar is
+// missing or invalid (the relay checks nothing against an empty digest). A
+// sidecar that can't be read is an error and drops nothing.
 func (s *RegistrySource) zipWant(ctx context.Context, key, sideKey string) (relay.Digest, error) {
-	if side, _, ok := s.readCached(ctx, sideKey); ok && digest.IsHex(string(side), 64) {
+	side, _, err := s.readCached(ctx, sideKey)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return relay.Digest{}, fmt.Errorf("read cached zip sidecar: %w", err)
+	}
+	if err == nil && digest.IsHex(string(side), 64) {
 		rc, _, err := s.cache.Open(ctx, key)
 		if err == nil {
 			rc.Close()
@@ -354,7 +391,8 @@ func (s *RegistrySource) info(ctx context.Context, key string, immutable bool, r
 // failed fetch is answered from the stale copy if there is one. A miss is
 // cached as notFoundMarker and returned as resolve.ErrNotFound.
 func (s *RegistrySource) meta(ctx context.Context, key string, immutable bool, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
-	cached, written, haveCache := s.readCached(ctx, key)
+	cached, written, cerr := s.readCached(ctx, key)
+	haveCache := cerr == nil
 	if haveCache && (immutable && !bytes.Equal(cached, notFoundMarker) || s.now().Sub(written) < s.ttl) {
 		metrics.ObserveCacheHit(ecoName, s.name)
 		return unmarker(cached, key)
@@ -391,17 +429,19 @@ func unmarker(b []byte, key string) ([]byte, error) {
 	return b, nil
 }
 
-func (s *RegistrySource) readCached(ctx context.Context, key string) ([]byte, time.Time, bool) {
+// readCached returns the cached file at key and when it was written; err is
+// storage.ErrNotFound when it is not cached.
+func (s *RegistrySource) readCached(ctx context.Context, key string) ([]byte, time.Time, error) {
 	rc, written, err := s.cache.Get(ctx, key)
 	if err != nil {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, err
 	}
 	defer rc.Close()
 	b, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, err
 	}
-	return b, written, true
+	return b, written, nil
 }
 
 // fetch GETs rawURL and returns clean(body); nil for a 404 or 410. text

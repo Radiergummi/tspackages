@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,7 +176,7 @@ func TestRegistryInfoStripped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _, ok := e.src.readCached(ctx, "go/proxy/"+mustSeg("example.com/m")+"/"+mustSeg("v1.0.0")+".info"); !ok || string(b) != `{"Version":"v1.0.0","Time":"2026-01-02T02:04:05Z"}` {
+	if b, _, err := e.src.readCached(ctx, "go/proxy/"+mustSeg("example.com/m")+"/"+mustSeg("v1.0.0")+".info"); err != nil || string(b) != `{"Version":"v1.0.0","Time":"2026-01-02T02:04:05Z"}` {
 		t.Fatalf("cached %q", b)
 	}
 	if in.Version != "v1.0.0" || !in.Time.Equal(time.Date(2026, 1, 2, 2, 4, 5, 0, time.UTC)) || in.Time.Location() != time.UTC {
@@ -737,5 +738,118 @@ func TestRegistrySecurityErrorFailsClosed(t *testing.T) {
 	}
 	if e.px.count(m2.url(".zip")) != 0 || e.px.count(m2.url(".mod")) != 0 {
 		t.Fatal("upstream fetched after a security error")
+	}
+}
+
+// A path a git source claims is a definite miss on a registry source, before
+// any request to the upstream or the checksum database.
+func TestRegistryPrivatePathNeverForwarded(t *testing.T) {
+	m := newTestModule(t, "github.com/acme/private", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	e.px.set("/github.com/acme/private/@v/list", textCT, "v1.0.0\n")
+	e.px.set("/github.com/acme/private/@v/v1.0.0.info", "application/json", `{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`)
+	e.px.set("/github.com/acme/private/@latest", "application/json", `{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`)
+	e.src.private = func(p string) bool { return Match("github.com/acme/*", p) }
+	ctx := context.Background()
+	for _, path := range []string{m.path, "github.com/Acme/private"} {
+		calls := map[string]func() error{
+			"list":   func() error { _, err := e.src.List(ctx, path); return err },
+			"info":   func() error { _, err := e.src.Info(ctx, path, "v1.0.0"); return err },
+			"latest": func() error { _, err := e.src.Latest(ctx, path); return err },
+			"mod":    func() error { _, err := readArtifact(e.src.Mod(ctx, path, "v1.0.0")); return err },
+			"zip":    func() error { _, err := readArtifact(e.src.Zip(ctx, path, "v1.0.0")); return err },
+		}
+		for name, call := range calls {
+			if err := call(); !errors.Is(err, resolve.ErrNotFound) {
+				t.Errorf("%s %s: %v", path, name, err)
+			}
+		}
+	}
+	e.px.mu.Lock()
+	n := len(e.px.hits)
+	e.px.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d upstream paths requested", n)
+	}
+	if n := e.sum.db.total("/"); n != 0 {
+		t.Errorf("%d database requests", n)
+	}
+}
+
+// A zip download is capped at the smaller of max_artifact_bytes and the
+// module zip limit, and a zip over the cap is neither served whole nor cached.
+func TestRegistryZipCapped(t *testing.T) {
+	big := NewRegistrySource(RegistryOptions{MaxArtifact: 8 << 30})
+	if big.maxArtifact != modzip.MaxZipFile {
+		t.Fatalf("cap with max_artifact_bytes 8GiB = %d, want %d", big.maxArtifact, modzip.MaxZipFile)
+	}
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	e.src.maxArtifact = int64(len(m.zip) - 1)
+	got, err := readArtifact(e.src.Zip(context.Background(), m.path, m.version))
+	if err == nil || len(got) >= len(m.zip) {
+		t.Fatalf("zip over the cap served: %d of %d bytes, %v", len(got), len(m.zip), err)
+	}
+	e.rl.Wait()
+	if _, ok := e.cached(t, e.key(t, m, ".zip")); ok {
+		t.Fatal("zip over the cap cached")
+	}
+}
+
+// sidecarFault fails Get of zip sidecars on demand.
+type sidecarFault struct {
+	storage.Driver
+	fail atomic.Bool
+}
+
+func (d *sidecarFault) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if d.fail.Load() && strings.HasSuffix(key, ".zip.sha256") {
+		return nil, storage.Info{}, errors.New("injected cache fault")
+	}
+	return d.Driver.Get(ctx, key)
+}
+
+// A sidecar that can't be read, unlike a missing one, is an I/O error: the
+// cached zip is kept and not fetched again.
+func TestRegistrySidecarReadErrorKeepsZip(t *testing.T) {
+	m := newTestModule(t, "example.com/m", "v1.0.0")
+	e := newArtEnv(t, recordsOf(t, m), m)
+	ctx := context.Background()
+	d, err := storage.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := &sidecarFault{Driver: d}
+	cache, err := storage.NewCache(ctx, fd, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.rl, err = relay.New(cache, filepath.Join(t.TempDir(), "relay"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sum.cache = cache
+	e.src = NewRegistrySource(RegistryOptions{
+		Name: "proxy", BaseURL: e.px.srv.URL, Client: e.c, Cache: cache, Relay: e.rl, Records: e.rec,
+		Verifier: e.src.verifier, TTL: time.Minute, MaxArtifact: 64 << 20,
+	})
+	if _, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil {
+		t.Fatal(err)
+	}
+	e.rl.Wait()
+	fd.fail.Store(true)
+	_, err = readArtifact(e.src.Zip(ctx, m.path, m.version))
+	if resolve.HTTPStatus(resolve.Wrap("proxy", err)) != http.StatusBadGateway {
+		t.Fatalf("zip with an unreadable sidecar: %v", err)
+	}
+	fd.fail.Store(false)
+	if _, ok := e.cached(t, e.key(t, m, ".zip")); !ok {
+		t.Fatal("cached zip evicted")
+	}
+	if got, err := readArtifact(e.src.Zip(ctx, m.path, m.version)); err != nil || !bytes.Equal(got, m.zip) {
+		t.Fatalf("zip after the fault: %v", err)
+	}
+	if n := e.px.count(m.url(".zip")); n != 1 {
+		t.Fatalf("upstream fetched %d zips", n)
 	}
 }

@@ -300,7 +300,10 @@ func goSource(s Source, earlier []Source, opts ValidateOptions, add func(string,
 		if !slices.ContainsFunc(s.Claims, func(c string) bool { return ValidGoPattern(c) && GoMatch(c, strings.ToLower(key)) }) {
 			add("modules: %q is matched by no claim of this source", key)
 		}
-		if d := m.Dir; d != "" && (path.IsAbs(d) || path.Clean(d) != d || d == ".." || strings.HasPrefix(d, "../")) {
+		switch d := m.Dir; {
+		case d == ".":
+			add("modules: dir %q of %q: leave dir out for a module at the repository root", d, key)
+		case d != "" && (path.IsAbs(d) || path.Clean(d) != d || d == ".." || strings.HasPrefix(d, "../")):
 			add("modules: dir %q of %q must be a clean relative path", d, key)
 		}
 	}

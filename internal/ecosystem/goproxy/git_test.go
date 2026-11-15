@@ -811,12 +811,37 @@ func TestMovedPackage(t *testing.T) {
 	}
 }
 
-// faultDriver fails List or Get of version records on demand and counts
-// pin writes.
+// faultDriver fails List or Get of version records, the read of a
+// record's body, or the claim of a pseudo-version record on demand, and
+// counts pin writes. winner, when set before the source is built, returns
+// the body another job stores first under a pseudo-version record key, given
+// the body being claimed (nil: none).
 type faultDriver struct {
 	storage.Driver
-	failList, failGet atomic.Bool
-	pinPuts           atomic.Int32
+	failList, failGet, failBody, failClaim atomic.Bool
+	pinPuts                                atomic.Int32
+	winner                                 func(body []byte) []byte
+}
+
+// cutBody returns the first two bytes of a record, then errFault.
+type cutBody struct {
+	io.ReadCloser
+	n int
+}
+
+func (b *cutBody) Read(p []byte) (int, error) {
+	if b.n >= 2 {
+		return 0, errFault
+	}
+	p = p[:min(len(p), 2-b.n)]
+	n, err := b.ReadCloser.Read(p)
+	b.n += n
+	return n, err
+}
+
+// isRecordKey reports whether key is a tag version or pseudo-version record.
+func isRecordKey(key string) bool {
+	return strings.HasSuffix(key, "/version.json") || strings.HasPrefix(key, "go-pseudo/") && strings.HasSuffix(key, ".json")
 }
 
 var errFault = errors.New("injected store fault")
@@ -832,12 +857,33 @@ func (d *faultDriver) Get(ctx context.Context, key string) (io.ReadCloser, stora
 	if d.failGet.Load() && strings.HasSuffix(key, "/version.json") {
 		return nil, storage.Info{}, errFault
 	}
-	return d.Driver.Get(ctx, key)
+	rc, info, err := d.Driver.Get(ctx, key)
+	if err == nil && d.failBody.Load() && isRecordKey(key) {
+		rc = &cutBody{ReadCloser: rc}
+	}
+	return rc, info, err
 }
 
 func (d *faultDriver) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
 	if strings.HasPrefix(key, "pins/") {
 		d.pinPuts.Add(1)
+	}
+	if strings.HasPrefix(key, "go-pseudo/") && strings.HasSuffix(key, ".json") {
+		if d.failClaim.Load() {
+			return storage.Info{}, errFault
+		}
+		if d.winner != nil {
+			b, err := io.ReadAll(r)
+			if err != nil {
+				return storage.Info{}, err
+			}
+			if w := d.winner(b); w != nil {
+				if _, err := d.Put(ctx, key, bytes.NewReader(w)); err != nil {
+					return storage.Info{}, err
+				}
+			}
+			r = bytes.NewReader(b)
+		}
 	}
 	return d.Driver.PutIfAbsent(ctx, key, r)
 }
@@ -856,7 +902,7 @@ func wantUnavailable(t *testing.T, what string, err error) {
 }
 
 func TestFailedLoadAnswersUnavailable(t *testing.T) {
-	for _, mode := range []string{"list", "get"} {
+	for _, mode := range []string{"list", "get", "body"} {
 		t.Run(mode, func(t *testing.T) {
 			e := newGitEnv(t)
 			fd := e.faults()
@@ -864,10 +910,7 @@ func TestFailedLoadAnswersUnavailable(t *testing.T) {
 			e.tag("v1.0.0")
 			pass(t, e.source(rootMod()))
 
-			fail := &fd.failList
-			if mode == "get" {
-				fail = &fd.failGet
-			}
+			fail := map[string]*atomic.Bool{"list": &fd.failList, "get": &fd.failGet, "body": &fd.failBody}[mode]
 			fail.Store(true)
 			g := e.source(rootMod())
 			_, err := g.List(t.Context(), modP)
@@ -889,6 +932,9 @@ func TestFailedLoadAnswersUnavailable(t *testing.T) {
 			fail.Store(false)
 			pass(t, g)
 			wantList(t, g, modP, "v1.0.0")
+			if r := g.Refusals(); len(r) != 0 {
+				t.Fatalf("refusals after a failed load: %+v", r)
+			}
 		})
 	}
 }

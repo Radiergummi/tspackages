@@ -475,9 +475,10 @@ is detected across restarts. When the database answers with a tree that
 contradicts it, tspackages logs `go checksum database misbehaved` at error
 and every registry fetch that needs a lookup fails with `502` until
 restart. Cached registry versions keep being served. The status page shows
-the sum.golang.org row as the security error while the verified tiles are
-still cached; after they are evicted, every lookup still fails, but the row shows
-`lookup failed`.
+the sum.golang.org row as the security error until restart. After a
+restart, the next lookup records the security error again while the tiles
+verified before are still cached; once they are evicted, every lookup still
+fails, but the row shows `lookup failed`.
 
 If the stored tree head itself is bad (it can't be verified with the key, or
 the object is corrupt), stop tspackages, delete

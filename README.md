@@ -216,7 +216,9 @@ fails validation: `*`, a wildcard in the host, and under `github.com`,
 `gitlab.com` or `bitbucket.org` the bare host or a wildcard in the owner
 segment. A claim of a whole host (`go.acme.dev/*`) is allowed with a warning
 at startup. A `registry` source may not come before a `git` source whose
-claims overlap its own.
+claims overlap its own. A path any `git` source claims is a miss on every
+`registry` source, so a claimed `registry` after a `git` source never sends
+it to its upstream or to sum.golang.org.
 
 A tag is a version when it is a canonical semantic version (`v1.2.3`, not `v1.2` or
 `1.2.3`), prefixed with the module's `dir` (`tools/v1.2.3`), and its major

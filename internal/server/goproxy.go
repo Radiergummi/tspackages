@@ -29,6 +29,16 @@ func buildGo(sh *shared, e config.Ecosystem) (built, error) {
 		gitSrcs  []*goproxy.GitSource
 		verifier *goproxy.Verifier
 	)
+	// private reports whether any git source claims a path, whatever the
+	// order; it reads gitSrcs once the loop below has filled it.
+	private := func(p string) bool {
+		for _, g := range gitSrcs {
+			if slices.ContainsFunc(g.Claims(), func(c string) bool { return goproxy.Match(c, p) }) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, s := range e.Sources {
 		switch s.Type {
 		case "registry":
@@ -45,7 +55,7 @@ func buildGo(sh *shared, e config.Ecosystem) (built, error) {
 			src := goproxy.NewRegistrySource(goproxy.RegistryOptions{
 				Name: s.Name, Claims: s.Claims, BaseURL: s.URL, Client: client, Cache: sh.cache, Relay: sh.relay,
 				Records: sh.records, TTL: s.MetadataTTL, MaxArtifact: int64(sh.cfg.Limits.MaxArtifactBytes),
-				Verifier: verifier, Wait: limits.UpstreamWait, Log: sh.log,
+				Verifier: verifier, Wait: limits.UpstreamWait, Private: private, Log: sh.log,
 			})
 			sources, status = append(sources, src), append(status, src)
 		case "git":
@@ -65,14 +75,6 @@ func buildGo(sh *shared, e config.Ecosystem) (built, error) {
 	var sumdb goproxy.SumDB
 	if verifier != nil {
 		status = append(status, verifier)
-		private := func(p string) bool {
-			for _, g := range gitSrcs {
-				if slices.ContainsFunc(g.Claims(), func(c string) bool { return goproxy.Match(c, p) }) {
-					return true
-				}
-			}
-			return false
-		}
 		sumdb = goproxy.NewSumDBProxy(verifier, sources, private, sh.log)
 	}
 	b := built{eco: goproxy.New(sources, sumdb, sh.log), status: status}

@@ -64,14 +64,19 @@ type Ticket struct {
 }
 
 // Wait returns the job's final error: nil, or its *RefusalError. It returns
-// ctx.Err() when ctx ends first (the job keeps its place until Leave) and
-// errQueueStopped when the queue stopped first.
+// ctx.Err() when ctx ends before the job finished (the job keeps its place
+// until Leave) and errQueueStopped when the queue stopped first.
 func (t *Ticket) Wait(ctx context.Context) error {
 	select {
 	case <-t.j.done:
 		return t.j.err
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-t.j.done:
+			return t.j.err
+		default:
+			return ctx.Err()
+		}
 	case <-t.q.stopped:
 		select {
 		case <-t.j.done:

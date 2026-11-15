@@ -135,6 +135,19 @@ func TestLookupNeedsRegistrySource(t *testing.T) {
 	}
 }
 
+// A proxy built without a private predicate treats every path as private.
+func TestLookupNilPrivateFailsClosed(t *testing.T) {
+	e := newProxyEnv(t)
+	e.proxy = NewSumDBProxy(e.sum.verifier(), e.srcs, nil, slog.New(slog.DiscardHandler))
+	w := do(e.handler(t, readAll), "GET", "/go/sumdb/sum.golang.org"+lookupM)
+	if w.Code != 404 || !strings.Contains(w.Body.String(), "example.com/m is private") {
+		t.Fatalf("%d %q", w.Code, w.Body)
+	}
+	if n := e.sum.db.total("/"); n != 0 {
+		t.Fatalf("%d database requests", n)
+	}
+}
+
 func TestLookupForbidden(t *testing.T) {
 	e := newProxyEnv(t)
 	// Straight to the proxy, past the handler's own check.

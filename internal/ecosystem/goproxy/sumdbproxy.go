@@ -25,10 +25,14 @@ type SumDBProxy struct {
 
 // NewSumDBProxy answers /go/sumdb/sum.golang.org/. private reports
 // whether any git source claims a path (whatever the order); sources are
-// the ecosystem's sources, for resolution.
+// the ecosystem's sources, for resolution. A nil private treats every path
+// as private.
 func NewSumDBProxy(v *Verifier, sources []Source, private func(path string) bool, log *slog.Logger) SumDB {
 	if log == nil {
 		log = slog.Default()
+	}
+	if private == nil {
+		private = func(string) bool { return true }
 	}
 	return &SumDBProxy{v: v, sources: sources, private: private, log: log}
 }

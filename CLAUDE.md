@@ -127,7 +127,8 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   rebuilds checked by `h1:`. Registry `.zip`/`.mod` are verified against
   sum.golang.org before caching; the verified tree head lives in the state
   store. Private paths (claimed by any `git` source) are never forwarded to
-  sum.golang.org. The one exception to "served git versions stay served":
+  sum.golang.org: `registry` sources answer them `404` before any upstream
+  request. The one exception to "served git versions stay served":
   a pseudo-version whose commit is gone from the mirror becomes
   unavailable.
 - One instance per `work_dir` (flock) and per tsnet state dir.

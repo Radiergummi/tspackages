@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,6 +113,75 @@ func TestBuildWiresGo(t *testing.T) {
 		if !strings.Contains(m, want) {
 			t.Errorf("metrics lack %s", want)
 		}
+	}
+}
+
+// countingServer answers every request with status and counts them.
+func countingServer(t *testing.T, status int) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n.Add(1)
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &n
+}
+
+// A path a git source claims never reaches the proxy or the checksum
+// database through a later claiming registry source, whatever its case.
+func TestGoGitClaimedPathNeverForwarded(t *testing.T) {
+	repo := goRepo(t, "module github.com/acme/x\n\ngo 1.21\n")
+	_, key, err := note.GenerateKey(rand.Reader, "sum.golang.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumdb, sumHits := countingServer(t, http.StatusNotFound)
+	proxy, proxyHits := countingServer(t, http.StatusOK)
+	su, _ := url.Parse(sumdb.URL)
+	pu, _ := url.Parse(proxy.URL)
+	cfg := fsConfig(t)
+	cfg.Ecosystems["go"] = config.Ecosystem{Sources: []config.Source{
+		{
+			Name: "gosrc", Type: "git", Claims: []string{"github.com/acme/*"},
+			Modules: map[string]config.GoModule{"github.com/acme/x": {Remote: repo}}, PollInterval: time.Hour,
+		},
+		{
+			Name: "public", Type: "registry", URL: proxy.URL, Claims: []string{"*"},
+			FetchHosts: []string{"sum.golang.org", pu.Host, su.Host},
+		},
+	}}
+	h, start, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), quiet, Hooks{
+		AllowFileRemotes: true, AllowPrivateUpstreams: true, GoSumDB: GoSumDB{URL: sumdb.URL, Key: key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startLoops(t, start)
+	eventually(t, "GET list", func() *httptest.ResponseRecorder { return do(h, "GET", "/go/github.com/acme/x/@v/list", nil) },
+		func(w *httptest.ResponseRecorder) bool { return w.Code == http.StatusOK })
+	for _, p := range []string{
+		"/go/github.com/acme/private/@v/v1.0.0.mod",
+		"/go/github.com/acme/private/@v/v1.0.0.zip",
+		"/go/github.com/acme/private/@v/v1.0.0.info",
+		"/go/github.com/acme/private/@v/list",
+		"/go/github.com/acme/private/@latest",
+		"/go/github.com/!acme/private/@v/v1.0.0.mod",
+		"/go/github.com/!acme/private/@v/v1.0.0.zip",
+	} {
+		if w := do(h, "GET", p, nil); w.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d %s", p, w.Code, w.Body)
+		}
+	}
+	w := do(h, "GET", "/go/sumdb/sum.golang.org/lookup/github.com/!acme/private@v1.0.0", nil)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "github.com/Acme/private is private: add it to GONOSUMDB") {
+		t.Errorf("lookup = %d %s", w.Code, w.Body)
+	}
+	if n := proxyHits.Load(); n != 0 {
+		t.Errorf("%d proxy requests", n)
+	}
+	if n := sumHits.Load(); n != 0 {
+		t.Errorf("%d checksum database requests", n)
 	}
 }
 

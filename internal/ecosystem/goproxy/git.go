@@ -411,23 +411,42 @@ func (g *GitSource) load(ctx context.Context) error {
 	return nil
 }
 
+// readRecord reads a version record. A failed read is returned as is; only
+// a record that is too large or does not decode wraps errBadRecord.
 func (g *GitSource) readRecord(ctx context.Context, key string) (versionRecord, error) {
-	rc, _, err := g.state.Get(ctx, key)
-	if err != nil {
-		return versionRecord{}, err
-	}
-	defer rc.Close()
 	var r versionRecord
-	if err := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&r); err != nil {
-		if ctx.Err() != nil {
-			return r, err
-		}
+	b, err := g.readRecordBody(ctx, key)
+	if err != nil {
+		return r, err
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
 		return r, fmt.Errorf("%w: %w", errBadRecord, err)
 	}
 	return r, nil
 }
 
-// errBadRecord marks a version.json that does not decode.
+// maxRecord caps a version or pseudo-version record.
+const maxRecord = 1 << 20
+
+// readRecordBody reads a record of at most maxRecord bytes; a larger one
+// wraps errBadRecord.
+func (g *GitSource) readRecordBody(ctx context.Context, key string) ([]byte, error) {
+	rc, _, err := g.state.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(io.LimitReader(rc, maxRecord+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxRecord {
+		return nil, fmt.Errorf("%w: over %d bytes", errBadRecord, maxRecord)
+	}
+	return b, nil
+}
+
+// errBadRecord marks a record that is too large or does not decode.
 var errBadRecord = errors.New("goproxy git: undecodable version record")
 
 // checkRecord returns why a decoded record of version v cannot be used, or

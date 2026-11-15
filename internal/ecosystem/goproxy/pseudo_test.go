@@ -367,3 +367,115 @@ func TestLatestUntaggedUsesDefaultBranch(t *testing.T) {
 	_, err = g2.Latest(t.Context(), modP)
 	wantNotFound(t, "Latest with the default branch not allowlisted", err)
 }
+
+// pseudoCached reports whether p@v's go.mod or zip is in g's cache.
+func pseudoCached(t *testing.T, g *GitSource, p, v string) bool {
+	t.Helper()
+	for _, ext := range []string{".zip", ".mod"} {
+		rc, _, err := g.cache.Open(t.Context(), pseudoKeyOf(p, v, ext))
+		if err == nil {
+			rc.Close()
+			return true
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+	return false
+}
+
+// claimWait bounds a request whose job keeps failing, while leaving a build
+// time to finish.
+func claimWait(_ *GitOptions, g *GitSource) { g.requestWait = 2 * time.Second }
+
+// otherZipHash replaces a claimed record's zip_h1.
+func otherZipHash(t *testing.T) func([]byte) []byte {
+	return func(b []byte) []byte {
+		var r pseudoRecord
+		if err := json.Unmarshal(b, &r); err != nil {
+			t.Error(err)
+			return nil
+		}
+		r.ZipHash = "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		out, _ := json.Marshal(r)
+		return out
+	}
+}
+
+// A pseudo-version whose record names another h1 than its build is refused
+// and nothing is cached: whether the record was there before the request or
+// another job claimed it first.
+func TestPseudoRecordOtherHashRefused(t *testing.T) {
+	for _, mode := range []string{"pre-seeded", "claimed first"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newGitEnv(t)
+			fd := e.faults()
+			c := e.commit(map[string]string{"go.mod": gomodOf(modP), "a.go": "package m\n"})
+			v := e.pseudoFor("", "", c)
+			if mode == "pre-seeded" {
+				body, _ := json.Marshal(pseudoRecord{Commit: c, ZipHash: "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", ModHash: "h1:x"})
+				if _, err := e.state.Put(t.Context(), pseudoKeyOf(modP, v, ".json"), bytes.NewReader(body)); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				fd.winner = otherZipHash(t)
+			}
+			g := e.source(rootMod())
+			if err := g.mirrors[e.remote].Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, err := g.Zip(t.Context(), modP, v)
+			wantUnavailable(t, "Zip whose build differs from the record", err)
+			wantRefused(t, g, modP, v, RefusalRefused, "h1 differs from the record")
+			if pseudoCached(t, g, modP, v) {
+				t.Fatal("a build that differs from the record was cached")
+			}
+			digests, err := g.rec.ProvenanceDigests(t.Context(), "go", modP, v)
+			if err != nil || len(digests) != 0 {
+				t.Fatalf("provenance digests %q, %v", digests, err)
+			}
+		})
+	}
+}
+
+// A failed record claim serves nothing and refuses nothing.
+func TestPseudoClaimFailureUnavailable(t *testing.T) {
+	e := newGitEnv(t)
+	fd := e.faults()
+	c := e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	v := e.pseudoFor("", "", c)
+	fd.failClaim.Store(true)
+	g := e.source(rootMod(), claimWait)
+	_, err := g.Zip(t.Context(), modP, v)
+	wantUnavailable(t, "Zip whose record claim failed", err)
+	if pseudoCached(t, g, modP, v) {
+		t.Fatal("a zip without a record was cached")
+	}
+	if _, ok := e.pseudoRecord(modP, v); ok {
+		t.Fatal("a record was written")
+	}
+	if r := g.Refusals(); len(r) != 0 {
+		t.Fatalf("refusals: %+v", r)
+	}
+	fd.failClaim.Store(false)
+	fetch(t, g.Zip, modP, v)
+}
+
+// A failed read of a record another job claimed first is an I/O error, not
+// a refusal: the version is served once the store recovers.
+func TestPseudoRecordReadFailureNotRefused(t *testing.T) {
+	e := newGitEnv(t)
+	fd := e.faults()
+	c := e.commit(map[string]string{"go.mod": gomodOf(modP)})
+	v := e.pseudoFor("", "", c)
+	fd.winner = func(b []byte) []byte { return b }
+	g := e.source(rootMod(), claimWait)
+	fd.failBody.Store(true)
+	_, err := g.Zip(t.Context(), modP, v)
+	wantUnavailable(t, "Zip whose record read failed", err)
+	if r := g.Refusals(); len(r) != 0 {
+		t.Fatalf("refusals: %+v", r)
+	}
+	fd.failBody.Store(false)
+	fetch(t, g.Zip, modP, v)
+}

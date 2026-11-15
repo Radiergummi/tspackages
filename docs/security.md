@@ -207,7 +207,10 @@ tailnet. Read this before you deploy.
 - **Private paths never reach sum.golang.org.** A checksum lookup for a path
   that any `git` source claims answers `404` with "add it to GONOSUMDB"
   without leaving the node; any other lookup is forwarded only for a path that
-  resolves to a `registry` source.
+  resolves to a `registry` source. A `registry` source answers a path any
+  `git` source claims with `404` before any request, so a git miss that falls
+  through to a later claiming `registry` source reaches neither its upstream
+  nor sum.golang.org.
 - The git source runs no repository code: it reads `go.mod` and runs
   `git archive` with the module zip rules of the go command, with user and
   system git attributes turned off. Module roots over 100,000 files,

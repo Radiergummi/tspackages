@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"strings"
@@ -474,19 +473,16 @@ func (g *GitSource) queryInfo(ctx context.Context, mod Module, p, rev string) (I
 	return Info{Version: pv, Time: when}, nil
 }
 
-// readPseudoRecord reads a pseudo-version record; one that does not decode
-// or names no valid commit wraps errBadRecord.
+// readPseudoRecord reads a pseudo-version record. A failed read is returned
+// as is; one that is too large, does not decode or names no valid commit
+// wraps errBadRecord.
 func (g *GitSource) readPseudoRecord(ctx context.Context, key string) (pseudoRecord, error) {
-	rc, _, err := g.state.Get(ctx, key)
-	if err != nil {
-		return pseudoRecord{}, err
-	}
-	defer rc.Close()
 	var r pseudoRecord
-	if err := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&r); err != nil {
-		if ctx.Err() != nil {
-			return r, err
-		}
+	b, err := g.readRecordBody(ctx, key)
+	if err != nil {
+		return r, err
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
 		return r, fmt.Errorf("%w: %w", errBadRecord, err)
 	}
 	if !digest.IsHex(r.Commit, 40, 64) {

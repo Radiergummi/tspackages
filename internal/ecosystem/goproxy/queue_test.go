@@ -392,3 +392,18 @@ func TestWaitQueueStopped(t *testing.T) {
 		t.Fatalf("Wait = %v, want errQueueStopped", err)
 	}
 }
+
+// A finished job's result wins over a context that ended too: select picks
+// a ready case at random, so 200 tries all but certainly hit both orders.
+func TestWaitPrefersFinishedJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	close(done)
+	tk := &Ticket{q: &queue{stopped: make(chan struct{})}, j: &job{done: done}}
+	for range 200 {
+		if err := tk.Wait(ctx); err != nil {
+			t.Fatalf("Wait = %v, want the job's nil result", err)
+		}
+	}
+}

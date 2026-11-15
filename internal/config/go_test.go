@@ -209,6 +209,10 @@ func TestGoModuleKeys(t *testing.T) {
 	if got := goErrs(t, goGit([]string{"github.com/acme/*"}, mods("github.com/Acme/SDK", remote))); got != "" {
 		t.Errorf("mixed case key: %q", got)
 	}
+	dot := goGit(claims, map[string]GoModule{"github.com/acme/x": {Remote: remote, Dir: "."}})
+	if got := goErrs(t, dot); !strings.Contains(got, `dir "." of "github.com/acme/x": leave dir out for a module at the repository root`) {
+		t.Errorf("dir .: errors %q", got)
+	}
 }
 
 func TestGoRegistryBeforeGit(t *testing.T) {
