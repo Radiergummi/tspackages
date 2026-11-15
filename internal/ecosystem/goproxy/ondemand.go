@@ -129,14 +129,7 @@ func (g *GitSource) pendingWhere(path string, match func(string) bool) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for k := range g.cands[mod.Remote] {
-		vk := verKey{k.Path, k.Version}
-		if k.Path != path || !match(k.Version) {
-			continue
-		}
-		_, stored := listed[vk]
-		_, refused := g.refusals[k]
-		_, recRefused := g.recRefusals[vk]
-		if !stored && !refused && !recRefused {
+		if k.Path == path && match(k.Version) && g.pendingCand(k, listed) {
 			return true
 		}
 	}
@@ -146,6 +139,30 @@ func (g *GitSource) pendingWhere(path string, match func(string) bool) bool {
 		}
 	}
 	return false
+}
+
+// pendingCand reports whether candidate k is neither stored, refused nor
+// skipped. g.mu is held.
+func (g *GitSource) pendingCand(k jobKey, listed map[verKey]versionRecord) bool {
+	vk := verKey{k.Path, k.Version}
+	_, stored := listed[vk]
+	_, refused := g.refusals[k]
+	_, recRefused := g.recRefusals[vk]
+	return !stored && !refused && !recRefused
+}
+
+// pendingCommits returns the commits of remote's pending candidates.
+func (g *GitSource) pendingCommits(remote string) []string {
+	listed := g.idx.Load().listed
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	set := map[string]bool{}
+	for k := range g.cands[remote] {
+		if g.pendingCand(k, listed) {
+			set[k.Commit] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // served answers p@v from the stored versions: the record of a listed one,
@@ -243,9 +260,9 @@ func (g *GitSource) demand(ctx context.Context, mod Module, p, v string) (versio
 	return versionRecord{}, fmt.Errorf("%w: %s@%s: not built (%v)", ErrUnavailable, p, v, werr) //nolint:errorlint // only ErrUnavailable is wrapped; werr may be a refusal
 }
 
-// query answers a non-canonical version of mod (a branch or a commit): the
-// remote is synced first, and a failed sync is ErrUnavailable. Pseudo-
-// versions are not minted yet, so a synced remote answers ErrNotFound.
+// query answers a non-canonical version of mod for .mod or .zip, which take
+// canonical versions only: the remote is synced first, and a failed sync is
+// ErrUnavailable; a synced remote answers ErrNotFound.
 func (g *GitSource) query(ctx context.Context, mod Module, p, v string) error {
 	ctx, cancel := context.WithTimeout(ctx, g.requestWait)
 	defer cancel()

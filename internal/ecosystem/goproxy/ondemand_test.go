@@ -281,7 +281,9 @@ func TestLatestPendingUnavailable(t *testing.T) {
 	if info, err := g.Latest(t.Context(), modP); err != nil || info.Version != "v1.0.0" {
 		t.Fatalf("Latest = %+v, %v", info, err)
 	}
-	// Synced, nothing stored and nothing pending: not found.
+	// Synced, nothing stored and nothing pending: the default branch, where
+	// go.mod declares no /v2 path. The query needs more than shortWait.
+	g.requestWait = requestWait
 	_, err = g.Latest(t.Context(), modP+"/v2")
 	wantNotFound(t, "Latest of a path without versions", err)
 	wantList(t, g, modP+"/v2")

@@ -103,10 +103,18 @@ func (e *gitEnv) sourceIn(base string, mods []Module, opts ...srcOpt) *GitSource
 	for i := range mods {
 		mods[i].Remote = e.remote
 	}
+	cacheDir, err := storage.NewFS(e.t.TempDir())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	cache, err := storage.NewCache(e.t.Context(), cacheDir, 1<<30, slog.New(slog.DiscardHandler))
+	if err != nil {
+		e.t.Fatal(err)
+	}
 	o := GitOptions{
 		Name: "acme", Claims: []string{"git.test/acme/*"}, Modules: mods,
 		Mirrors: map[string]*gitmirror.Mirror{e.remote: m},
-		Pins:    pins.New(e.state), State: e.state, Records: records.New(e.state),
+		Pins:    pins.New(e.state), State: e.state, Cache: cache, Records: records.New(e.state),
 		Poll: time.Hour, TmpDir: e.t.TempDir(), Log: slog.New(slog.DiscardHandler),
 	}
 	g, err := newGitSource(o, func(g *GitSource) {

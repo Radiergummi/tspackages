@@ -129,8 +129,10 @@ type GitSource struct {
 	modules  []Module
 	mirrors  map[string]*gitmirror.Mirror
 	remotes  []string // with modules, sorted
+	branches []string // path.Match patterns; empty = the default branch
 	pins     *pins.Store
 	state    storage.Driver
+	cache    *storage.Cache // pseudo-version zips and go.mod files
 	rec      *records.Store
 	poll     time.Duration
 	maxBytes int64
@@ -214,6 +216,9 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 	if o.TmpDir == "" {
 		return nil, errors.New("goproxy git: TmpDir is required")
 	}
+	if o.Cache == nil {
+		return nil, errors.New("goproxy git: Cache is required")
+	}
 	if o.Poll <= 0 {
 		o.Poll = time.Minute
 	}
@@ -226,7 +231,7 @@ func newGitSource(o GitOptions, hook func(*GitSource)) (*GitSource, error) {
 	}
 	g := &GitSource{
 		name: o.Name, claims: o.Claims, modules: slices.Clone(o.Modules), mirrors: o.Mirrors,
-		pins: o.Pins, state: o.State, rec: o.Records, poll: o.Poll, maxBytes: maxBytes, tmpDir: o.TmpDir, log: o.Log,
+		branches: slices.Clone(o.Branches), pins: o.Pins, state: o.State, cache: o.Cache, rec: o.Records, poll: o.Poll, maxBytes: maxBytes, tmpDir: o.TmpDir, log: o.Log,
 		q:        newQueue(buildWorkers, buildTimeout, o.Log),
 		unlisted: map[verKey]versionRecord{}, recRefusals: map[verKey]Refusal{}, refusals: map[jobKey]Refusal{},
 		dirRefusals: map[dirKey]string{}, treeOK: map[dirKey]bool{}, failures: map[dirKey]map[uint64]bool{},
@@ -1221,8 +1226,19 @@ func (g *GitSource) List(_ context.Context, p string) ([]string, error) {
 }
 
 // Info answers a stored canonical version, building a tag version on
-// demand; any other query is not found once the remote synced.
+// demand, a canonical pseudo-version, and a branch or commit query with the
+// tag version on its commit or a pseudo-version.
 func (g *GitSource) Info(ctx context.Context, p, v string) (Info, error) {
+	if !semver.IsValid(v) || semver.Canonical(v) != v || isPseudo(v) {
+		mod, err := g.checkModule(p)
+		if err != nil {
+			return Info{}, err
+		}
+		if isPseudo(v) {
+			return g.pseudoInfo(ctx, mod, p, v)
+		}
+		return g.queryInfo(ctx, mod, p, v)
+	}
 	rec, err := g.lookup(ctx, p, v)
 	if err != nil {
 		return Info{}, err
@@ -1232,8 +1248,9 @@ func (g *GitSource) Info(ctx context.Context, p, v string) (Info, error) {
 
 // Latest answers the highest stored release, else the highest stored
 // prerelease. With none stored it is ErrUnavailable while the remote has
-// not synced since the start or a version of p is pending.
-func (g *GitSource) Latest(_ context.Context, p string) (Info, error) {
+// not synced since the start or a version of p is pending, and otherwise
+// answers the default branch as a query.
+func (g *GitSource) Latest(ctx context.Context, p string) (Info, error) {
 	mod, err := g.checkModule(p)
 	if err != nil {
 		return Info{}, err
@@ -1247,7 +1264,7 @@ func (g *GitSource) Latest(_ context.Context, p string) (Info, error) {
 		case g.pendingWhere(p, func(string) bool { return true }):
 			return Info{}, fmt.Errorf("%w: %s: a version is pending", ErrUnavailable, p)
 		}
-		return Info{}, fmt.Errorf("%w: %s has no stored versions", resolve.ErrNotFound, p)
+		return g.queryInfo(ctx, mod, p, "")
 	}
 	best := vs[len(vs)-1]
 	for _, v := range slices.Backward(vs) {
@@ -1259,17 +1276,26 @@ func (g *GitSource) Latest(_ context.Context, p string) (Info, error) {
 	return Info{Version: best, Time: idx.listed[verKey{p, best}].Time}, nil
 }
 
-// Mod streams a stored version's go.mod.
+// Mod streams a stored version's or a pseudo-version's go.mod.
 func (g *GitSource) Mod(ctx context.Context, p, v string) (Artifact, error) {
-	return g.open(ctx, p, v, "go.mod")
+	return g.open(ctx, p, v, "go.mod", ".mod")
 }
 
-// Zip streams a stored version's module zip.
+// Zip streams a stored version's or a pseudo-version's module zip.
 func (g *GitSource) Zip(ctx context.Context, p, v string) (Artifact, error) {
-	return g.open(ctx, p, v, "module.zip")
+	return g.open(ctx, p, v, "module.zip", ".zip")
 }
 
-func (g *GitSource) open(ctx context.Context, p, v, file string) (Artifact, error) {
+// open streams file of a stored version, or the cached pseudoExt file of a
+// pseudo-version.
+func (g *GitSource) open(ctx context.Context, p, v, file, pseudoExt string) (Artifact, error) {
+	if isPseudo(v) {
+		mod, err := g.checkModule(p)
+		if err != nil {
+			return Artifact{}, err
+		}
+		return g.openPseudo(ctx, mod, p, v, pseudoExt)
+	}
 	rec, err := g.lookup(ctx, p, v)
 	if err != nil {
 		return Artifact{}, err
