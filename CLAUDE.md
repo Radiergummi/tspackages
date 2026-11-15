@@ -12,9 +12,9 @@ native protocol, assembles each endpoint from ordered sources (`git`,
 identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
-Roadmap: Composer and PyPI (`storage`, `registry` and `git` sdists; CI
-uploads with `twine`/`uv publish`) ship; then Go (git + registry + sumdb
-proxy), npm, OCI and Maven.
+Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
+uploads with `twine`/`uv publish`) and Go (`git` + `registry` + sumdb
+proxy) ship; then npm, OCI and Maven.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -24,7 +24,7 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real Composer/pip/uv/twine end-to-end; need composer 2.x, git, python3 with pip, uv, twine (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine/go end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go (S3 variant: TSP_TEST_S3_ENDPOINT)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
@@ -68,9 +68,14 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   the simple API (HTML + JSON), the three sources, pyproject discovery,
   PKG-INFO and deterministic sdists, the HTTP handler. Must not import
   `composer` (nor the reverse).
+- `internal/ecosystem/goproxy` — module paths and claims, the GOPROXY
+  handler, the `git` source (tag versions, build queue, module zips,
+  pseudo-versions, on-demand sync), the `registry` source, the
+  sum.golang.org verifier and the client-facing sumdb proxy. Must not
+  import `composer` or `pypi` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
-- `integration/` — end-to-end tests with real Composer, pip, uv and twine
-  (`-tags integration`).
+- `integration/` — end-to-end tests with real Composer, pip, uv, twine and
+  the go command (`-tags integration`).
 
 ## Invariants — do not break
 
@@ -112,6 +117,19 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   file never changes bytes. Git-generated sdists live in the state store,
   are built once and never regenerated (a change without a version bump is
   reported, not served).
+- Go: claims and `go:` rules are `*` or `/`-separated segments of
+  `[a-z0-9._~-]` and `*`, matched against the lowercased decoded module
+  path (a claim covers every `/vN` of its module). `git` claims become
+  clients' `GONOSUMDB`, so `*`, a wildcard in the host, and under
+  `github.com`/`gitlab.com`/`bitbucket.org` the bare host or a wildcard in
+  the owner segment are config errors. Tag versions are durable: built
+  once into the state store (`go-git/`), never rebuilt with other bytes,
+  rebuilds checked by `h1:`. Registry `.zip`/`.mod` are verified against
+  sum.golang.org before caching; the verified tree head lives in the state
+  store. Private paths (claimed by any `git` source) are never forwarded to
+  sum.golang.org. The one exception to "served git versions stay served":
+  a pseudo-version whose commit is gone from the mirror becomes
+  unavailable.
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

@@ -159,17 +159,19 @@ the tailnet as [Monitoring](#monitoring) describes.
 | Data | Where | Back up? | If lost |
 |------|-------|----------|---------|
 | Node and TLS keys | `tailscale.state_dir` | Yes, as a secret | New node identity; see [Losing a piece](#losing-a-piece). |
-| Tag pins, git-built Composer archives and their `.meta.json` sidecars, git-built PyPI sdists, provenance, audit records | `storage.state` | Yes | Git-served versions may change bytes or vanish; history is gone. |
+| Tag pins, git-built Composer archives and their `.meta.json` sidecars, git-built PyPI sdists, git-built Go module zips and pseudo-version records, the latest verified sum.golang.org tree head, provenance, audit records | `storage.state` | Yes | Git-served versions may change bytes or vanish; history is gone. |
 | Uploaded packages and their indexes | each store in `storage.stores` | Yes | Uploaded packages are gone. |
-| Registry metadata and archives | `storage.cache` | No | Fetched again from upstream. |
+| Registry metadata and archives, checksum database tiles, Go pseudo-version zips | `storage.cache` | No | Fetched or built again. |
 | Git mirrors, SSH key files, spooled uploads, downloads in progress | `storage.work_dir` | No | Mirrors are cloned again; key files are rewritten at every start. |
 
 The state store and the hosted stores hold private packages; protect their
 backups as you protect the stores.
 
 The state store's keys are `pins/`, `composer-git/`, `pypi-git/`,
-`provenance/` and `audit/`. tspackages only ever creates objects there and
-never overwrites or deletes one. A hosted store holds `composer/` and `pypi/`;
+`go-git/`, `go-pseudo/`, `go-sumdb/`, `provenance/` and `audit/`.
+tspackages only ever creates objects there and never deletes one. The one
+object it overwrites is `go-sumdb/sum.golang.org/latest`, the latest
+verified checksum database tree head, rewritten whenever the tree grows. A hosted store holds `composer/` and `pypi/`;
 its objects never change either, except each package's `index.json`, which is
 rewritten on every upload and can be rebuilt from the other objects.
 
@@ -210,8 +212,9 @@ container:
 
 - Turn on **versioning** on the state and hosted buckets, and **Object
   Lock** with a default retention on the state bucket. tspackages never
-  overwrites or deletes in the state store, so a retention period doesn't
-  get in its way. Use separate buckets for the state store and the hosted
+  deletes in the state store, so a retention period doesn't get in its way.
+  `go-sumdb/sum.golang.org/latest` gets a new version on every write; a
+  lifecycle rule may expire its noncurrent versions. Use separate buckets for the state store and the hosted
   stores, so each gets its own settings.
 - Use **governance mode** if you may ever need to purge something, such as
   a leaked secret: an account with the bypass permission can then remove
@@ -242,7 +245,8 @@ container:
    records at once, but the package stays out of the `/pypi/simple/` project
    list until its next upload; pip and uv don't read that list.
 4. Start tspackages. `/readyz` answers `ok` once every store is reachable.
-   PyPI releases already in the state store are served at once. Names
+   PyPI releases and Go tag versions already in the state store are
+   served at once. Names
    claimed by a Composer git source answer `502` until the first index
    pass, which starts at once and clones the mirrors first. See
    [When the registry is down](#when-the-registry-is-down) for PyPI git
@@ -269,6 +273,11 @@ moment: hosted packages need nothing from the state store.
   `shasum` in existing `composer.lock` files no longer matches. PyPI sdists
   are regenerated; they come out the same only while the sdist format is
   unchanged and the same tagged commit wins, otherwise hash-pinned lock files break.
+  Go module zips are built again from the tags as they are now. Their
+  `h1:` hashes match while a tag still points at its first commit; a tag
+  moved since then gives a version that `go.sum` files reject. Pseudo-version records are lost, and
+  with them the `h1:` check on rebuilds. The checksum database tree head is
+  fetched again, so a fork from before the loss goes unnoticed.
   Versions whose tags are gone upstream are lost. Provenance and audit
   records are lost, and the check for registry archives that changed
   upstream starts over.
@@ -279,7 +288,9 @@ moment: hosted packages need nothing from the state store.
   registry metadata is served stale; without a cache those requests fail.
 - **`work_dir`.** Mirrors are cloned again. A Composer remote that is
   unreachable at that point serves its pinned versions from the stored
-  archives; PyPI releases already stored stay served either way.
+  archives; PyPI releases and Go tag versions already stored stay served
+  either way. Go pseudo-versions answer `502` until their commits are in
+  the new mirror.
 
 ## Upgrading
 
@@ -338,9 +349,11 @@ Metrics:
   `tspackages_cache_hits_total`, `tspackages_rate_limited_total` and
   `tspackages_build_info{version,commit}`.
 
-The status page shows each source's health, tags that moved upstream,
-Composer packages declared by several remotes, registry archives whose bytes
-changed, and PyPI git conflicts and skipped packages. It shows what the
+The status page has a section per configured ecosystem, with each source's
+health, tags that moved upstream, Composer packages declared by several
+remotes, registry archives whose bytes changed, PyPI git conflicts and
+skipped packages, and Go tags that were skipped, refused or moved and the
+state of the sum.golang.org verifier. It shows what the
 running process has seen; restarts clear the moved-tag and changed-archive
 lists until those are seen again. The logs are the lasting record. Lines
 worth an alert:
@@ -362,9 +375,15 @@ worth an alert:
 | `pypi git: a rebuilt sdist differs from its release record; not written` | warn | Rebuilding a stored release's missing sdist gave other bytes. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
 | `pypi git: repairing a release failed` | error | A stored release lacks its sdist and couldn't be built again. |
+| `goproxy git: pass failed` | error | A whole Go index pass failed. |
+| `goproxy git: sync failed; indexing the local mirror` | warn | A remote is unreachable. |
+| `goproxy git: tag moved upstream; serving the stored version` | warn | A tag was force-pushed. The stored version keeps the first commit. |
+| `goproxy git: tag version skipped`, `goproxy git: tag version refused` | warn | A tag isn't served; `reason` says why (see [Size refusals](#size-refusals)). |
+| `goproxy git: stored version refused`, `goproxy git: pseudo-version refused` | warn | A rebuild gave another `h1:` than the record, or the commit is gone; the version answers `502`. |
+| `go checksum database misbehaved` | error | sum.golang.org contradicted the stored tree head; registry fetches fail until restart (see [The checksum database](#the-checksum-database)). |
 | `composer upstream unhealthy`, `pypi upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
 | `left symlinks out of a git archive` | warn | A git-built archive lacks the listed symlinks. |
-| `composer source failed`, `pypi source failed` | error | A request ended in `5xx`. |
+| `composer source failed`, `pypi source failed`, `go source failed` | error | A request ended in `5xx`. |
 | `not ready` | warn | `/readyz` failed. |
 
 PyPI git conflicts (a release changed without a version bump, divergent
@@ -374,6 +393,98 @@ path, `pyproject.toml` or workspace over the caps in the
 appear on the status page only, not in the logs. A refusal is remembered
 for the commit until restart; a fixed repository needs a new tag, and with
 it a new version, anyway.
+
+## Go
+
+### Client setup
+
+Each machine runs, with the `GONOSUMDB` value from the status page:
+
+```sh
+go env -w GOPROXY=https://<hostname>.<tailnet>.ts.net/go
+go env -w GONOSUMDB=github.com/acme
+go env -u GOPRIVATE GONOPROXY
+```
+
+`GOPRIVATE` must be unset, not only `GONOSUMDB` set. It is the default for
+`GONOPROXY` and `GONOSUMDB`, and the go command falls back to it when either
+is set to an empty value. With `GOPRIVATE` covering the private paths, the
+go command fetches those modules straight from VCS, which needs git
+credentials on every machine and skips tspackages' tag pins. `GOPROXY`
+takes no `,direct` and no `|`: a `404` for a private module would fall
+through to VCS. CI runners need the same three settings, as environment
+variables or with `go env -w`.
+
+### Rate limits
+
+A cold `go mod download` or `go build` makes several requests per module
+(`list` or `.info`, `.mod`, `.zip`, and for public modules checksum database
+lookup and tile requests), and over HTTPS the go command repeats every `4xx` once.
+A `429` fails the go command; it doesn't retry. Size `requests_per_second`
+and `burst` for a CI job that downloads its whole module graph from an
+empty cache.
+
+### Builds
+
+Each `git` source has one build queue with 2 workers. A job has 10 minutes
+from when a worker takes it. A request for a tag version, a pseudo-version
+zip or a repair goes ahead of the index pass's work. A pass syncs each
+remote, queues every tag version that isn't stored yet and never waits for
+the builds.
+
+A request for an unknown version, a branch or a commit syncs that remote
+first, at most once per 10 seconds per remote, pass syncs included. A
+request waits at most 30 seconds in all, for the sync and its build, then
+answers `502`; the go command reports that and stops, so run it again
+later. Until a remote has synced once since tspackages
+started, its modules serve their stored versions and recorded
+pseudo-versions only, and everything else answers `502`, never `404`.
+
+### Size refusals
+
+A module is refused, reported on the status page and remembered for its
+commit until restart when:
+
+- its root directory in the repository holds more than 100,000 files;
+- the archive it is built from is over 500MiB or `max_artifact_bytes`. The
+  archive is stored uncompressed (`git archive -0`) and holds files the
+  module zip later drops (nested modules, `vendor/`), so this cap counts
+  more bytes than the go command's own 500MiB limit on compressed output;
+- its `go.mod` or root `LICENSE` is over 16MiB;
+- its `go` directive is newer than the Go version tspackages was built
+  with, or doesn't parse. An upgrade and restart builds it again.
+
+Building a zip holds one entry record per file in memory, bounded by the
+500MiB cap at up to 200,000 archive entries; the bytes stream through temp
+files in `<work_dir>/go-build/`.
+
+### Cache sizing
+
+Pseudo-version zips live in the cache and are rebuilt on demand from the
+mirror. The cache must hold at least the largest pseudo-version zip you
+serve: a zip larger than the whole cache is dropped as it is stored, and
+every request for it builds it again and fails. Tag versions live in the
+state store and don't count.
+
+### The checksum database
+
+Registry `.mod` and `.zip` files are checked against sum.golang.org before
+they are cached. The latest verified tree head is kept in the state store
+under `go-sumdb/sum.golang.org/latest`, so a rolled-back or forked database
+is detected across restarts. When the database answers with a tree that
+contradicts it, tspackages logs `go checksum database misbehaved` at error
+and every registry fetch that needs a lookup fails with `502` until
+restart. Cached registry versions keep being served. The status page shows
+the sum.golang.org row as the security error while the verified tiles are
+still cached; after they are evicted, every lookup still fails, but the row shows
+`lookup failed`.
+
+If the stored tree head itself is bad (it can't be verified with the key, or
+the object is corrupt), stop tspackages, delete
+`go-sumdb/sum.golang.org/latest` from the state store and start it again.
+The next lookup stores a new tree head. Do this only once you are sure
+sum.golang.org itself isn't the problem: deleting the object also forgets
+the tree head a real fork would be checked against.
 
 ## Removing a bad publish
 

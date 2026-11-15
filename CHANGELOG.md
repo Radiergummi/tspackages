@@ -16,6 +16,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   settings (`GONOSUMDB` from the git sources), skipped, refused and moved
   tags, and the checksum database's state.
 
+### Changed
+
+- The status page has a section per ecosystem, each with its client
+  settings and tables; an ecosystem that isn't configured has no section.
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

@@ -168,3 +168,49 @@ tailnet. Read this before you deploy.
   source is passed through.
 - Upstream file entries without a SHA256 are dropped from served pages, so
   nothing upstream is served unverified.
+
+## Go
+
+- Module paths are case-sensitive, but claims and `go:` rules match the
+  lowercase path, so `github.com/Acme/x` can't slip past a
+  `github.com/acme/*` claim. Claims and rules accept `*` or `/`-separated
+  segments of `[a-z0-9._~-]` and `*`; anything else is a config error, or a
+  rule that grants nothing. A claim covers every major version of its
+  module, and `github.com/acme/*` doesn't cover `github.com/acme`.
+- A `git` source's claims become every client's `GONOSUMDB`, so claims that
+  would turn off checksum verification for public modules are config
+  errors: `*`, a wildcard in the host, and under `github.com`, `gitlab.com`
+  or `bitbucket.org` the bare host or a wildcard in the owner segment. Every
+  `modules` key must match a claim. A whole-host claim (`go.acme.dev/*`)
+  is allowed with a warning at startup.
+- **Tag versions are durable.** A tag version's zip is built once, stored
+  in the state store with its `h1:` hashes and served from there for good,
+  even after the tag moves or the remote is gone. A zip missing from the
+  store is rebuilt from the recorded commit and kept only if its `h1:`
+  equals the record's. The zip has the `h1:` that `go mod download` computes
+  from the repository, so it matches `go.sum` files written without
+  tspackages.
+- Pseudo-versions are built into the cache on demand, and the first build
+  records the commit and `h1:` in the state store; every rebuild must match
+  the record. This is the one exception to "served git versions stay
+  served": a pseudo-version whose commit is gone from the mirror becomes
+  unavailable (`502`), even with its zip still cached.
+- Only allowlisted branches and commits reachable from them or from a
+  stored tag can be queried; any other commit answers `404`, even if it is
+  in the mirror.
+- Registry `.mod` and `.zip` files are verified against sum.golang.org
+  before they are cached, and the zip's last byte is held back until its
+  `h1:` matched. A cached zip is checked against its recorded SHA256 while
+  it streams. The latest verified tree head is kept in the state store, so
+  a rolled-back or forked database is detected across restarts, and from
+  then on registry fetches fail closed until restart.
+- **Private paths never reach sum.golang.org.** A checksum lookup for a path
+  that any `git` source claims answers `404` with "add it to GONOSUMDB"
+  without leaving the node; any other lookup is forwarded only for a path that
+  resolves to a `registry` source.
+- The git source runs no repository code: it reads `go.mod` and runs
+  `git archive` with the module zip rules of the go command, with user and
+  system git attributes turned off. Module roots over 100,000 files,
+  archives over 500MiB, and `go.mod` or `LICENSE` files over 16MiB are
+  refused and reported. Builds run in a queue of 2 workers with a 10-minute
+  limit each, so a push can't block other modules.
