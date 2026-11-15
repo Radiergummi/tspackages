@@ -6,6 +6,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- A Go module proxy at `/go/` (the `GOPROXY` protocol) with a checksum
+  database proxy at `/go/sumdb/sum.golang.org/`. Sources: `git`, which
+  builds module zips from tagged versions and pseudo-versions of configured
+  modules, and `registry` for `proxy.golang.org` pass-through, verified
+  against sum.golang.org before caching. The status page lists the `go env`
+  settings (`GONOSUMDB` from the git sources), skipped, refused and moved
+  tags, and the checksum database's state.
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

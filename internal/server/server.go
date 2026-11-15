@@ -33,7 +33,11 @@ import (
 type Hooks struct {
 	AllowPrivateUpstreams bool // upstream.Options.AllowPrivateForTesting
 	AllowFileRemotes      bool // gitmirror.Options.AllowFileRemotesForTesting
+	GoSumDB               GoSumDB
 }
+
+// GoSumDB replaces sum.golang.org's URL and verifier key. Test-only.
+type GoSumDB struct{ URL, Key string }
 
 // shared holds what every ecosystem builder may use.
 type shared struct {
@@ -66,7 +70,7 @@ type built struct {
 var builders = []struct {
 	name  string
 	build func(sh *shared, e config.Ecosystem) (built, error)
-}{{"composer", buildComposer}, {"pypi", buildPyPI}}
+}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}}
 
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
@@ -77,8 +81,8 @@ var onMirror = func(*gitmirror.Mirror) {}
 // they have stopped (run it in a goroutine). Git mirrors live in
 // <work_dir>/git, and directories there that belong to no configured mirror
 // are removed; SSH key material is rewritten to <work_dir>/keys
-// (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources) at
-// every start.
+// (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources,
+// go/<source>.* for Go sources) at every start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
 	if err := config.ValidateWith(cfg, config.ValidateOptions{
@@ -271,17 +275,19 @@ func pruneMirrorDirs(gitDir string, mirrors mirrorSet) error {
 	return nil
 }
 
-// prepareWorkDir makes work_dir and its git/, keys/ and uploads/
-// subdirectories private, and empties keys/ (so only the current key material
-// remains) and uploads/ (spooled uploads an earlier run left behind).
+// prepareWorkDir makes work_dir and its git/, keys/, uploads/ and go-build/
+// subdirectories private, and empties keys/ (so only the current key
+// material remains), uploads/ (spooled uploads an earlier run left behind)
+// and go-build/ (Go git archives an earlier run left behind).
 func prepareWorkDir(dir string) (gitDir, keyDir, uploadDir string, err error) {
 	gitDir, keyDir, uploadDir = filepath.Join(dir, "git"), filepath.Join(dir, "keys"), filepath.Join(dir, "uploads")
-	for _, d := range []string{dir, gitDir, keyDir, uploadDir} {
+	goBuildDir := filepath.Join(dir, "go-build")
+	for _, d := range []string{dir, gitDir, keyDir, uploadDir, goBuildDir} {
 		if err := workdir.EnsurePrivateDir(d); err != nil {
 			return "", "", "", err
 		}
 	}
-	for _, d := range []string{keyDir, uploadDir} {
+	for _, d := range []string{keyDir, uploadDir, goBuildDir} {
 		entries, err := os.ReadDir(d)
 		if err != nil {
 			return "", "", "", err

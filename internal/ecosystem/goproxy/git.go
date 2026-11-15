@@ -475,7 +475,24 @@ func (g *GitSource) indexRemotes(ctx context.Context, remotes []string) error {
 			g.log.Warn("goproxy git: indexing a remote failed", "source", g.name, "remote", metrics.RedactRemote(remote), "error", err)
 		}
 	}
+	metrics.SetGitLastSync(ecoName, g.name, g.oldestSync())
 	return nil
+}
+
+// oldestSync returns the oldest last successful sync among the remotes, or
+// the zero time while one has never synced.
+func (g *GitSource) oldestSync() time.Time {
+	var oldest time.Time
+	for i, remote := range g.remotes {
+		t := g.mirrors[remote].LastSync()
+		if t.IsZero() {
+			return time.Time{}
+		}
+		if i == 0 || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return oldest
 }
 
 func (g *GitSource) passRemote(ctx context.Context, remote string) error {

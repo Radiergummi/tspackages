@@ -409,9 +409,7 @@ func TestBuildersCoverEveryEcosystem(t *testing.T) {
 		names = append(names, b.name)
 	}
 	slices.Sort(names)
-	want := slices.DeleteFunc(config.SupportedEcosystems(), func(n string) bool {
-		return n == "go" // TODO(Task 20): remove; the server has no Go builder yet
-	})
+	want := config.SupportedEcosystems()
 	if !slices.Equal(names, want) {
 		t.Fatalf("builders = %v, config.SupportedEcosystems = %v", names, want)
 	}
