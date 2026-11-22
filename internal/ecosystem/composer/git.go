@@ -795,7 +795,10 @@ func (g *GitSource) Health(context.Context) []metrics.Health {
 	g.hmu.RUnlock()
 	var out []metrics.Health
 	for i, m := range g.mirrors {
-		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Scoped: true, Package: status[i].pkg}
+		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Ecosystem: "composer", Scoped: true}
+		if status[i].pkg != "" {
+			h.Packages = []string{status[i].pkg}
+		}
 		last := m.LastSync()
 		switch {
 		case !status[i].indexed:
@@ -811,7 +814,7 @@ func (g *GitSource) Health(context.Context) []metrics.Health {
 		out = append(out, h)
 	}
 	if len(g.idx.Load().conflicts) > 0 {
-		out = append(out, metrics.Health{Name: g.name + " conflicts", Detail: "conflict"})
+		out = append(out, metrics.Health{Name: g.name + " conflicts", Ecosystem: "composer", Detail: "conflict"})
 	}
 	return out
 }

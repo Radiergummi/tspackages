@@ -12,8 +12,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-
-	"github.com/radiergummi/tspackages/internal/gitmirror"
 )
 
 // ValidateOptions loosen validation for tests. Configuration never sets them.
@@ -40,7 +38,7 @@ func ValidateWith(c *Config, opts ValidateOptions) error {
 
 	for _, eco := range slices.Sorted(maps.Keys(c.Ecosystems)) {
 		e := c.Ecosystems[eco]
-		if eco != "composer" && eco != "pypi" {
+		if _, ok := ecosystems[eco]; !ok {
 			add("ecosystem %q is not supported yet", eco)
 			continue
 		}
@@ -228,7 +226,8 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 	type claim struct{ pattern, source string }
 	var earlier []claim // claims of the sources before s
 	unclaimed := 0
-	for _, s := range sources {
+	rules := ecosystems[eco]
+	for i, s := range sources {
 		add := func(format string, a ...any) {
 			errs = append(errs, fmt.Errorf("%s source %q: %s", eco, s.Name, fmt.Sprintf(format, a...)))
 		}
@@ -241,8 +240,8 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		}
 		seen[s.Name] = true
 		for _, c := range s.Claims {
-			if !validClaim(eco, c) {
-				add("invalid claim %q (%s)", c, claimHint[eco])
+			if !rules.validClaim(c) {
+				add("invalid claim %q (%s)", c, rules.hint)
 				continue
 			}
 			// Uploads go to the first claiming source, so a name that an
@@ -251,21 +250,19 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				continue
 			}
 			for _, e := range earlier {
-				if claimsOverlap(eco, c, e.pattern) {
+				if rules.overlap(c, e.pattern) {
 					add("claim %q overlaps claim %q of earlier source %q; uploads matching both would never be served (list the storage source first)", c, e.pattern, e.source)
 					break
 				}
 			}
 		}
 		for _, c := range s.Claims {
-			if validClaim(eco, c) {
+			if rules.validClaim(c) {
 				earlier = append(earlier, claim{c, s.Name})
 			}
 		}
-		if len(s.Tags) > 0 && (eco != "pypi" || s.Type != "git") {
-			add("tags is only supported on pypi git sources")
-		} else {
-			validateTags(s, add)
+		if slices.Contains(rules.types, s.Type) {
+			rules.source(s, sources[:i], opts, add)
 		}
 
 		if len(s.Claims) == 0 && s.Type != "storage" {
@@ -278,34 +275,19 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			add("poll_interval must not be negative")
 		}
 		switch s.Type {
+		case "git", "storage", "registry":
+			if !slices.Contains(rules.types, s.Type) {
+				add("type %q is not supported for %s", s.Type, eco)
+				continue
+			}
+		}
+		switch s.Type {
 		case "storage":
 			if len(s.Claims) == 0 {
 				errs = append(errs, fmt.Errorf("%s: storage source %q must have claims", eco, s.Name))
 			}
 			if _, ok := stores[s.Store]; !ok {
 				add("unknown store %q", s.Store)
-			}
-		case "git":
-			if len(s.Remotes) == 0 {
-				add("remotes is required")
-			}
-			ssh := false
-			for _, r := range s.Remotes {
-				kind, err := gitmirror.RemoteKind(r, opts.AllowFileRemotes)
-				switch {
-				case errors.Is(err, gitmirror.ErrRemoteCredentials):
-					add("remote must not contain credentials; use token")
-				case err != nil:
-					add("unsupported remote scheme in %q (use https:// or ssh)", r)
-				case kind == "ssh":
-					ssh = true
-				}
-			}
-			if ssh && s.KnownHosts == "" {
-				add("known_hosts is required for SSH remotes")
-			}
-			if eco == "pypi" && len(s.Branches) > 0 {
-				add("branches are not supported for pypi (Python indexes have no branch versions)")
 			}
 		case "registry":
 			if s.URL == "" {
@@ -324,9 +306,6 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				if u.Scheme != "https" && (u.Scheme != "http" || !opts.AllowHTTPUpstreams) {
 					add("url %q must use https", s.URL)
 				}
-				if eco == "pypi" && !strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/simple") {
-					add("url %q must point at a simple index (ending in /simple/)", s.URL)
-				}
 				if !HostAllowed(s.FetchHosts, u) {
 					add("url host %q is not in fetch_hosts", u.Host)
 				}
@@ -343,6 +322,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 					add("download_credentials host %q is not in fetch_hosts", host)
 				}
 			}
+		case "git": // checked by the ecosystem's source hook
 		default:
 			add("type must be git, storage or registry, got %q", s.Type)
 		}
@@ -364,11 +344,6 @@ var (
 	// between two non-empty parts, as in every normalised name.
 	pypiClaimRe = regexp.MustCompile(`^([a-z0-9*]+(-[a-z0-9*]+)+|\**[a-z0-9][a-z0-9*]*)$`)
 )
-
-var claimHint = map[string]string{
-	"composer": `use "*" or "<vendor>/<name>" in lowercase [a-z0-9_.*-]`,
-	"pypi":     `use "*" or a normalised name pattern of [a-z0-9-] and "*"`,
-}
 
 // validClaim accepts "*" or a pattern in the ecosystem's normalised name
 // grammar (Composer: exactly two lowercase segments), so a claim can never be

@@ -684,3 +684,38 @@ func TestCacheHitWithholdsLastByte(t *testing.T) {
 		t.Fatalf("read %d of %d bytes, err %v", len(got), len(body), err)
 	}
 }
+
+func TestOnCommitSeesTempFile(t *testing.T) {
+	r, _, _ := newRelay(t)
+	data := bytes.Repeat([]byte("zip-bytes "), 1000)
+	var calls atomic.Int32
+	var path, sum string
+	onCommit := func(_ context.Context, res Result) error {
+		path = res.Path
+		b, err := os.ReadFile(res.Path)
+		if err != nil {
+			return err
+		}
+		s := sha256.Sum256(b)
+		sum = hex.EncodeToString(s[:])
+		if sum != res.SHA256 {
+			t.Errorf("temp file sha256 %s, result %s", sum, res.SHA256)
+		}
+		return nil
+	}
+	rc, _, _, err := r.Open(context.Background(), "k", digestOf(data), bytesFetch(data, &calls), onCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if path == "" || sum != digestOf(data).SHA256 {
+		t.Fatalf("onCommit saw path %q, sha256 %q", path, sum)
+	}
+	r.Wait() // the temp file is deleted after the background cache write
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp file still there: %v", err)
+	}
+}

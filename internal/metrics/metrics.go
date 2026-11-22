@@ -21,10 +21,13 @@ type Health struct {
 	Name   string
 	OK     bool
 	Detail string
-	// Scoped rows describe one package's remote and are shown only to callers
-	// allowed to read Package ("" while unknown: shown to nobody).
-	Scoped  bool
-	Package string
+	// Ecosystem names the ecosystem the row belongs to; its status section's
+	// matcher filters Scoped rows.
+	Ecosystem string
+	// Scoped rows describe one remote and are shown only to callers allowed to
+	// read any of Packages (none known: shown to nobody).
+	Scoped   bool
+	Packages []string
 }
 
 // StatusSource reports its health on the status page.

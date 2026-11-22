@@ -14,8 +14,6 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/authz"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
-	"github.com/radiergummi/tspackages/internal/ecosystem/composer"
-	"github.com/radiergummi/tspackages/internal/ecosystem/pypi"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
@@ -33,17 +31,13 @@ var statusTmpl = template.Must(template.New("status").Parse(statusHTML))
 
 // Web serves /, /healthz, /readyz and /metrics.
 type Web struct {
-	hostname  string
-	eco       []ecosystem.Ecosystem
-	sources   []StatusSource
-	moved     func() []pins.MovedTag
-	conflicts func() []composer.Conflict
-	changed   func() []composer.ChangedDist
-	pypiConf  func() []pypi.Conflict
-	pypiSkip  func() []pypi.Skipped
-	ready     func(ctx context.Context) error
+	hostname string
+	eco      []ecosystem.Ecosystem
+	sources  []StatusSource
+	moved    func() []pins.MovedTag
+	sections []Section
+	ready    func(ctx context.Context) error
 
-	movedPkg     func(pins.MovedTag) string // package a moved tag's remote declares
 	readyTimeout time.Duration
 }
 
@@ -54,32 +48,17 @@ type Options struct {
 	Ecosystems []ecosystem.Ecosystem
 	Sources    []StatusSource
 	Moved      func() []pins.MovedTag
-	// MovedPkg names the package a moved tag's remote declares, so the status
-	// page shows the tag only to callers allowed to read that package; without
-	// it moved tags are hidden.
-	MovedPkg  func(pins.MovedTag) string
-	Conflicts func() []composer.Conflict
-	Changed   func() []composer.ChangedDist // dists whose upstream bytes changed
-	// PyPIConflicts and PyPISkipped report the pypi git sources' releases
-	// that are not served as tagged, and packages that cannot be served.
-	PyPIConflicts func() []pypi.Conflict
-	PyPISkipped   func() []pypi.Skipped
-	Ready         func(ctx context.Context) error
+	// Sections describe the ecosystems' parts of the page, in display order.
+	Sections []Section
+	Ready    func(ctx context.Context) error
 }
 
 // New returns the status endpoints.
 func New(o Options) *Web {
-	w := &Web{hostname: o.Hostname, eco: o.Ecosystems, sources: o.Sources, moved: o.Moved, movedPkg: o.MovedPkg,
-		conflicts: o.Conflicts, changed: o.Changed, pypiConf: o.PyPIConflicts, pypiSkip: o.PyPISkipped,
+	w := &Web{hostname: o.Hostname, eco: o.Ecosystems, sources: o.Sources, moved: o.Moved, sections: o.Sections,
 		ready: o.Ready, readyTimeout: 5 * time.Second}
-	if w.moved == nil || w.movedPkg == nil {
+	if w.moved == nil {
 		w.moved = func() []pins.MovedTag { return nil }
-	}
-	if w.conflicts == nil {
-		w.conflicts = func() []composer.Conflict { return nil }
-	}
-	if w.changed == nil {
-		w.changed = func() []composer.ChangedDist { return nil }
 	}
 	if w.ready == nil {
 		w.ready = func(context.Context) error { return nil }
@@ -146,12 +125,8 @@ type pageData struct {
 	Ecosystems []string
 	Health     []Health
 	Moved      []pins.MovedTag
-	Conflicts  []conflictView
-	Changed    []composer.ChangedDist
-	Composer   bool
-	PyPI       bool
-	PyPIConf   []pypi.Conflict
-	PyPISkip   []pypi.Skipped
+	Shared     []tableView // level 2 tables of the mounted sections
+	Sections   []sectionView
 }
 
 func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
@@ -165,65 +140,37 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 		host = w.hostname
 	}
 	d := pageData{Host: host}
+	mounted := map[string]bool{}
 	for _, e := range w.eco {
 		d.Ecosystems = append(d.Ecosystems, e.Name())
-		switch e.Name() {
-		case "composer":
-			d.Composer = true
-		case "pypi":
-			d.PyPI = true
-		}
+		mounted[e.Name()] = true
 	}
 	slices.Sort(d.Ecosystems)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	allowed := func(pkg string) bool {
-		return authz.Allowed(caller.Rules, "composer", pkg, authz.Read, composer.Match)
+	shown := map[string]Section{}
+	for _, s := range w.sections {
+		if mounted[s.Ecosystem] {
+			shown[s.Ecosystem] = s
+			d.Sections = append(d.Sections, s.view(caller, host))
+			for _, t := range s.Tables {
+				if t.Level == 2 {
+					d.Shared = append(d.Shared, s.tableView(caller, t))
+				}
+			}
+		}
 	}
-	for _, s := range w.sources {
-		for _, h := range s.Health(ctx) {
-			if !h.Scoped || (h.Package != "" && allowed(h.Package)) {
+	for _, src := range w.sources {
+		for _, h := range src.Health(ctx) {
+			if s, ok := shown[h.Ecosystem]; !h.Scoped || (ok && s.readable(caller, h.Packages)) {
 				d.Health = append(d.Health, h)
 			}
 		}
 	}
 	for _, m := range w.moved() {
-		if allowed(w.movedPkg(m)) {
+		if s, ok := shown[m.Ecosystem]; ok && s.MovedPackage != nil && s.readable(caller, []string{s.MovedPackage(m)}) {
 			m.Remote = metrics.RedactRemote(m.Remote)
 			d.Moved = append(d.Moved, m)
-		}
-	}
-	for _, c := range w.conflicts() {
-		if !allowed(c.Package) {
-			continue
-		}
-		v := conflictView{Package: c.Package}
-		for _, r := range c.Remotes {
-			v.Remotes = append(v.Remotes, metrics.RedactRemote(r))
-		}
-		d.Conflicts = append(d.Conflicts, v)
-	}
-	pypiAllowed := func(pkg string) bool {
-		return pkg != "" && authz.Allowed(caller.Rules, "pypi", pkg, authz.Read, pypi.Match)
-	}
-	if w.pypiConf != nil {
-		for _, c := range w.pypiConf() {
-			if pypiAllowed(c.Package) {
-				d.PyPIConf = append(d.PyPIConf, c)
-			}
-		}
-	}
-	if w.pypiSkip != nil {
-		for _, s := range w.pypiSkip() {
-			if pypiAllowed(s.Package) {
-				s.Remote = metrics.RedactRemote(s.Remote)
-				d.PyPISkip = append(d.PyPISkip, s)
-			}
-		}
-	}
-	for _, c := range w.changed() {
-		if allowed(c.Package) {
-			d.Changed = append(d.Changed, c)
 		}
 	}
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -233,11 +180,6 @@ func (w *Web) status(rw http.ResponseWriter, r *http.Request) {
 	if err := statusTmpl.Execute(rw, d); err != nil {
 		http.Error(rw, "internal error", http.StatusInternalServerError)
 	}
-}
-
-type conflictView struct {
-	Package string
-	Remotes []string
 }
 
 // hasAnyRule reports whether the rules hold at least one read or write entry.

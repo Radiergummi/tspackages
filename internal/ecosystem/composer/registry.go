@@ -452,7 +452,7 @@ func (s *RegistrySource) noteFetch(ctx context.Context, err error, haveCache boo
 func (s *RegistrySource) Health(context.Context) []metrics.Health {
 	s.hmu.Lock()
 	defer s.hmu.Unlock()
-	h := metrics.Health{Name: s.name, OK: s.fetchErr == nil, Detail: "no upstream fetch has failed"}
+	h := metrics.Health{Name: s.name, Ecosystem: "composer", OK: s.fetchErr == nil, Detail: "no upstream fetch has failed"}
 	if s.fetchErr != nil {
 		// Category only; the error itself was logged when it occurred or changed.
 		h.Detail = "upstream error"

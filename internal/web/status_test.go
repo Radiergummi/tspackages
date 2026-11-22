@@ -1,4 +1,4 @@
-package web
+package web_test
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/pins"
+	"github.com/radiergummi/tspackages/internal/web"
 )
 
 type fakeEco struct{}
@@ -25,16 +26,25 @@ func (fakeEco) Mount(*http.ServeMux) {}
 
 var _ ecosystem.Ecosystem = fakeEco{}
 
-type fakeSource []Health
+type fakeSource []metrics.Health
 
-func (f fakeSource) Health(context.Context) []Health { return f }
+func (f fakeSource) Health(context.Context) []metrics.Health { return f }
 
-func serve(t *testing.T, w *Web, path string, c *identity.Caller) *httptest.ResponseRecorder {
+func serve(t *testing.T, w *web.Web, path string, c *identity.Caller) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveHost(t, w, "pkgs.tail.ts.net", c, path)
+}
+
+func serveHost(t *testing.T, w *web.Web, host string, c *identity.Caller, path ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	p := "/"
+	if len(path) > 0 {
+		p = path[0]
+	}
 	mux := http.NewServeMux()
 	w.Mount(mux)
-	r := httptest.NewRequest("GET", path, nil)
-	r.Host = "pkgs.tail.ts.net"
+	r := httptest.NewRequest("GET", p, nil)
+	r.Host = host
 	if c != nil {
 		r = r.WithContext(identity.WithCaller(r.Context(), *c))
 	}
@@ -55,18 +65,17 @@ func movedPkg(m pins.MovedTag) string {
 	return "a/x"
 }
 
-func newWeb(ready func(context.Context) error) *Web {
-	return New(Options{
+func newWeb(ready func(context.Context) error) *web.Web {
+	return web.New(web.Options{
 		Hostname:   "fallback",
 		Ecosystems: []ecosystem.Ecosystem{fakeEco{}},
-		Sources:    []StatusSource{fakeSource{{Name: "main", OK: true, Detail: "fine"}, {Name: "<b>bad</b>", OK: false, Detail: "never indexed"}}},
+		Sources:    []web.StatusSource{fakeSource{{Name: "main", Ecosystem: "composer", OK: true, Detail: "fine"}, {Name: "<b>bad</b>", Ecosystem: "composer", OK: false, Detail: "never indexed"}}},
 		Moved: func() []pins.MovedTag {
 			return []pins.MovedTag{{Ecosystem: "composer", Source: "git", Remote: "https://x/y.git", Tag: "v1.0.0<script>", Pinned: "aaa", Seen: "bbb"}}
 		},
-		MovedPkg: movedPkg,
-		Conflicts: func() []composer.Conflict {
+		Sections: []web.Section{composer.StatusSection(func() []composer.Conflict {
 			return []composer.Conflict{{Package: "a/b", Remotes: []string{"r1", "r2"}}}
-		},
+		}, nil, movedPkg)},
 		Ready: ready,
 	})
 }
@@ -129,12 +138,12 @@ func TestProbeAccess(t *testing.T) {
 }
 
 func TestStatusFiltersScopedHealthRows(t *testing.T) {
-	w := New(Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}}, Sources: []StatusSource{fakeSource{
-		{Name: "store", OK: true, Detail: "fine"},
-		{Name: "git https://h/a.git", Scoped: true, Package: "a/x", OK: true, Detail: "x"},
-		{Name: "git https://h/b.git", Scoped: true, Package: "b/x", OK: true, Detail: "x"},
-		{Name: "git https://h/unknown.git", Scoped: true, OK: false, Detail: "never indexed"},
-	}}})
+	w := web.New(web.Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}}, Sources: []web.StatusSource{fakeSource{
+		{Name: "store", Ecosystem: "composer", OK: true, Detail: "fine"},
+		{Name: "git https://h/a.git", Ecosystem: "composer", Scoped: true, Packages: []string{"a/x"}, OK: true, Detail: "x"},
+		{Name: "git https://h/b.git", Ecosystem: "composer", Scoped: true, Packages: []string{"b/x"}, OK: true, Detail: "x"},
+		{Name: "git https://h/unknown.git", Ecosystem: "composer", Scoped: true, OK: false, Detail: "never indexed"},
+	}}, Sections: []web.Section{composer.StatusSection(nil, nil, nil)}})
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
 	body := serve(t, w, "/", c).Body.String()
 	for _, want := range []string{"store", "h/a.git"} {
@@ -167,7 +176,7 @@ func TestReadyzDoesNotLeakErrorText(t *testing.T) {
 
 func TestReadyzTimesOut(t *testing.T) {
 	w := newWeb(func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
-	w.readyTimeout = 20 * time.Millisecond
+	w.SetReadyTimeout(20 * time.Millisecond)
 	rec := serve(t, w, "/readyz", reader())
 	if rec.Code != 503 || rec.Body.String() != "not ready: timeout" {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
@@ -189,18 +198,17 @@ func TestReadyzClientCancelled(t *testing.T) {
 }
 
 func TestStatusFiltersByReadRules(t *testing.T) {
-	newW := func(movedPkg func(pins.MovedTag) string) *Web {
-		return New(Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}},
+	newW := func(movedPkg func(pins.MovedTag) string) *web.Web {
+		return web.New(web.Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}},
 			Moved: func() []pins.MovedTag {
 				return []pins.MovedTag{
-					{Source: "git", Remote: "https://tok@h/a.git", Tag: "v-a", Pinned: "1", Seen: "2"},
-					{Source: "git", Remote: "https://h/other.git", Tag: "v-b", Pinned: "1", Seen: "2"},
+					{Ecosystem: "composer", Source: "git", Remote: "https://tok@h/a.git", Tag: "v-a", Pinned: "1", Seen: "2"},
+					{Ecosystem: "composer", Source: "git", Remote: "https://h/other.git", Tag: "v-b", Pinned: "1", Seen: "2"},
 				}
 			},
-			MovedPkg: movedPkg,
-			Conflicts: func() []composer.Conflict {
+			Sections: []web.Section{composer.StatusSection(func() []composer.Conflict {
 				return []composer.Conflict{{Package: "a/x", Remotes: []string{"https://tok@h/1.git", "r2"}}, {Package: "b/x", Remotes: []string{"r3", "r4"}}}
-			},
+			}, nil, movedPkg)},
 		})
 	}
 	w := newW(movedPkg)
@@ -246,13 +254,13 @@ func TestMetricsExposed(t *testing.T) {
 }
 
 func TestStatusShowsChangedDistsByReadRules(t *testing.T) {
-	w := New(Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}},
-		Changed: func() []composer.ChangedDist {
+	w := web.New(web.Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{fakeEco{}},
+		Sections: []web.Section{composer.StatusSection(nil, func() []composer.ChangedDist {
 			return []composer.ChangedDist{
 				{Source: "packagist", Package: "a/x", Version: "1.0.0<i>", Reference: "ref-a", Pinned: "p-a", Seen: "s-a"},
 				{Source: "packagist", Package: "b/x", Version: "2.0.0", Reference: "ref-b", Pinned: "p-b", Seen: "s-b"},
 			}
-		},
+		}, nil)},
 	})
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"composer:a/*"}}}}
 	body := serve(t, w, "/", c).Body.String()
@@ -272,19 +280,18 @@ func (pypiEco) Name() string             { return "pypi" }
 func (pypiEco) Mount(mux *http.ServeMux) {}
 
 func TestStatusShowsPyPIByReadRules(t *testing.T) {
-	w := New(Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{pypiEco{}},
-		PyPIConflicts: func() []pypi.Conflict {
+	w := web.New(web.Options{Hostname: "h", Ecosystems: []ecosystem.Ecosystem{pypiEco{}},
+		Sections: []web.Section{pypi.StatusSection(func() []pypi.Conflict {
 			return []pypi.Conflict{
 				{Package: "acme-core", Version: "1.0.0", Kind: pypi.ConflictNoBump, Tags: []string{"api@<2>"}},
 				{Package: "other-x", Version: "1.0", Kind: pypi.ConflictDivergent, Tags: []string{"secret-tag"}},
 			}
-		},
-		PyPISkipped: func() []pypi.Skipped {
+		}, func() []pypi.Skipped {
 			return []pypi.Skipped{
 				{Remote: "https://h/mono.git", Tag: "v1", Dir: "packages/dyn", Package: "acme-dyn", Reason: "version is dynamic"},
 				{Remote: "https://h/x.git", Tag: "v1", Dir: "", Package: "", Reason: "name missing or invalid"},
 			}
-		},
+		})},
 	})
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"pypi:acme-*"}}}}
 	body := serve(t, w, "/", c).Body.String()

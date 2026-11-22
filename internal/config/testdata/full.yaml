@@ -29,3 +29,16 @@ ecosystems:
         fetch_hosts: [repo.packagist.org, api.github.com, codeload.github.com]
         download_credentials:
           api.github.com: {bearer: "${env:GITHUB_TOKEN}"}
+  go:
+    sources:
+      - name: matchory-git
+        type: git
+        claims: ["github.com/matchory", "github.com/matchory/*"]
+        modules:
+          github.com/matchory/sdk: https://github.com/matchory/sdk.git
+          github.com/matchory/mono/tools: {remote: https://github.com/matchory/mono.git, dir: tools}
+        token: ${env:GITHUB_TOKEN}
+      - name: goproxy
+        type: registry
+        url: https://proxy.golang.org
+        fetch_hosts: [proxy.golang.org, sum.golang.org]

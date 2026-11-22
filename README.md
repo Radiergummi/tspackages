@@ -6,7 +6,7 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Composer and PyPI ship today. Go, npm, OCI and Maven follow. Read
+Composer, PyPI and Go ship today. npm, OCI and Maven follow. Read
 [docs/security.md](docs/security.md) before you deploy, and
 [docs/operations.md](docs/operations.md) for backups, upgrades and monitoring.
 
@@ -169,6 +169,75 @@ the sdist, and setuptools includes non-Python package data only if
 `MANIFEST.in` or `package-data` lists it. Publish such packages through a
 `storage` source.
 
+## Go sources
+
+`/go/` speaks the `GOPROXY` protocol, with a checksum database proxy for
+sum.golang.org at `/go/sumdb/sum.golang.org/`. Go has `git` and `registry`
+sources; it has no publish command, so there is no `storage` source.
+
+```yaml
+ecosystems:
+  go:
+    sources:
+      - name: acme
+        type: git
+        claims: ["github.com/acme", "github.com/acme/*"]
+        modules:
+          github.com/acme/sdk: https://github.com/acme/sdk.git
+          github.com/acme/mono/tools: {remote: https://github.com/acme/mono.git, dir: tools}
+        branches: [main]                 # default: the remote's default branch
+        token: ${env:GIT_TOKEN}
+      - name: public
+        type: registry
+        url: https://proxy.golang.org
+        fetch_hosts: [proxy.golang.org, sum.golang.org]
+```
+
+| Type | Keys | Does |
+|------|------|------|
+| `git` | `modules`, `branches`, `ssh_key`, `known_hosts`, `token`, `poll_interval` | Tags become versions of the listed modules, built once into module zips and kept. Allowlisted branches and commits reachable from them answer with pseudo-versions. |
+| `registry` | `url` (`https://` only), `fetch_hosts` (must contain `sum.golang.org`), `metadata_ttl` | Pass-through to `proxy.golang.org`. Each `.mod` and `.zip` is checked against sum.golang.org before it is cached. |
+
+Module paths are case-sensitive, but claims and `go:` rules match the
+lowercase path, so `github.com/Acme/x` can't slip past `github.com/acme/*`.
+A claim is `*` or `/`-separated segments of `[a-z0-9._~-]` and `*`. A `*`
+inside a segment matches within that segment; a last segment of exactly `*`
+matches one or more segments. A claim covers every major version of its
+module (`github.com/acme/sdk` matches `github.com/acme/sdk/v2`), but
+`github.com/acme/*` doesn't match `github.com/acme`: claim both with
+`["github.com/acme", "github.com/acme/*"]`.
+
+`modules` maps each module path, without a `/vN` suffix, to its remote, or
+to `{remote, dir}` for a module in a subdirectory of the repository. An entry
+serves its path and every `<path>/vN`; one remote may carry several modules.
+Every key must match one of the source's claims. A `git` source's claims
+become the clients' `GONOSUMDB`, so a claim that would cover public modules
+fails validation: `*`, a wildcard in the host, and under `github.com`,
+`gitlab.com` or `bitbucket.org` the bare host or a wildcard in the owner
+segment. A claim of a whole host (`go.acme.dev/*`) is allowed with a warning
+at startup. A `registry` source may not come before a `git` source whose
+claims overlap its own. A path any `git` source claims is a miss on every
+`registry` source, so a claimed `registry` after a `git` source never sends
+it to its upstream or to sum.golang.org.
+
+A tag is a version when it is a canonical semantic version (`v1.2.3`, not `v1.2` or
+`1.2.3`), prefixed with the module's `dir` (`tools/v1.2.3`), and its major
+version fits the path. For `<path>/v2`, the tagged commit holds a `go.mod`
+declaring the `/v2` path either in the module's directory or in its `v2/`
+subdirectory. A tag whose commit has no `go.mod` declaring exactly the
+requested path is skipped and listed on the status page; there are no
+`+incompatible` versions. A version's zip has the `h1:` hash that
+`go mod download` computes from the repository, is built once and kept,
+and a moved tag keeps serving it.
+
+`@<branch>` (a branch the `branches` patterns allow, such as `@main`),
+`@latest` for a module without tags, and `@<sha>` (7 to 64 hex digits,
+reachable from an allowed branch or a stored tag) answer with the
+pseudo-version the go command computes. Branch names containing `/`,
+non-semver tag names and `HEAD` can't be queried; they answer `404`.
+Refused modules and the size limits are in
+[docs/operations.md](docs/operations.md#go).
+
 ## Client setup
 
 ### Composer
@@ -235,6 +304,27 @@ exists`, even with identical bytes (`twine upload --skip-existing` copes), and
 so is a second sdist, or a second wheel with the same tags, for a version
 already published under another spelling.
 
+### Go
+
+```sh
+go env -w GOPROXY=https://registry.<tailnet>.ts.net/go
+go env -w GONOSUMDB=github.com/acme      # the status page prints the value
+go env -u GOPRIVATE GONOPROXY
+```
+
+- Use tspackages as the only `GOPROXY` entry, without `,direct` or `|`. A
+  `404` for a private module would fall through to VCS after `,direct`, and
+  after `|` every error would.
+- `GONOSUMDB` lists the `git` sources' claims and module paths; copy the
+  value from the status page. Without it, the go command's checksum lookup
+  for a private module answers `404` with `is private: add it to GONOSUMDB`,
+  and the download fails. Private paths never reach sum.golang.org.
+- Unset `GOPRIVATE`: it is the default for `GONOPROXY` and `GONOSUMDB`, and
+  would send private modules past the proxy straight to VCS.
+- Leave `GOSUMDB` at its default. The go command finds the checksum
+  database at `/go/sumdb/sum.golang.org/` through `GOPROXY`, so public
+  modules are verified as usual, also by `go mod verify`.
+
 ## Tailnet policy
 
 Humans read; each publishing repo gets its own CI tag with write on its own
@@ -270,7 +360,7 @@ unioned. The capability name is configurable (`tailscale.capability`).
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
-make integration   # end-to-end with real Composer, pip, uv and twine
+make integration   # end-to-end with real Composer, pip, uv, twine and go
 make tailnet       # real tsnet nodes against an in-process control server
 make vuln          # govulncheck, failing on reachable findings
 ```

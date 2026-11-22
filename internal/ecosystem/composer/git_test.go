@@ -854,7 +854,7 @@ func TestServedVersionsSurviveUnreachableRemoteAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	art.Body.Close()
-	if h := g3.Health(ctx); h[0].OK || h[0].Package != "matchory/a" {
+	if h := g3.Health(ctx); h[0].OK || len(h[0].Packages) != 1 || h[0].Packages[0] != "matchory/a" {
 		t.Errorf("health: %+v", h[0])
 	}
 }

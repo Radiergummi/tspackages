@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -399,5 +400,17 @@ func TestBuildPyPIKeyFilesDoNotCollide(t *testing.T) {
 	}
 	if len(*got) != 3 {
 		t.Fatalf("%d mirrors, want 3", len(*got))
+	}
+}
+
+func TestBuildersCoverEveryEcosystem(t *testing.T) {
+	var names []string
+	for _, b := range builders {
+		names = append(names, b.name)
+	}
+	slices.Sort(names)
+	want := config.SupportedEcosystems()
+	if !slices.Equal(names, want) {
+		t.Fatalf("builders = %v, config.SupportedEcosystems = %v", names, want)
 	}
 }

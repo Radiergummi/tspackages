@@ -32,6 +32,7 @@ type Digest struct{ SHA1, SHA256 string }
 type Result struct {
 	SHA1, SHA256 string
 	Size         int64
+	Path         string // the completed temp file; readable only while onCommit runs, "" on cache hits
 }
 
 // Fetch opens the upstream artifact, returning its body and declared size
@@ -314,7 +315,9 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 		dl.mu.Unlock()
 	}
 	if err == nil && onCommit != nil {
+		res.Path = path
 		err = onCommit(ctx, res)
+		res.Path = ""
 	}
 	if err == nil {
 		dl.mu.Lock()

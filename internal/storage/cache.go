@@ -143,6 +143,19 @@ func (c *Cache) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// OpenObject reads key from d with its size. Over a RangeGetter driver the reader
+// also implements io.Seeker, reopening the object at the new offset.
+func OpenObject(ctx context.Context, d Driver, key string) (io.ReadCloser, int64, error) {
+	rc, info, err := d.Get(ctx, key)
+	if err != nil {
+		return nil, 0, err
+	}
+	if rg, ok := d.(RangeGetter); ok {
+		return &seekReader{ctx: ctx, rg: rg, key: key, size: info.Size, rc: rc}, info.Size, nil
+	}
+	return rc, info.Size, nil
+}
+
 // seekReader reads an object from off, reopening it with GetRange after a
 // Seek.
 type seekReader struct {

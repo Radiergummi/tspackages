@@ -72,6 +72,8 @@ type Mirror struct {
 	mu         sync.Mutex // serialises Sync; guards fetchClean
 	fetchClean bool       // the last fetch in this process completed, so no stale locks are left
 
+	scratchMu sync.Mutex // guards creation of the module-archive scratch repository; never held with mu
+
 	lastSync      atomic.Pointer[time.Time]
 	defaultBranch atomic.Pointer[string] // as last set from the remote by this process
 }
@@ -320,15 +322,22 @@ func (m *Mirror) followRemoteHead(ctx context.Context) error {
 	return nil
 }
 
+// refFormat is the for-each-ref format parseRefs reads.
+const refFormat = "--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)"
+
 // Refs lists tags and branches whose target is a commit; annotated tags
 // (including nested ones) are peeled to the commit.
 func (m *Mirror) Refs(ctx context.Context) ([]Ref, error) {
-	out, err := m.git(ctx, m.dir, nil, nil, "for-each-ref",
-		"--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objecttype)%00%(*objectname)",
-		"refs/tags", "refs/heads")
+	out, err := m.git(ctx, m.dir, nil, nil, "for-each-ref", refFormat, "refs/tags", "refs/heads")
 	if err != nil {
 		return nil, err
 	}
+	return parseRefs(out)
+}
+
+// parseRefs reads for-each-ref output in refFormat: the tags and branches
+// whose target, peeled, is a commit.
+func parseRefs(out []byte) ([]Ref, error) {
 	var refs []Ref
 	for line := range strings.SplitSeq(string(out), "\n") {
 		if line == "" {
@@ -373,13 +382,26 @@ func (m *Mirror) DefaultBranch(ctx context.Context) (string, error) {
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/heads/"), nil
 }
 
-// ErrTooLarge is wrapped by ReadFile for a file over its 1 MiB limit.
+// ErrTooLarge is wrapped by ReadFile and ReadFileMax for a file over the cap.
 var ErrTooLarge = errors.New("file over the read limit")
+
+// ErrNoCommit is wrapped, together with resolve.ErrNotFound, by ReadFile and
+// ReadFileMax when the commit itself is missing, so callers can tell it from
+// a missing path (a mirror re-created from a remote that dropped the commit
+// is not the commit's content).
+var ErrNoCommit = errors.New("commit not in the mirror")
 
 // ReadFile returns the content of the regular file path at commit. A missing
 // path or commit wraps resolve.ErrNotFound; files over 1 MiB wrap ErrTooLarge
 // (this is for small manifests such as composer.json and go.mod).
 func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, error) {
+	return m.ReadFileMax(ctx, commit, path, maxReadFile)
+}
+
+// ReadFileMax is ReadFile with the cap max: a missing path or commit, or a
+// path naming a tree or gitlink, wraps resolve.ErrNotFound (a missing commit
+// also wraps ErrNoCommit); a blob over max wraps ErrTooLarge. A symlink's blob (its target text) is returned as is.
+func (m *Mirror) ReadFileMax(ctx context.Context, commit, path string, max int64) ([]byte, error) {
 	if err := checkCommit(commit); err != nil {
 		return nil, err
 	}
@@ -404,8 +426,11 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 	if len(lines) != 2 {
 		return nil, fmt.Errorf("gitmirror: unexpected cat-file output %q", out)
 	}
+	if strings.HasSuffix(lines[0], " missing") {
+		return nil, fmt.Errorf("gitmirror: %s: %w: %w", commit, ErrNoCommit, resolve.ErrNotFound)
+	}
 	notFound := fmt.Errorf("gitmirror: %s:%s: %w", commit, path, resolve.ErrNotFound)
-	if strings.HasSuffix(lines[0], " missing") || strings.HasSuffix(lines[1], " missing") {
+	if strings.HasSuffix(lines[1], " missing") {
 		return nil, notFound
 	}
 	f := strings.Fields(lines[1]) // <sha> <type> <size>
@@ -416,8 +441,8 @@ func (m *Mirror) ReadFile(ctx context.Context, commit, path string) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("gitmirror: unexpected cat-file output %q", lines[1])
 	}
-	if size > maxReadFile {
-		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes: %w of %d bytes", commit, path, size, ErrTooLarge, maxReadFile)
+	if size > max {
+		return nil, fmt.Errorf("gitmirror: %s:%s is %d bytes: %w of %d bytes", commit, path, size, ErrTooLarge, max)
 	}
 	return m.git(ctx, m.dir, nil, nil, "cat-file", "blob", commit+":"+path)
 }
@@ -431,6 +456,124 @@ func (m *Mirror) ArchiveZip(ctx context.Context, commit string, w io.Writer) err
 		return err
 	}
 	_, err := m.git(ctx, m.dir, nil, w, "archive", "--format=zip", commit)
+	return err
+}
+
+// ErrArchiveFailed is wrapped by ArchiveModuleZip when git archive exits
+// non-zero for a reason in the commit's content (an unknown commit or
+// subdirectory, an unreadable object), as opposed to a cancelled context or a
+// failing writer.
+var ErrArchiveFailed = errors.New("git archive failed")
+
+// moduleArchiveCmd returns the arguments (after --git-dir) and environment of
+// the module archive command. The -c options and GIT_ATTR_NOSYSTEM keep user
+// and system configuration and attributes out of the archive.
+func (m *Mirror) moduleArchiveCmd(commit, subdir string) (args, env []string) {
+	args = []string{
+		"-c", "core.autocrlf=input",
+		"-c", "core.eol=lf",
+		"-c", "core.attributesFile=/dev/null",
+		"archive", "--format=zip", "-0", "--prefix=prefix/", commit,
+	}
+	if subdir != "" {
+		args = append(args, "--", subdir)
+	}
+	return args, append(m.env(), "GIT_ATTR_NOSYSTEM=1")
+}
+
+// scratchDir is the module-archive scratch repository of this mirror.
+func (m *Mirror) scratchDir() string {
+	return strings.TrimSuffix(m.dir, ".git") + ".go-archive"
+}
+
+// ensureScratch creates the scratch repository if it is missing or lacks its
+// alternates file. It takes scratchMu, never mu: Sync can hold mu for minutes.
+// Its info/attributes switch export-subst and export-ignore off, which the
+// shared mirror must not do for other archives; alternates make the mirror's
+// objects readable (safe because the mirror runs with gc.auto=0 and fetch
+// --prune drops refs, not objects).
+func (m *Mirror) ensureScratch(ctx context.Context) (string, error) {
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+	dir := m.scratchDir()
+	if _, err := os.Stat(filepath.Join(dir, "objects", "info", "alternates")); err == nil {
+		return dir, nil
+	}
+	tmp := dir + ".tmp"
+	for _, d := range []string{tmp, dir} {
+		if err := os.RemoveAll(d); err != nil {
+			return "", fmt.Errorf("gitmirror: clear scratch repository: %w", err)
+		}
+	}
+	if _, err := m.git(ctx, "", nil, nil, "init", "--bare", "--quiet", tmp); err != nil {
+		return "", err
+	}
+	for name, content := range map[string]string{
+		filepath.Join("objects", "info", "alternates"): filepath.Join(m.dir, "objects") + "\n",
+		filepath.Join("info", "attributes"):            "* -export-subst -export-ignore\n",
+	} {
+		p := filepath.Join(tmp, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// failWriter remembers the first error of the wrapped writer.
+type failWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (f *failWriter) Write(b []byte) (int, error) {
+	n, err := f.w.Write(b)
+	if err != nil && f.err == nil {
+		f.err = err
+	}
+	return n, err
+}
+
+// ArchiveModuleZip writes `git archive --format=zip -0 --prefix=prefix/
+// <commit> [-- <subdir>]` to w, run in a scratch repository with export-ignore
+// and export-subst off and no user or system attributes. It never takes mu.
+// A writer error (such as the caller's size cap) is returned as is; a git
+// failure caused by content wraps ErrArchiveFailed. Anything already written
+// to w is invalid when an error is returned.
+func (m *Mirror) ArchiveModuleZip(ctx context.Context, commit, subdir string, w io.Writer) error {
+	if err := checkCommit(commit); err != nil {
+		return err
+	}
+	if subdir != "" {
+		if err := checkPath(subdir); err != nil {
+			return err
+		}
+	}
+	dir, err := m.ensureScratch(ctx)
+	if err != nil {
+		return err
+	}
+	args, env := m.moduleArchiveCmd(commit, subdir)
+	fw := &failWriter{w: w}
+	_, err = m.gitEnv(ctx, dir, env, nil, fw, args...)
+	switch {
+	case err == nil:
+		return nil
+	case fw.err != nil:
+		return fw.err
+	case ctx.Err() != nil:
+		return err
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.Exited() {
+		return fmt.Errorf("%w: %w", ErrArchiveFailed, err)
+	}
 	return err
 }
 
@@ -457,6 +600,11 @@ func (e *gitError) Unwrap() error { return e.err }
 // discovery). With a non-nil stdout writer the output is streamed there and
 // the returned bytes are nil.
 func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout io.Writer, args ...string) ([]byte, error) {
+	return m.gitEnv(ctx, gitDir, m.env(), stdin, stdout, args...)
+}
+
+// gitEnv is git with an explicit environment.
+func (m *Mirror) gitEnv(ctx context.Context, gitDir string, env []string, stdin io.Reader, stdout io.Writer, args ...string) ([]byte, error) {
 	fileAllow := "never"
 	if m.opts.AllowFileRemotesForTesting {
 		fileAllow = "always"
@@ -484,7 +632,7 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = m.opts.BaseDir
-	cmd.Env = m.env()
+	cmd.Env = env
 	cmd.Stdin = stdin
 	// Own process group, so cancellation also reaches ssh and remote helpers:
 	// SIGTERM to the group, SIGKILL to the group killDelay later.
@@ -509,9 +657,22 @@ func (m *Mirror) git(ctx context.Context, gitDir string, stdin io.Reader, stdout
 		kill.Stop() // git has exited; do not signal a group id that may be reused
 	}
 	if err != nil {
-		return nil, &gitError{args: args[0], err: err, stderr: m.redact(errBuf.String())}
+		return nil, &gitError{args: subcommand(args), err: err, stderr: m.redact(errBuf.String())}
 	}
 	return out.Bytes(), nil
+}
+
+// subcommand names the git command in args, skipping leading "-c <config>"
+// pairs.
+func subcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return ""
 }
 
 func (m *Mirror) env() []string {
@@ -695,6 +856,167 @@ func (m *Mirror) ArchiveTar(ctx context.Context, commit string, paths []string, 
 		args = append(args, p)
 	}
 	_, err := m.git(ctx, m.dir, nil, w, args...)
+	return err
+}
+
+// StoredRefPrefix names the hidden refs that keep stored commits in the
+// mirror. Sync fetches only refs/heads and refs/tags, so its pruning never
+// removes them, and Refs does not list them.
+const StoredRefPrefix = "refs/tspackages/stored/"
+
+// revisionLens are the accepted lengths of a commit id prefix.
+var revisionLens = func() []int {
+	var l []int
+	for n := 7; n <= 64; n++ {
+		l = append(l, n)
+	}
+	return l
+}()
+
+// ResolveCommit returns the one commit whose id starts with hex (7 to 64
+// lowercase hex digits); none or several wrap resolve.ErrNotFound.
+func (m *Mirror) ResolveCommit(ctx context.Context, hex string) (string, error) {
+	if !digest.IsHex(hex, revisionLens...) {
+		return "", fmt.Errorf("gitmirror: invalid revision %q", hex)
+	}
+	res, err := m.commitsOf(ctx, []string{hex})
+	if err != nil {
+		return "", err
+	}
+	// ^{commit} peels a tag object to a commit with another id; only a
+	// commit named by hex itself counts.
+	if res[0] == "" || !strings.HasPrefix(res[0], hex) {
+		return "", fmt.Errorf("gitmirror: revision %s: %w", hex, resolve.ErrNotFound)
+	}
+	return res[0], nil
+}
+
+// HasCommit reports whether commit exists in the mirror.
+func (m *Mirror) HasCommit(ctx context.Context, commit string) (bool, error) {
+	if err := checkCommit(commit); err != nil {
+		return false, err
+	}
+	res, err := m.commitsOf(ctx, []string{commit})
+	if err != nil {
+		return false, err
+	}
+	return res[0] == commit, nil
+}
+
+// commitsOf peels each of revs (validated hex) to a commit with cat-file
+// --batch-check; a missing, ambiguous or non-commit one is "".
+func (m *Mirror) commitsOf(ctx context.Context, revs []string) ([]string, error) {
+	var in strings.Builder
+	for _, r := range revs {
+		in.WriteString(r + "^{commit}\n")
+	}
+	out, err := m.git(ctx, m.dir, strings.NewReader(in.String()), nil, "cat-file", "--batch-check")
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(lines) != len(revs) {
+		return nil, fmt.Errorf("gitmirror: cat-file answered %d lines for %d revisions", len(lines), len(revs))
+	}
+	res := make([]string, len(revs))
+	for i, line := range lines {
+		c, err := parseBatchCheck(line)
+		switch {
+		case errors.Is(err, resolve.ErrNotFound):
+		case err != nil:
+			return nil, err
+		default:
+			res[i] = c
+		}
+	}
+	return res, nil
+}
+
+// parseBatchCheck reads one line of cat-file --batch-check output for a
+// <rev>^{commit} query: the commit id, or resolve.ErrNotFound for a missing
+// or ambiguous revision.
+func parseBatchCheck(line string) (string, error) {
+	f := strings.Fields(line)
+	switch {
+	case len(f) == 2 && (f[1] == "missing" || f[1] == "ambiguous"):
+		return "", fmt.Errorf("gitmirror: %s %s: %w", f[0], f[1], resolve.ErrNotFound)
+	case len(f) == 3 && f[1] == "commit" && checkCommit(f[0]) == nil:
+		return f[0], nil
+	}
+	return "", fmt.Errorf("gitmirror: unexpected cat-file line %q", line)
+}
+
+// ContainingRefs lists the refs under refs/heads and StoredRefPrefix that
+// contain commit, sorted by name. commit must be in the mirror (see
+// HasCommit and ResolveCommit); git fails for an absent one.
+func (m *Mirror) ContainingRefs(ctx context.Context, commit string) ([]string, error) {
+	if err := checkCommit(commit); err != nil {
+		return nil, err
+	}
+	out, err := m.git(ctx, m.dir, nil, nil, "for-each-ref", "--contains", commit, "--format=%(refname)",
+		"refs/heads", strings.TrimSuffix(StoredRefPrefix, "/"))
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(out)), nil
+}
+
+// MergedTags lists the tags merged into commit (reachable from it), peeled
+// as Refs does.
+func (m *Mirror) MergedTags(ctx context.Context, commit string) ([]Ref, error) {
+	if err := checkCommit(commit); err != nil {
+		return nil, err
+	}
+	out, err := m.git(ctx, m.dir, nil, nil, "for-each-ref", "--merged", commit, refFormat, "refs/tags")
+	if err != nil {
+		return nil, err
+	}
+	return parseRefs(out)
+}
+
+// EnsureStoredRefs creates StoredRefPrefix+<commit> for every listed commit
+// present in the mirror that lacks one, and skips absent commits. It
+// removes nothing, and holds the lock Sync holds.
+func (m *Mirror) EnsureStoredRefs(ctx context.Context, commits []string) error {
+	for _, c := range commits {
+		if err := checkCommit(c); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, err := m.git(ctx, m.dir, nil, nil, "for-each-ref", "--format=%(refname)", strings.TrimSuffix(StoredRefPrefix, "/"))
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for name := range strings.FieldsSeq(string(out)) {
+		have[strings.TrimPrefix(name, StoredRefPrefix)] = true
+	}
+	var missing []string
+	for _, c := range commits {
+		if !have[c] {
+			have[c] = true
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	present, err := m.commitsOf(ctx, missing)
+	if err != nil {
+		return err
+	}
+	var in strings.Builder
+	for i, c := range missing {
+		if present[i] == c {
+			fmt.Fprintf(&in, "create %s%s %s\n", StoredRefPrefix, c, c)
+		}
+	}
+	if in.Len() == 0 {
+		return nil
+	}
+	_, err = m.git(ctx, m.dir, strings.NewReader(in.String()), nil, "update-ref", "--stdin")
 	return err
 }
 

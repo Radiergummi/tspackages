@@ -15,8 +15,6 @@ import (
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
-	"github.com/radiergummi/tspackages/internal/ecosystem/composer"
-	"github.com/radiergummi/tspackages/internal/ecosystem/pypi"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/limits"
@@ -35,7 +33,44 @@ import (
 type Hooks struct {
 	AllowPrivateUpstreams bool // upstream.Options.AllowPrivateForTesting
 	AllowFileRemotes      bool // gitmirror.Options.AllowFileRemotesForTesting
+	GoSumDB               GoSumDB
 }
+
+// GoSumDB replaces sum.golang.org's URL and verifier key. Test-only.
+type GoSumDB struct{ URL, Key string }
+
+// shared holds what every ecosystem builder may use.
+type shared struct {
+	cfg                        *config.Config
+	stores                     *openedStores
+	cache                      *storage.Cache
+	relay                      *relay.Relay
+	pins                       *pins.Store
+	records                    *records.Store
+	archive                    archive.Limits
+	keyDir, uploadDir, workDir string
+	// mirrors writes s's key material to keyPrefix.{key,known_hosts} and
+	// returns one mirror per remote, shared across sources by mirrorSet.
+	mirrors  func(s config.Source, keyPrefix string, remotes []string) ([]*gitmirror.Mirror, error)
+	upstream func(s config.Source) (*upstream.Client, error)
+	hooks    Hooks
+	log      *slog.Logger
+}
+
+// built is one ecosystem's endpoint, status sources, background loops and
+// status page section.
+type built struct {
+	eco     ecosystem.Ecosystem
+	status  []web.StatusSource
+	loops   []func(context.Context)
+	section web.Section
+}
+
+// builders lists the ecosystems the server can build, in mount order.
+var builders = []struct {
+	name  string
+	build func(sh *shared, e config.Ecosystem) (built, error)
+}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}}
 
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
@@ -46,8 +81,8 @@ var onMirror = func(*gitmirror.Mirror) {}
 // they have stopped (run it in a goroutine). Git mirrors live in
 // <work_dir>/git, and directories there that belong to no configured mirror
 // are removed; SSH key material is rewritten to <work_dir>/keys
-// (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources) at
-// every start.
+// (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources,
+// go/<source>.* for Go sources) at every start.
 func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
 	if err := config.ValidateWith(cfg, config.ValidateOptions{
@@ -87,150 +122,57 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		MaxEntries:      l.MaxArchiveEntries,
 	}
 
-	var (
-		sources    []composer.Source
-		gitSources []*composer.GitSource
-		regSources []*composer.RegistrySource
-		status     []web.StatusSource
-		mirrors    = mirrorSet{}
-	)
-	fail := func(err error) (http.Handler, func(context.Context), error) { return nil, nil, err }
-	eco, hasComposer := cfg.Ecosystems["composer"]
-	for _, s := range eco.Sources {
-		switch s.Type {
-		case "storage":
-			src := composer.NewStorageSource(s.Name, s.Claims, stores.hosted[s.Store], rec, archiveLimits, log)
-			sources, status = append(sources, src), append(status, src)
-		case "registry":
-			client, err := upstreamClient(s, h)
-			if err != nil {
-				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
-			}
-			src := composer.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rl, rec,
-				s.MetadataTTL, int64(l.MaxArtifactBytes), 0, limits.UpstreamWait, log)
-			sources, status = append(sources, src), append(status, src)
-			regSources = append(regSources, src)
-		case "git":
-			ms, err := sourceMirrors(s, filepath.Join(keyDir, s.Name), gitDir, mirrors, h, log)
-			if err != nil {
-				return fail(fmt.Errorf("composer source %q: %w", s.Name, err))
-			}
-			src, err := composer.NewGitSource(s.Name, s.Claims, s.Branches, ms, pinStore, rec, stores.state,
-				s.PollInterval, log, min(int64(l.MaxArtifactBytes), composer.MaxGitArchiveBytes))
-			if err != nil {
-				return fail(err)
-			}
-			sources, status = append(sources, src), append(status, src)
-			gitSources = append(gitSources, src)
-		}
+	mirrors := mirrorSet{}
+	sh := &shared{
+		cfg: cfg, stores: stores, cache: cache, relay: rl, pins: pinStore, records: rec,
+		archive: archiveLimits, keyDir: keyDir, uploadDir: uploadDir, workDir: cfg.Storage.WorkDir,
+		mirrors: func(s config.Source, keyPrefix string, remotes []string) ([]*gitmirror.Mirror, error) {
+			s.Remotes = remotes
+			return sourceMirrors(s, keyPrefix, gitDir, mirrors, h, log)
+		},
+		upstream: func(s config.Source) (*upstream.Client, error) { return upstreamClient(s, h) },
+		hooks:    h,
+		log:      log,
 	}
-
 	var (
-		pySources []pypi.Source
-		pyGit     []*pypi.GitSource
+		ecos     []ecosystem.Ecosystem
+		status   []web.StatusSource
+		loops    []func(context.Context)
+		sections []web.Section
 	)
-	pyEco, hasPyPI := cfg.Ecosystems["pypi"]
-	for _, s := range pyEco.Sources {
-		switch s.Type {
-		case "storage":
-			src := pypi.NewStorageSource(s.Name, s.Claims, stores.hosted[s.Store], rec, archiveLimits, log)
-			pySources, status = append(pySources, src), append(status, src)
-		case "registry":
-			client, err := upstreamClient(s, h)
-			if err != nil {
-				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
-			}
-			src := pypi.NewRegistrySource(s.Name, s.Claims, s.URL, client, cache, rl, rec,
-				s.MetadataTTL, int64(l.MaxArtifactBytes), limits.UpstreamWait, log)
-			pySources, status = append(pySources, src), append(status, src)
-		case "git":
-			// Key files live in keys/pypi/, where no composer source's can.
-			pyKeyDir := filepath.Join(keyDir, "pypi")
-			if err := workdir.EnsurePrivateDir(pyKeyDir); err != nil {
-				return fail(err)
-			}
-			ms, err := sourceMirrors(s, filepath.Join(pyKeyDir, s.Name), gitDir, mirrors, h, log)
-			if err != nil {
-				return fail(fmt.Errorf("pypi source %q: %w", s.Name, err))
-			}
-			src, err := pypi.NewGitSource(s.Name, s.Claims, ms, s.Tags, stores.state, rec, s.PollInterval, log,
-				min(int64(l.MaxArtifactBytes), pypi.MaxGitSdistBytes))
-			if err != nil {
-				return fail(err)
-			}
-			pySources, status = append(pySources, src), append(status, src)
-			pyGit = append(pyGit, src)
+	for _, b := range builders {
+		e, ok := cfg.Ecosystems[b.name]
+		if !ok {
+			continue
 		}
+		out, err := b.build(sh, e)
+		if err != nil {
+			return nil, nil, err
+		}
+		ecos, status, loops = append(ecos, out.eco), append(status, out.status...), append(loops, out.loops...)
+		sections = append(sections, out.section)
 	}
 
 	if err := pruneMirrorDirs(gitDir, mirrors); err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
 
 	limiter := limits.New(cfg.Limits)
 	mux := http.NewServeMux()
-	var ecos []ecosystem.Ecosystem
-	if hasComposer {
-		c := composer.New(sources, archiveLimits, log)
-		c.Mount(mux)
-		ecos = append(ecos, c)
-	}
-	if hasPyPI {
-		p := pypi.New(pySources, int64(l.MaxUploadBytes), uploadDir, log)
-		p.Mount(mux)
-		ecos = append(ecos, p)
-	}
-	pypiConflicts := func() []pypi.Conflict {
-		var out []pypi.Conflict
-		for _, g := range pyGit {
-			out = append(out, g.Conflicts()...)
-		}
-		return out
-	}
-	pypiSkipped := func() []pypi.Skipped {
-		var out []pypi.Skipped
-		for _, g := range pyGit {
-			out = append(out, g.Skipped()...)
-		}
-		return out
-	}
-	conflicts := func() []composer.Conflict {
-		var out []composer.Conflict
-		for _, g := range gitSources {
-			out = append(out, g.Conflicts()...)
-		}
-		return out
-	}
-	changed := func() []composer.ChangedDist {
-		var out []composer.ChangedDist
-		for _, r := range regSources {
-			out = append(out, r.ChangedDists()...)
-		}
-		return out
-	}
-	movedPkg := func(m pins.MovedTag) string {
-		for _, g := range gitSources {
-			if p := g.MovedPackage(m); p != "" {
-				return p
-			}
-		}
-		return ""
+	for _, e := range ecos {
+		e.Mount(mux)
 	}
 	metrics.SetRejected(limiter.Rejected)
 	web.New(web.Options{
 		Hostname: cfg.Tailscale.Hostname, Ecosystems: ecos, Sources: status,
-		Moved: pinStore.Moved, MovedPkg: movedPkg, Conflicts: conflicts, Changed: changed,
-		PyPIConflicts: pypiConflicts, PyPISkipped: pypiSkipped, Ready: stores.ready,
+		Moved: pinStore.Moved, Sections: sections, Ready: stores.ready,
 	}).Mount(mux)
 
 	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
 	start := func(ctx context.Context) {
 		var wg sync.WaitGroup
-		for _, g := range gitSources {
-			wg.Go(func() { g.Run(ctx) })
-		}
-		for _, g := range pyGit {
-			wg.Go(func() { g.Run(ctx) })
+		for _, run := range loops {
+			wg.Go(func() { run(ctx) })
 		}
 		<-ctx.Done()
 		wg.Wait()
@@ -333,17 +275,19 @@ func pruneMirrorDirs(gitDir string, mirrors mirrorSet) error {
 	return nil
 }
 
-// prepareWorkDir makes work_dir and its git/, keys/ and uploads/
-// subdirectories private, and empties keys/ (so only the current key material
-// remains) and uploads/ (spooled uploads an earlier run left behind).
+// prepareWorkDir makes work_dir and its git/, keys/, uploads/ and go-build/
+// subdirectories private, and empties keys/ (so only the current key
+// material remains), uploads/ (spooled uploads an earlier run left behind)
+// and go-build/ (Go git archives an earlier run left behind).
 func prepareWorkDir(dir string) (gitDir, keyDir, uploadDir string, err error) {
 	gitDir, keyDir, uploadDir = filepath.Join(dir, "git"), filepath.Join(dir, "keys"), filepath.Join(dir, "uploads")
-	for _, d := range []string{dir, gitDir, keyDir, uploadDir} {
+	goBuildDir := filepath.Join(dir, "go-build")
+	for _, d := range []string{dir, gitDir, keyDir, uploadDir, goBuildDir} {
 		if err := workdir.EnsurePrivateDir(d); err != nil {
 			return "", "", "", err
 		}
 	}
-	for _, d := range []string{keyDir, uploadDir} {
+	for _, d := range []string{keyDir, uploadDir, goBuildDir} {
 		entries, err := os.ReadDir(d)
 		if err != nil {
 			return "", "", "", err

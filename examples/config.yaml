@@ -66,3 +66,21 @@ ecosystems:
         type: registry
         url: https://pypi.org/simple/
         fetch_hosts: [pypi.org, files.pythonhosted.org]
+
+  go:
+    sources:
+      # Git claims become every client's GONOSUMDB (see the status page).
+      - name: matchory-git
+        type: git
+        claims: ["github.com/matchory", "github.com/matchory/*"]   # "/*" alone doesn't cover the bare path
+        modules:
+          # A path without /vN serves every major version of it.
+          github.com/matchory/sdk-go: git@github.com:matchory/sdk-go.git
+          github.com/matchory/mono/tools: {remote: git@github.com:matchory/mono.git, dir: tools}
+        branches: [main, "release-*"]       # @<branch> and pseudo-versions; default: the default branch only
+        ssh_key: ${env:DEPLOY_KEY}
+        known_hosts: ${env:KNOWN_HOSTS}
+      - name: proxy
+        type: registry
+        url: https://proxy.golang.org
+        fetch_hosts: [proxy.golang.org, sum.golang.org]   # sum.golang.org is required

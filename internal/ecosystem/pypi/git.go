@@ -991,7 +991,7 @@ func (g *GitSource) Health(context.Context) []metrics.Health {
 	defer g.hmu.Unlock()
 	var out []metrics.Health
 	for _, m := range g.mirrors {
-		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote())}
+		h := metrics.Health{Name: g.name + " " + metrics.RedactRemote(m.Remote()), Ecosystem: "pypi"}
 		err, seen := g.health[m.Remote()]
 		switch {
 		case !seen:

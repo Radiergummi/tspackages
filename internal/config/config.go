@@ -112,6 +112,40 @@ type Source struct {
 	// package directories each releases ("*" = all, "." = the root
 	// package). pypi git sources only.
 	Tags map[string]map[string][]string `yaml:"tags"`
+	// Modules maps a module path (without a major-version suffix) to its
+	// repository. go git sources only.
+	Modules map[string]GoModule `yaml:"modules"`
+}
+
+// GoModule locates a Go module in a repository.
+type GoModule struct {
+	Remote string `yaml:"remote"`
+	Dir    string `yaml:"dir"` // the path's directory in the repository; "" = root
+}
+
+// UnmarshalYAML accepts a scalar (the remote) or a mapping {remote, dir}.
+func (m *GoModule) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		*m = GoModule{Remote: n.Value}
+		return nil
+	case yaml.MappingNode:
+		// Node.Decode starts a decoder without KnownFields, so check by hand.
+		for i := 0; i < len(n.Content); i += 2 {
+			if k := n.Content[i].Value; k != "remote" && k != "dir" {
+				return fmt.Errorf("line %d: field %s not found in a go module (use remote and dir)", n.Content[i].Line, k)
+			}
+		}
+		type plain GoModule
+		var p plain
+		if err := n.Decode(&p); err != nil {
+			return err
+		}
+		*m = GoModule(p)
+		return nil
+	default: // documents, sequences and aliases are not modules
+	}
+	return fmt.Errorf("line %d: a go module is a remote or a mapping of remote and dir", n.Line)
 }
 
 type Credential struct {

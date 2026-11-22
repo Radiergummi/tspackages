@@ -571,7 +571,7 @@ func (s *StorageSource) Dist(ctx context.Context, name, version, reference strin
 
 // Health is OK if the store answers a Stat (a miss counts as success).
 func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
-	h := metrics.Health{Name: s.name, OK: true, Detail: "store reachable"}
+	h := metrics.Health{Name: s.name, Ecosystem: "composer", OK: true, Detail: "store reachable"}
 	if err := storage.Reachable(ctx, s.d); err != nil {
 		h.OK, h.Detail = false, "unreachable"
 		if s.unhealthy.CompareAndSwap(false, true) {
