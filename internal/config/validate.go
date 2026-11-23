@@ -343,6 +343,9 @@ var (
 	// and "*", with at least one character that is not "*", and "-" only
 	// between two non-empty parts, as in every normalised name.
 	pypiClaimRe = regexp.MustCompile(`^([a-z0-9*]+(-[a-z0-9*]+)+|\**[a-z0-9][a-z0-9*]*)$`)
+	// npmClaimRe is npm.ValidPattern's grammar without the "*" alternative:
+	// "@scope/name" or "name" in lowercase [a-z0-9._*-].
+	npmClaimRe = regexp.MustCompile(`^(@[a-z0-9._*-]+/[a-z0-9._*-]+|[a-z0-9._*-]+)$`)
 )
 
 // validClaim accepts "*" or a pattern in the ecosystem's normalised name
@@ -355,19 +358,33 @@ func validClaim(eco, c string) bool {
 	if eco == "pypi" {
 		return pypiClaimRe.MatchString(c)
 	}
+	if eco == "npm" {
+		return npmClaimRe.MatchString(c)
+	}
 	return claimRe.MatchString(c)
 }
 
 // claimsOverlap reports whether some package name matches both valid claims.
 // "*" matches every name; otherwise only "*" is special within a segment (it
 // matches any run of characters). Composer claims have two segments, pypi
-// claims one.
+// claims one, npm claims one or, with a "@scope/" prefix, two.
 func claimsOverlap(eco, a, b string) bool {
 	if a == "*" || b == "*" {
 		return true
 	}
 	if eco == "pypi" {
 		return globsOverlap(a, b)
+	}
+	if eco == "npm" {
+		as, aScoped := strings.CutPrefix(a, "@")
+		bs, bScoped := strings.CutPrefix(b, "@")
+		if aScoped != bScoped {
+			return false
+		}
+		if !aScoped {
+			return globsOverlap(a, b)
+		}
+		a, b = as, bs
 	}
 	av, an, _ := strings.Cut(a, "/")
 	bv, bn, _ := strings.Cut(b, "/")
