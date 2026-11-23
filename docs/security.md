@@ -302,8 +302,12 @@ fail and the status page names it. The caps:
   looked up only on its claiming sources, through files, POMs, checksums
   and metadata alike. A `maven-metadata.xml` path names either an
   artifact (`com/acme/lib`: `com.acme:lib`) or a group (`com.acme.lib`);
-  it counts as claimed when either reading matches a claim. Upstream URLs
-  are built only from a parsed and re-serialized path.
+  it counts as claimed when either reading matches a claim. Group-level
+  metadata lists a group's plugins, so reading it needs a rule without an
+  artifact (`maven:com.acme.lib`, `maven:com.acme.*`); when both readings
+  are claimed, the group level's sources are asked only for a caller that
+  may read the group too. Upstream URLs are built only from a parsed and
+  re-serialized path.
 - **Checksums describe the bytes served.** tspackages generates `.sha1`,
   `.md5`, `.sha256`, `.sha512` and the `X-Checksum-Sha1`, `X-Checksum-Md5`
   and `ETag` headers from the bytes it stores or verified; uploaded

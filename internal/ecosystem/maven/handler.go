@@ -449,13 +449,15 @@ func (e *readErr) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// candidates returns the sources that may answer p, whether p is claimed,
-// and the name authz checks it by with its matcher. A metadata path is read
-// both as artifact-level metadata of <group>:<artifact> and as group-level
-// metadata of <group>.<artifact>: the artifact level's claiming sources come
-// first, then the group level's, each in config order and once; the group
-// level decides authz only when the artifact level is unclaimed.
-func (h *Maven) candidates(p Path) (cands []Source, claimed bool, name string, m authz.Matcher) {
+// candidates returns the sources that may answer p for a caller with rules,
+// whether p is claimed, and the name authz checks it by with its matcher.
+// A metadata path is read both as artifact-level metadata of
+// <group>:<artifact> and as group-level metadata of <group>.<artifact>: the
+// artifact level's claiming sources come first, then the group level's,
+// each in config order and once. The group level decides authz only when
+// the artifact level is unclaimed; otherwise its sources are asked only
+// when the caller may also act on the group.
+func (h *Maven) candidates(p Path, rules []authz.Rule, action authz.Action) (cands []Source, claimed bool, name string, m authz.Matcher) {
 	key := p.Coords.Key()
 	if p.Kind != KindArtifactMetadata {
 		cands, claimed = resolve.Candidates(h.sources, key, matchKey)
@@ -470,14 +472,31 @@ func (h *Maven) candidates(p Path) (cands []Source, claimed bool, name string, m
 			grp = append(grp, s)
 		}
 	}
+	group, gm := strings.ToLower(p.Group()), groupRule(action)
 	switch {
 	case len(art) > 0:
-		return append(art, grp...), true, key, matchKey
+		if len(grp) > 0 && authz.Allowed(rules, ecoName, group, action, gm) {
+			art = append(art, grp...)
+		}
+		return art, true, key, matchKey
 	case len(grp) > 0:
-		return grp, true, strings.ToLower(p.Group()), MatchGroup
+		return grp, true, group, gm
 	}
 	cands, _ = resolve.Candidates(h.sources, key, matchKey)
 	return cands, false, key, matchKey
+}
+
+// groupRule is the matcher of rules for group-level metadata. Reading it
+// lists a group's plugins, so only a rule without an artifact grants it.
+// Writing it accepts any rule whose group matches: a maven-plugin deploy
+// uploads it, and the upload is checked and discarded.
+func groupRule(action authz.Action) authz.Matcher {
+	if action == authz.Write {
+		return MatchGroup
+	}
+	return func(pattern, group string) bool {
+		return !strings.Contains(pattern, ":") && MatchGroup(pattern, group)
+	}
 }
 
 // matchKey is Match over a "groupId:artifactId" key.
@@ -490,7 +509,7 @@ func matchKey(pattern, key string) bool {
 // perform action on it, and returns its candidate sources and the name it
 // was checked by.
 func (h *Maven) authorize(w http.ResponseWriter, caller identity.Caller, e *entry, p Path, action authz.Action) ([]Source, string, bool) {
-	cands, claimed, name, m := h.candidates(p)
+	cands, claimed, name, m := h.candidates(p, caller.Rules, action)
 	e.claimed = claimed
 	if !authz.Allowed(caller.Rules, ecoName, name, action, m) {
 		h.logMalformed(caller)

@@ -66,6 +66,12 @@ type callLog struct {
 	names []string
 }
 
+func (l *callLog) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.names = nil
+}
+
 func (l *callLog) add(name string) {
 	l.mu.Lock()
 	l.names = append(l.names, name)
@@ -394,6 +400,31 @@ func TestClaimsBothReadings(t *testing.T) {
 	h = server(t, []Source{st, reg}, `{"read":["maven:com.matchory.*"]}`)
 	if w := do(h, "GET", plugins, nil); w.Code != 404 {
 		t.Fatalf("group rule: %d %s", w.Code, w.Body)
+	}
+	// A read rule that names an artifact never grants group-level metadata,
+	// even when its group part matches the group.
+	h = server(t, []Source{st, reg}, `{"read":["maven:com.matchory.plugins:x"]}`)
+	if w := do(h, "GET", plugins, nil); w.Code != 403 {
+		t.Fatalf("artifact rule on its own group: %d %s", w.Code, w.Body)
+	}
+
+	// With both readings claimed, a caller allowed only the artifact level
+	// is answered by its sources alone; the group level's are not asked.
+	log.reset()
+	h = server(t, []Source{groupSrc, artSrc, reg}, `{"read":["maven:com.matchory:plugins"]}`)
+	if w := do(h, "GET", plugins, nil); w.Code != 404 {
+		t.Fatalf("artifact grant, both readings: %d %s", w.Code, w.Body)
+	}
+	if want := []string{"artifact"}; !slices.Equal(log.names, want) {
+		t.Fatalf("asked %v, want %v", log.names, want)
+	}
+	log.reset()
+	h = server(t, []Source{groupSrc, artSrc, reg}, `{"read":["maven:com.matchory:plugins","maven:com.matchory.plugins"]}`)
+	if w := do(h, "GET", plugins, nil); w.Code != 404 {
+		t.Fatalf("both grants: %d %s", w.Code, w.Body)
+	}
+	if want := []string{"artifact", "group"}; !slices.Equal(log.names, want) {
+		t.Fatalf("asked %v, want %v", log.names, want)
 	}
 }
 
