@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"sync"
@@ -138,5 +139,34 @@ func TestEvictKeepsCommittedWantedBytes(t *testing.T) {
 	}
 	if _, _, err := cache.Get(context.Background(), "k"); err != nil {
 		t.Fatalf("after eviction: %v", err)
+	}
+}
+
+// TestEvictSHA512: an eviction keeps what a download expecting the same
+// SHA-512 caches, and drops it when only the SHA-256 matches.
+func TestEvictSHA512(t *testing.T) {
+	data := []byte("npm tarball")
+	have := Digest{SHA256: digestOf(data).SHA256, SHA512: sha512Hex(data)}
+	other := Digest{SHA256: have.SHA256, SHA512: hex.EncodeToString(make([]byte, 64))}
+	for _, c := range []struct {
+		name string
+		want Digest
+		kept bool
+	}{{"same", have, true}, {"other sha512", other, false}} {
+		t.Run(c.name, func(t *testing.T) {
+			r, cache, release := newHeldRelay(t)
+			var calls atomic.Int32
+			readAllOf(t, r, have, bytesFetch(data, &calls))
+			r.beforeWait = release
+			if err := r.Evict(context.Background(), "k", c.want); err != nil {
+				t.Fatal(err)
+			}
+			release()
+			r.Wait()
+			_, _, err := cache.Get(context.Background(), "k")
+			if c.kept != (err == nil) {
+				t.Fatalf("kept = %v, want %v (err %v)", err == nil, c.kept, err)
+			}
+		})
 	}
 }
