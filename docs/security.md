@@ -217,3 +217,63 @@ tailnet. Read this before you deploy.
   archives over 500MiB, and `go.mod` or `LICENSE` files over 16MiB are
   refused and reported. Builds run in a queue of 2 workers with a 10-minute
   limit each, so a push can't block other modules.
+
+## npm
+
+- Names are lowercased before claim matching, authorization and routing,
+  so `@Acme/x` can't slip past an `@acme/*` claim. Claims and `npm:` rules
+  accept `*`, `@<scope>/<name>` or an unscoped `<name>` of `[a-z0-9._-]`
+  and `*`; anything else is a config error, or a rule that grants nothing.
+  A `*` inside a pattern matches within one part, so `acme*` doesn't cover
+  `@acme/x`. Prefer scoped names for private packages: an unscoped private
+  name is one typo away from a public one.
+- Configure clients with tspackages as their only `registry=` and no
+  `@scope:registry=` lines that point elsewhere. A scope sent to another
+  registry is outside tspackages' claims.
+- **Private names never reach registry.npmjs.org.** A claimed name is looked
+  up only on its claiming sources. `npm audit` would send every dependency
+  name, private ones included, so `/-/npm/v1/security/advisories/bulk`
+  answers `404` instead of being forwarded.
+- **Served metadata comes from the tarball.** A storage version's manifest
+  is built from the `package/package.json` inside the published tarball,
+  through an allowlist of fields; of the publish body, only `gitHead`,
+  `_nodeVersion` and `_npmVersion` are kept. A publish whose URL, body and
+  tarball names or versions disagree, or whose declared `integrity` or
+  `shasum` doesn't match the tarball, is rejected.
+- A published version never changes bytes. The same bytes published again
+  succeed; other bytes for an existing version, or a version that differs
+  from an existing one only in build metadata (`1.0.0+a`, `1.0.0+b`), are
+  `409`. There is no unpublish and no deprecate (`405`).
+- **No response is a `401`.** npm turns a `401` into a one-time password or
+  web login prompt. A caller without a matching rule gets `403` with
+  `forbidden: no npm:<name> read rule` (or `write`), and an upstream `401`
+  becomes a `502`. The `_authToken` clients send is stripped and ignored.
+- Upstream tarballs are checked against the version's declared `integrity`
+  before they are cached, by SHA-512 when it declares one and otherwise by
+  SHA-1 (an `integrity` with only `sha1`, or a hex `shasum`). Versions with neither
+  are dropped from served packuments. Old versions that declare only SHA-1
+  are therefore verified by SHA-1 alone, which trusts the upstream not to
+  serve a crafted collision. A tarball whose SHA256 differs from the first
+  one recorded for its version is served, logged at warn and listed on the
+  status page.
+- Tarball URLs from upstream must be on the source's `fetch_hosts`, or the
+  version is dropped. Served `dist.tarball` URLs point at tspackages and
+  carry no source.
+- No package code runs on the server. Lifecycle scripts and
+  `bundleDependencies` are stored as published. Publish-time provenance
+  bundles (`--provenance`) are stored and recorded, not served; a
+  `registry` source passes `dist.attestations` and the signing keys through.
+
+Neither packuments nor publish bodies are held whole in memory: they are
+parsed as streams, one version object at a time. The caps:
+
+| Parser | Input | Caps |
+|---|---|---|
+| Names and paths | request paths | names of at most 156 bytes (one escaped storage key segment), fixed segment counts |
+| Versions | publish, request paths | strict SemVer 2.0.0, 156 bytes |
+| dist-tags | publish body, `npm dist-tag` | 64 bytes of `[a-z0-9._-]`, not a version or range; 100 tags per package |
+| Upstream packument | registry source | 256MiB, 200,000 versions, 4MiB per version, nesting 64, keys of 1KiB |
+| Publish body | client | `max_upload_bytes` × 4/3 + 2MiB, one version, one tarball of at most `max_upload_bytes`, a provenance bundle of at most 1MiB |
+| `package.json` | published tarball | 1MiB, nesting 64 |
+| Tarball | publish | the `archive` limits of every upload |
+| `integrity` | upstream, client | 1KiB, `sha512` and `sha1` only |

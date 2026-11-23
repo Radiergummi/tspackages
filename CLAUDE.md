@@ -13,8 +13,9 @@ identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
 Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
-uploads with `twine`/`uv publish`) and Go (`git` + `registry` + sumdb
-proxy) ship; then npm, OCI and Maven.
+uploads with `twine`/`uv publish`), Go (`git` + `registry` + sumdb
+proxy) and npm (`storage` + `registry`; npm and pnpm, CI publishes with a
+dummy `_authToken`) ship; then OCI and Maven.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -24,7 +25,7 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real Composer/pip/uv/twine/go end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine/go/npm/pnpm end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm (S3 variant: TSP_TEST_S3_ENDPOINT)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
@@ -73,9 +74,14 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   pseudo-versions, on-demand sync), the `registry` source, the
   sum.golang.org verifier and the client-facing sumdb proxy. Must not
   import `composer` or `pypi` (nor the reverse).
+- `internal/ecosystem/npm` — names and claims, strict SemVer, request
+  paths, the streamed packument rewrite and publish inspection, the
+  `storage` source (dist-tags, precedence claims) and the `registry`
+  source (tarballs, keys, attestations), the HTTP handler. Must not import
+  `composer`, `pypi` or `goproxy` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
-- `integration/` — end-to-end tests with real Composer, pip, uv, twine and
-  the go command (`-tags integration`).
+- `integration/` — end-to-end tests with real Composer, pip, uv, twine,
+  the go command, npm and pnpm (`-tags integration`).
 
 ## Invariants — do not break
 
@@ -131,6 +137,19 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   request. The one exception to "served git versions stay served":
   a pseudo-version whose commit is gone from the mirror becomes
   unavailable.
+- npm: claims and `npm:` rules are `*`, `@<scope>/<name>` or an unscoped
+  `<name>` of `[a-z0-9._-]` and `*` (a `*` matches within one part),
+  matched against the lowercased name; storage accepts only names that are
+  already lowercase. Every key segment from a name or version goes through
+  `storage.EscapeSegment`, so names and versions are at most 156 raw bytes
+  (`MaxSegment`). A storage version's metadata is built from the tarball's
+  `package/package.json` through `npm.PublishableFields`, never from the
+  publish body. A version is claimed with its sha256 (`~claim`) and its
+  precedence without build metadata (`~precedence`), so other bytes, or
+  `1.0.0+a` next to `1.0.0+b`, are `409`. Registry tarballs are verified
+  by SHA-512 (or SHA-1 when that is all a version declares) before
+  caching; versions without either are dropped. Never answer `401`: npm
+  turns it into an OTP or login prompt; deny is `403`.
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

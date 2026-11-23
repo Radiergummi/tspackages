@@ -6,7 +6,7 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Composer, PyPI and Go ship today. npm, OCI and Maven follow. Read
+Composer, PyPI, Go and npm ship today. OCI and Maven follow. Read
 [docs/security.md](docs/security.md) before you deploy, and
 [docs/operations.md](docs/operations.md) for backups, upgrades and monitoring.
 
@@ -238,6 +238,40 @@ non-semver tag names and `HEAD` can't be queried; they answer `404`.
 Refused modules and the size limits are in
 [docs/operations.md](docs/operations.md#go).
 
+## npm sources
+
+`/npm/` speaks the npm registry protocol for npm and pnpm. npm has
+`storage` and `registry` sources; there is no `git` source.
+
+```yaml
+ecosystems:
+  npm:
+    sources:
+      - {name: hosted, type: storage, store: main, claims: ["@acme/*"]}
+      - name: npmjs
+        type: registry
+        url: https://registry.npmjs.org/
+        fetch_hosts: [registry.npmjs.org]
+```
+
+| Type | Keys | Does |
+|------|------|------|
+| `storage` | `store`, `claims` | Hosts packages published with `npm publish` or `pnpm publish`, and their dist-tags. |
+| `registry` | `url` (`https://`, ending in `/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to `registry.npmjs.org`. Tarballs are checked against the declared `integrity` before they are cached. |
+
+A claim is `*`, `@<scope>/<name>` or an unscoped `<name>`, with `[a-z0-9._-]`
+and `*` in each part; a `*` matches within one part, so `acme*` doesn't
+match `@acme/x`. Names are matched in lowercase. Prefer scoped names for
+private packages. Names and versions are at most 156 bytes, and storage
+accepts only strict semantic versions and lowercase names.
+
+A version's metadata comes from the `package.json` inside its tarball, not
+from the publish request. Publishing the same bytes again succeeds; other
+bytes for an existing version are `409`. `latest` moves only to a higher
+version on publish, and a package's first version is always `latest`.
+Unpublish and deprecate answer `405`, and `npm audit` gets `404` (see
+[docs/operations.md](docs/operations.md#npm-audit)).
+
 ## Client setup
 
 ### Composer
@@ -325,6 +359,21 @@ go env -u GOPRIVATE GONOPROXY
   database at `/go/sumdb/sum.golang.org/` through `GOPROXY`, so public
   modules are verified as usual, also by `go mod verify`.
 
+### npm and pnpm
+
+In the project's `.npmrc` (or `~/.npmrc`):
+
+```ini
+registry=https://registry.<tailnet>.ts.net/npm/
+//registry.<tailnet>.ts.net/npm/:_authToken=tailscale
+```
+
+The token is a placeholder: npm won't publish without one, and tspackages
+ignores it. Don't add `@scope:registry=` lines that point elsewhere.
+Lockfiles written against registry.npmjs.org install unchanged. Publish
+with `npm publish` or `pnpm publish`, with `publishConfig.registry` set in
+`package.json` (see [docs/operations.md](docs/operations.md#publishing-from-ci)).
+
 ## Tailnet policy
 
 Humans read; each publishing repo gets its own CI tag with write on its own
@@ -360,7 +409,7 @@ unioned. The capability name is configurable (`tailscale.capability`).
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
-make integration   # end-to-end with real Composer, pip, uv, twine and go
+make integration   # end-to-end with real Composer, pip, uv, twine, go, npm and pnpm
 make tailnet       # real tsnet nodes against an in-process control server
 make vuln          # govulncheck, failing on reachable findings
 ```

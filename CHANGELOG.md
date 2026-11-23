@@ -15,6 +15,18 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   against sum.golang.org before caching. The status page lists the `go env`
   settings (`GONOSUMDB` from the git sources), skipped, refused and moved
   tags, and the checksum database's state.
+- An npm registry at `/npm/` for npm 11 and pnpm 12: packuments (full and
+  abbreviated), tarballs, `npm publish`, `pnpm publish` and `npm dist-tag`.
+  Sources: `storage`, whose version metadata comes from the `package.json`
+  inside the published tarball, and `registry` for `registry.npmjs.org`
+  pass-through. Clients need only `registry=` and a placeholder
+  `_authToken` in `.npmrc`; lockfiles written against registry.npmjs.org
+  install unchanged. Unpublish and deprecate answer `405`, and `npm audit`
+  gets `404` so private names never reach registry.npmjs.org. The status
+  page lists the `.npmrc` settings and upstream tarballs that changed.
+- The relay verifies SHA-512 digests: npm tarballs from a `registry`
+  source are checked against the declared `integrity` (SHA-512, or SHA-1
+  for old versions that declare nothing else) before they are cached.
 
 ### Changed
 

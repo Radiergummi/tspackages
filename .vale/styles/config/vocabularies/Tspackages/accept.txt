@@ -4,6 +4,7 @@
 (?i)configs?
 (?i)dev
 (?i)loopback
+(?i)packuments?
 (?i)repo's
 (?i)repos?
 (?i)sdists?
@@ -28,9 +29,10 @@ MinIO
 npm
 OAuth
 Packagist
+pnpm
 PyPI
 setuptools
-SHA-?(?:1|256)
+SHA-?(?:1|256|512)
 systemd
 Tailscale(?:'s)?
 TLS

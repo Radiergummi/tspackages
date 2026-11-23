@@ -352,8 +352,9 @@ Metrics:
 The status page has a section per configured ecosystem, with each source's
 health, tags that moved upstream, Composer packages declared by several
 remotes, registry archives whose bytes changed, PyPI git conflicts and
-skipped packages, and Go tags that were skipped, refused or moved and the
-state of the sum.golang.org verifier. It shows what the
+skipped packages, Go tags that were skipped, refused or moved and the
+state of the sum.golang.org verifier, and npm tarballs that changed
+upstream. It shows what the
 running process has seen; restarts clear the moved-tag and changed-archive
 lists until those are seen again. The logs are the lasting record. Lines
 worth an alert:
@@ -363,6 +364,7 @@ worth an alert:
 | `relay: download failed` with `relay: digest mismatch` in `error` | warn | An upstream archive didn't match its declared hash. Nothing was cached, and the client's transfer was broken off short of its `Content-Length`. |
 | `relay: download failed` with `relay: cache` in `error` | warn | A verified archive reached the client but couldn't be cached; the next request fetches it again. |
 | `composer dist changed upstream; serving the new bytes` | warn | A registry archive differs from the bytes first seen for that version and reference. |
+| `npm tarball changed upstream; serving the new bytes` | warn | A registry tarball differs from the bytes first seen for that version. |
 | `composer git: tag moved upstream; serving the pinned commit` | warn | A tag was force-pushed. The pin keeps the first commit. |
 | `composer package declared by several remotes; not served` | error | Two remotes of one git source declare the same package. |
 | `composer git: serving pinned versions only` | warn | A remote can't be indexed, so only its pinned versions are served. |
@@ -381,9 +383,9 @@ worth an alert:
 | `goproxy git: tag version skipped`, `goproxy git: tag version refused` | warn | A tag isn't served; `reason` says why (see [Size refusals](#size-refusals)). |
 | `goproxy git: stored version refused`, `goproxy git: pseudo-version refused` | warn | A rebuild gave another `h1:` than the record, or the commit is gone; the version answers `502`. |
 | `go checksum database misbehaved` | error | sum.golang.org contradicted the stored tree head; registry fetches fail until restart (see [The checksum database](#the-checksum-database)). |
-| `composer upstream unhealthy`, `pypi upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
+| `composer upstream unhealthy`, `pypi upstream unhealthy`, `npm upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
 | `left symlinks out of a git archive` | warn | A git-built archive lacks the listed symlinks. |
-| `composer source failed`, `pypi source failed`, `go source failed` | error | A request ended in `5xx`. |
+| `composer source failed`, `pypi source failed`, `go source failed`, `npm request failed` | error | A request ended in `5xx`. |
 | `not ready` | warn | `/readyz` failed. |
 
 PyPI git conflicts (a release changed without a version bump, divergent
@@ -486,6 +488,89 @@ the object is corrupt), stop tspackages, delete
 The next lookup stores a new tree head. Do this only once you are sure
 sum.golang.org itself isn't the problem: deleting the object also forgets
 the tree head a real fork would be checked against.
+
+## npm
+
+### Client setup
+
+Each project (or each user's `~/.npmrc`) needs two lines, and no others for
+the registry:
+
+```ini
+registry=https://<hostname>.<tailnet>.ts.net/npm/
+//<hostname>.<tailnet>.ts.net/npm/:_authToken=tailscale
+```
+
+npm refuses to publish without a token for the registry, so the second line
+holds a dummy one. tspackages strips it and never checks it; the caller's
+grant decides. pnpm reads the same `.npmrc`. Don't add
+`@scope:registry=` lines that point elsewhere: that scope then bypasses
+tspackages and its claims.
+
+Lockfiles written against registry.npmjs.org install unchanged: npm swaps
+the `resolved` host for the configured registry (its `replace-registry-host`
+setting, `npmjs` by default; don't set it to `never`), and pnpm lockfiles
+carry no URLs for registry packages. A lockfile written against tspackages
+names tspackages' host in `resolved`.
+
+pnpm holds back versions younger than its `minimumReleaseAge` and, when an
+install picks a just-published private version anyway, adds it to
+`minimumReleaseAgeExclude` in `pnpm-workspace.yaml`. To keep that file
+stable, exclude your private scopes up front:
+
+```yaml
+# pnpm-workspace.yaml
+minimumReleaseAgeExclude:
+  - "@acme/*"
+```
+
+### Publishing from CI
+
+Give the CI node's tag `write` on its own package (`npm:@acme/sdk`), put the
+two `.npmrc` lines in place and publish. Set the registry in `package.json`
+so a publish from a laptop with another configuration can't go to
+registry.npmjs.org:
+
+```json
+"publishConfig": {"registry": "https://<hostname>.<tailnet>.ts.net/npm/"}
+```
+
+`npm publish --registry https://<hostname>.<tailnet>.ts.net/npm/` does the
+same for one run. `pnpm publish` works the same way. Publishing the same
+bytes again succeeds; other bytes for an existing version fail with `E409`
+and `version already exists`, also with `--force`. A publish under the
+`latest` tag of a version lower than the current `latest` succeeds but
+leaves `latest` where it was, and npm prints `latest stayed at <version>`.
+`npm dist-tag add` and `rm` work on names a `storage` source serves; `latest`
+can't be removed. `npm deprecate` and `npm unpublish` fail with `E405`.
+
+`npm publish --provenance` works where npm can get an OIDC token (GitHub
+Actions with `id-token: write`). The bundle is stored and recorded in the
+provenance records but not served, so `npm audit signatures` doesn't find
+it. npm's trusted-publishing token exchange, sent to the host root, gets a
+`404`, which npm ignores.
+
+### npm audit
+
+`/npm/-/npm/v1/security/advisories/bulk` answers `404`. Forwarding it would
+send every dependency name in the tree, private ones included, to
+registry.npmjs.org. `npm install` and `npm ci` carry on and mention the
+failure only with `--loglevel verbose`. `npm audit` fails with `audit
+endpoint returned an error`. No vulnerability report comes through
+tspackages; audit public dependencies with a tool that doesn't send private
+names, and set `audit=false` in `.npmrc` to skip the request.
+
+### Revalidation and rate limits
+
+Packuments carry `Cache-Control: no-cache` and an `ETag`, so a fresh
+publish is visible at once. The cost: every install sends a conditional
+request per package and gets a `304`, even with a warm npm cache, about
+1,000 requests for a tree of 1,000 packages. Tarballs come from npm's cache
+(`npm config get cache`) or pnpm's store. Size `requests_per_second` and
+`burst` for your largest install from one node. npm retries a `429` twice,
+waiting at least 10 seconds each time (`fetch-retries`,
+`fetch-retry-mintimeout`), so a limit that is too tight makes installs slow
+before it fails them.
 
 ## Removing a bad publish
 
@@ -652,11 +737,13 @@ To keep that window small and harmless:
   so a large cache in S3 or a large `fs` store slows the start. Then the
   first git index pass runs.
 - **Keep client caches.** Composer keeps downloaded archives in its cache
-  directory and installs from a lock file without fetching them again. Every
-  tspackages response carries `Cache-Control: private, no-store`, so don't
-  count on a client's HTTP cache.
+  directory and installs from a lock file without fetching them again, and
+  npm and pnpm keep tarballs by their integrity. Every tspackages response
+  except an npm packument carries `Cache-Control: private, no-store`, so
+  don't count on a client's HTTP cache.
 - **Cache in CI.** Persist Composer's cache directory between runs
-  (`composer config cache-dir`). pip's cache is mostly an HTTP cache, which
+  (`composer config cache-dir`), and npm's cache or pnpm's store
+  (`npm config get cache`, `pnpm store path`). pip's cache is mostly an HTTP cache, which
   `no-store` keeps empty. For Python builds that must not depend on the registry, keep a wheelhouse
   (`pip download -d wheelhouse`, then `pip install --no-index --find-links
   wheelhouse`).
