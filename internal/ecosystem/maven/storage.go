@@ -79,12 +79,15 @@ func NewStorageSource(name string, claims []string, d storage.Driver, rec *recor
 func (s *StorageSource) Name() string     { return s.name }
 func (s *StorageSource) Claims() []string { return s.claims }
 
-// sidecar is a stored file's record.
+// sidecar is a stored file's record. ETag is the file's ETag when the
+// sidecar was written: a file whose ETag differs holds other bytes (a
+// SNAPSHOT overwrite between its file and sidecar writes).
 type sidecar struct {
 	Size     int64            `json:"size"`
 	Digests  sidecarDigests   `json:"digests"`
 	Uploaded time.Time        `json:"uploaded"`
 	Uploader records.Uploader `json:"uploader"`
+	ETag     string           `json:"etag"`
 }
 
 type sidecarDigests struct {
@@ -252,7 +255,10 @@ func (s *StorageSource) reserve(ctx context.Context, key, value string) (string,
 // sidecar in effect and, when it replaced a SNAPSHOT file, the replaced
 // sha256. The same bytes again are a success that keeps the first sidecar;
 // other bytes are ErrExists for a release file and replace a SNAPSHOT file.
-// A concurrent change of the file or its sidecar reruns the attempt.
+// A stored file is compared by its sidecar when the sidecar was written for
+// it, by its bytes otherwise. A concurrent change of the file or its
+// sidecar reruns the attempt. The file and sidecar writes run to their end
+// when the client leaves.
 func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path, body *os.File) (sidecar, string, error) {
 	rewind := func() error { _, err := body.Seek(0, io.SeekStart); return err }
 	if err := rewind(); err != nil {
@@ -266,11 +272,19 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 	d := h.Digests()
 	sc := sidecar{Size: size, Digests: sidecarDigests(d),
 		Uploaded: time.Now().UTC(), Uploader: records.UploaderFrom(c)}
-	scBody, err := json.Marshal(sc)
-	if err != nil {
-		return sidecar{}, "", err
-	}
+	wctx := context.WithoutCancel(ctx)
 	fk, sk := fileKey(p.Coords, p.File), sidecarKey(p.Coords, p.File)
+	// writeSidecar records sc for the file with fileETag, replacing the
+	// sidecar with sidecarETag ("" for none).
+	writeSidecar := func(fileETag, sidecarETag string) error {
+		sc.ETag = fileETag
+		b, err := json.Marshal(sc)
+		if err != nil {
+			return err
+		}
+		_, err = s.d.PutIfMatch(wctx, sk, bytes.NewReader(b), sidecarETag)
+		return err
+	}
 	for attempt := range updateRetries {
 		cur, sInfo, err := s.readSidecar(ctx, sk)
 		noSidecar := errors.Is(err, storage.ErrNotFound)
@@ -280,11 +294,11 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		if err := rewind(); err != nil {
 			return sidecar{}, "", err
 		}
-		_, err = s.d.PutIfAbsent(ctx, fk, body)
+		info, err := s.d.PutIfAbsent(wctx, fk, body)
 		if err == nil {
 			// A sidecar left without its file (removed by an operator) is
 			// replaced.
-			_, err = s.d.PutIfMatch(ctx, sk, bytes.NewReader(scBody), sInfo.ETag)
+			err = writeSidecar(info.ETag, sInfo.ETag)
 			if errors.Is(err, storage.ErrPrecondition) {
 				if err := pause(ctx, attempt); err != nil {
 					return sidecar{}, "", err
@@ -296,9 +310,17 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		if !errors.Is(err, storage.ErrExists) {
 			return sidecar{}, "", err
 		}
-		stored, fETag := cur.Digests.SHA256, ""
-		if noSidecar {
-			// Stored, its sidecar not yet written: compare the bytes.
+		info, err = s.d.Stat(ctx, fk)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return sidecar{}, "", err
+		}
+		stored, fETag := cur.Digests.SHA256, info.ETag
+		current := !noSidecar && cur.ETag == fETag
+		if !current {
+			// Stored without a sidecar for these bytes: compare the bytes.
 			sd, info, err := s.hashStored(ctx, fk)
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
@@ -309,10 +331,10 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 			stored, fETag = sd.SHA256, info.ETag
 		}
 		if stored == sc.Digests.SHA256 {
-			if !noSidecar {
+			if current {
 				return cur, "", nil
 			}
-			_, err := s.d.PutIfMatch(ctx, sk, bytes.NewReader(scBody), "")
+			err := writeSidecar(fETag, sInfo.ETag)
 			if errors.Is(err, storage.ErrPrecondition) {
 				continue
 			}
@@ -321,22 +343,12 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		if !p.Snapshot {
 			return sidecar{}, "", fmt.Errorf("%s %w", p.File, ErrExists)
 		}
-		if fETag == "" {
-			info, err := s.d.Stat(ctx, fk)
-			if errors.Is(err, storage.ErrNotFound) {
-				continue
-			}
-			if err != nil {
-				return sidecar{}, "", err
-			}
-			fETag = info.ETag
-		}
 		if err := rewind(); err != nil {
 			return sidecar{}, "", err
 		}
-		_, err = s.d.PutIfMatch(ctx, fk, body, fETag)
+		info, err = s.d.PutIfMatch(wctx, fk, body, fETag)
 		if err == nil {
-			_, err = s.d.PutIfMatch(ctx, sk, bytes.NewReader(scBody), sInfo.ETag)
+			err = writeSidecar(info.ETag, sInfo.ETag)
 		}
 		if errors.Is(err, storage.ErrPrecondition) {
 			if err := pause(ctx, attempt); err != nil {
@@ -533,7 +545,8 @@ func pause(ctx context.Context, attempt int) error {
 }
 
 // File serves a stored file. Release and timestamped SNAPSHOT files are
-// immutable to clients.
+// immutable to clients. A file whose sidecar was written for other bytes is
+// served without digests and not immutable.
 func (s *StorageSource) File(ctx context.Context, p Path) (File, error) {
 	if len(p.File) > maxFileName {
 		return File{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, p)
@@ -554,12 +567,16 @@ func (s *StorageSource) File(ctx context.Context, p Path) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	value, _, _ := fileParts(p.Coords, p.File)
-	return File{Body: rc, Size: info.Size, Digests: sc.Digests.digests(), Modified: sc.Uploaded,
-		Immutable: !p.Snapshot || value != p.Coords.Version}, nil
+	f := File{Body: rc, Size: info.Size, Modified: sc.Uploaded}
+	if sc.ETag == info.ETag {
+		value, _, _ := fileParts(p.Coords, p.File)
+		f.Digests, f.Immutable = sc.Digests.digests(), !p.Snapshot || value != p.Coords.Version
+	}
+	return f, nil
 }
 
-// Digests returns a stored file's digests from its sidecar.
+// Digests returns a stored file's digests from its sidecar, or from its
+// bytes when the sidecar was written for other bytes.
 func (s *StorageSource) Digests(ctx context.Context, p Path) (Digests, error) {
 	if len(p.File) > maxFileName {
 		return Digests{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, p)
@@ -571,7 +588,22 @@ func (s *StorageSource) Digests(ctx context.Context, p Path) (Digests, error) {
 	if err != nil {
 		return Digests{}, err
 	}
-	return sc.Digests.digests(), nil
+	key := fileKey(p.Coords, p.File)
+	info, err := s.d.Stat(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return Digests{}, fmt.Errorf("maven: stored object %s is missing", key)
+	}
+	if err != nil {
+		return Digests{}, err
+	}
+	if sc.ETag == info.ETag {
+		return sc.Digests.digests(), nil
+	}
+	d, _, err := s.hashStored(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return Digests{}, fmt.Errorf("maven: stored object %s is missing", key)
+	}
+	return d, err
 }
 
 // Metadata renders artifact-level metadata from the index (group-level

@@ -10,18 +10,20 @@ import (
 )
 
 // XMLLimits cap an XML document: its size in bytes, element nesting depth
-// and element count.
+// and element count. ASCIILabels accepts any declared encoding for a
+// document whose every byte is ASCII, which reads the same in it.
 type XMLLimits struct {
 	MaxBytes    int64
 	MaxDepth    int
 	MaxElements int
+	ASCIILabels bool
 }
 
 var (
 	// UploadXML caps uploaded POMs and maven-metadata.xml.
 	UploadXML = XMLLimits{MaxBytes: 1 << 20, MaxDepth: 32, MaxElements: 10000}
-	// UpstreamXML caps maven-metadata.xml and POMs read from upstreams.
-	UpstreamXML = XMLLimits{MaxBytes: 4 << 20, MaxDepth: 32, MaxElements: 10000}
+	// UpstreamXML caps maven-metadata.xml read from upstreams.
+	UpstreamXML = XMLLimits{MaxBytes: 4 << 20, MaxDepth: 32, MaxElements: 10000, ASCIILabels: true}
 )
 
 // XMLError is why an XML document was refused.
@@ -42,13 +44,14 @@ var (
 // DecodeXML decodes r into v after rejecting <!DOCTYPE, <!ENTITY and any
 // processing instruction other than the leading <?xml?> declaration, and
 // enforcing l. The document is UTF-8, with or without a BOM; another
-// declared encoding is an error naming it. Errors are *XMLError.
+// declared encoding is an error naming it, unless l.ASCIILabels allows it
+// for an ASCII document. Errors are *XMLError.
 func DecodeXML(r io.Reader, l XMLLimits, v any) error {
 	doc, err := scanXML(r, l, "")
 	if err != nil {
 		return err
 	}
-	if err := newXMLDecoder(doc).Decode(v); err != nil {
+	if err := newXMLDecoder(doc, l).Decode(v); err != nil {
 		return xmlErrorf("%v", err)
 	}
 	return nil
@@ -61,12 +64,24 @@ func CheckXML(r io.Reader, l XMLLimits, root string) error {
 	return err
 }
 
-func newXMLDecoder(doc []byte) *xml.Decoder {
+func newXMLDecoder(doc []byte, l XMLLimits) *xml.Decoder {
 	d := xml.NewDecoder(bytes.NewReader(doc))
-	d.CharsetReader = func(label string, _ io.Reader) (io.Reader, error) {
+	d.CharsetReader = func(label string, r io.Reader) (io.Reader, error) {
+		if l.ASCIILabels && isASCII(doc) {
+			return r, nil
+		}
 		return nil, fmt.Errorf("encoding %s is not supported, only UTF-8", label)
 	}
 	return d
+}
+
+func isASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // scanXML reads at most l.MaxBytes of r, checks the document and returns
@@ -85,7 +100,7 @@ func scanXML(r io.Reader, l XMLLimits, root string) ([]byte, error) {
 	}
 	doc = bytes.TrimPrefix(doc, utf8BOM)
 
-	d := newXMLDecoder(doc)
+	d := newXMLDecoder(doc, l)
 	depth, elements := 0, 0
 	sawRoot := false
 	for first := true; ; first = false {

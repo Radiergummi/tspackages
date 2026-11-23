@@ -316,6 +316,12 @@ func (h *Maven) metadata(w http.ResponseWriter, r *http.Request, e *entry, p Pat
 		return
 	}
 	e.source = src.Name()
+	// The checksums of the bytes served, so Maven need not fetch them.
+	hs := NewHasher()
+	_, _ = hs.Write(b)
+	d := hs.Digests()
+	w.Header().Set("X-Checksum-Sha1", d.SHA1)
+	w.Header().Set("X-Checksum-Md5", d.MD5)
 	serveBytes(w, r, b, "application/xml")
 }
 

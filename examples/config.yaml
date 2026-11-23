@@ -101,7 +101,7 @@ ecosystems:
       - name: hosted
         type: storage
         store: main
-        claims: ["com.example.*"]
+        claims: ["com.example", "com.example.*"]
       - name: central
         type: registry
         url: https://repo.maven.apache.org/maven2/

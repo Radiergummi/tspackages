@@ -127,7 +127,7 @@ func newRegEnv(t *testing.T) *regEnv {
 	rec := records.New(sd)
 	c := upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1"}, AllowPrivateForTesting: true})
 	e := &regEnv{up: up, cache: cache, cd: cd, relay: rl, rec: rec, clock: time.Now()}
-	e.src = NewRegistrySource("central", []string{"*"}, up.srv.URL+"/", c, cache, rl, rec, time.Minute, 1<<20, nil, t.TempDir(), slog.New(slog.DiscardHandler))
+	e.src = NewRegistrySource("central", []string{"*"}, up.srv.URL+"/", c, cache, rl, rec, time.Minute, 1<<20, nil, slog.New(slog.DiscardHandler))
 	e.src.now = func() time.Time { return e.clock }
 	return e
 }
@@ -462,8 +462,9 @@ func TestChangedFileBackToFirst(t *testing.T) {
 	for i, body := range []string{jarData, jarData + " B", jarData} {
 		e.up.set(upJar, body)
 		e.up.set(upJar+".sha1", sha1Hex(body))
-		e.clock = e.clock.Add(2 * time.Minute)                // the cached .sha1 expires
-		for _, k := range e.keys(t, "maven/central/files/") { // fetched again, not a hit
+		// A release's .sha1 is cached for good: drop it and the file, so
+		// both are fetched again.
+		for _, k := range append(e.keys(t, "maven/central/paths/"), e.keys(t, "maven/central/files/")...) {
 			if err := e.cache.Delete(ctx, k); err != nil {
 				t.Fatal(err)
 			}
@@ -488,5 +489,104 @@ func TestChangedFileBackToFirst(t *testing.T) {
 				t.Fatalf("fetch 2: changed = %+v", got)
 			}
 		}
+	}
+}
+
+// TestUpstreamURLEscaped: every segment of an upstream request path is
+// escaped, so "?", "#" and "%" in a version stay part of the path.
+func TestUpstreamURLEscaped(t *testing.T) {
+	for _, tc := range []struct{ version, escaped string }{
+		{"1.0?x", "1.0%3Fx"},
+		{"1.0#x", "1.0%23x"},
+		{"%2e%2e", "%252e%252e"},
+	} {
+		t.Run(tc.escaped, func(t *testing.T) {
+			e := newRegEnv(t)
+			ctx := context.Background()
+			jar := "/org/foo/bar/" + tc.escaped + "/bar-" + tc.escaped + ".jar"
+			e.up.set(jar, jarData)
+			e.up.set(jar+".sha1", sha1Hex(jarData))
+			p := mustPath(t, "org/foo/bar/"+tc.version+"/bar-"+tc.version+".jar")
+			if b, err := readFile(e.src.File(ctx, p)); err != nil || string(b) != jarData {
+				t.Fatalf("file: %q, %v", b, err)
+			}
+			e.relay.Wait()
+			meta := "/org/foo/bar/" + tc.escaped + "-SNAPSHOT/maven-metadata.xml"
+			e.up.set(meta, "<metadata/>")
+			if b, err := e.src.Metadata(ctx, mustPath(t, "org/foo/bar/"+tc.version+"-SNAPSHOT/maven-metadata.xml")); err != nil || string(b) != "<metadata/>" {
+				t.Fatalf("metadata: %q, %v", b, err)
+			}
+			want := []string{"GET " + jar + ".sha1", "GET " + jar, "GET " + meta}
+			if got := e.up.requests(); !slices.Equal(got, want) {
+				t.Fatalf("requests = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestReleaseChecksumPermanent: a release file's .sha1 is fetched once;
+// a SNAPSHOT file's is refreshed after the TTL.
+func TestReleaseChecksumPermanent(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	snapJar := "/com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-1.jar"
+	for _, path := range []string{upJar, snapJar} {
+		e.up.set(path, jarData)
+		e.up.set(path+".sha1", sha1Hex(jarData))
+	}
+	for range 2 {
+		for _, path := range []string{upJar, snapJar} {
+			if b, err := readFile(e.src.File(ctx, mustPath(t, path))); err != nil || string(b) != jarData {
+				t.Fatalf("%s: %q, %v", path, b, err)
+			}
+			e.relay.Wait()
+		}
+		e.clock = e.clock.Add(2 * time.Minute)
+	}
+	if n := e.up.count(upJar + ".sha1"); n != 1 {
+		t.Errorf("release .sha1 fetched %d times, want 1", n)
+	}
+	if n := e.up.count(snapJar + ".sha1"); n != 2 {
+		t.Errorf("SNAPSHOT .sha1 fetched %d times, want 2", n)
+	}
+}
+
+// TestLongCoordinates: a groupId:artifactId too long for a provenance
+// record is served and cached without one.
+func TestLongCoordinates(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	g, a := strings.Repeat("g", 100), strings.Repeat("a", 100)
+	path := "/" + g + "/" + a + "/1.0/" + a + "-1.0.jar"
+	e.up.set(path, jarData)
+	e.up.set(path+".sha1", sha1Hex(jarData))
+	for i := range 2 {
+		if b, err := readFile(e.src.File(ctx, mustPath(t, path))); err != nil || string(b) != jarData {
+			t.Fatalf("call %d: %q, %v", i, b, err)
+		}
+		e.relay.Wait()
+	}
+	if n := e.up.count(path); n != 1 {
+		t.Fatalf("jar fetched %d times", n)
+	}
+	if d, err := e.src.Digests(ctx, mustPath(t, path)); err != nil || d != allDigests(jarData) {
+		t.Fatalf("digests = %+v, %v", d, err)
+	}
+}
+
+// TestMetadataASCIIEncodingLabel: upstream metadata labelled with another
+// encoding is accepted while every byte is ASCII.
+func TestMetadataASCIIEncodingLabel(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	doc := `<?xml version="1.0" encoding="ISO-8859-1"?><metadata><groupId>com.matchory</groupId></metadata>`
+	e.up.set(upMeta, doc)
+	if b, err := e.src.Metadata(ctx, mustPath(t, upMeta)); err != nil || string(b) != doc {
+		t.Fatalf("ASCII: %q, %v", b, err)
+	}
+	other := "/com/matchory/other/maven-metadata.xml"
+	e.up.set(other, `<?xml version="1.0" encoding="ISO-8859-1"?><metadata><groupId>caf`+"\xe9"+`</groupId></metadata>`)
+	if _, err := e.src.Metadata(ctx, mustPath(t, other)); err == nil || resolve.HTTPStatus(resolve.Wrap("central", err)) != http.StatusBadGateway {
+		t.Fatalf("non-ASCII: err = %v", err)
 	}
 }

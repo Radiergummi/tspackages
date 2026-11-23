@@ -104,3 +104,17 @@ func TestKey(t *testing.T) {
 		t.Errorf("Key = %q", got)
 	}
 }
+
+func TestSegmentCap(t *testing.T) {
+	path := func(groupSegs int) string { return strings.Repeat("g/", groupSegs) + "a/1/a-1.jar" }
+	if _, err := ParsePath(path(61)); err != nil {
+		t.Errorf("64 segments refused: %v", err)
+	}
+	if _, err := ParsePath(path(62)); err == nil {
+		t.Error("65 segments accepted")
+	}
+	// A dotted group segment counts once per part.
+	if _, err := ParsePath(strings.Repeat("g.", 61) + "g/a/1/a-1.jar"); err == nil {
+		t.Error("65 canonical segments accepted")
+	}
+}

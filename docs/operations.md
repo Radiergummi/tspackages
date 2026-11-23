@@ -743,10 +743,13 @@ A file that isn't cached yet costs two upstream fetches, its `.sha1` and
 then the file, and a Maven build's plugins alone are a few hundred files.
 At the default `upstream_fetches_per_second` of 10 per node, the first
 `mvn deploy` of a small project on an empty cache spends about a minute
-waiting for the limiter; later builds are served from the cache. Raise
-the limit for CI nodes that build against a cold cache. Cached files carry
-`X-Checksum-Sha1` and `X-Checksum-Md5`, so Maven doesn't request the
-checksum files.
+waiting for the limiter. Raise the limit for CI nodes that build against a
+cold cache. A release file's `.sha1` is fetched once and kept, so later
+builds of release dependencies make no upstream request, even with a
+fresh `~/.m2`. SNAPSHOT files' `.sha1`, files the upstream lacks and
+`maven-metadata.xml` are fetched again after `metadata_ttl`. Files and
+`maven-metadata.xml` carry `X-Checksum-Sha1` and `X-Checksum-Md5`, so
+Maven doesn't request the checksum files.
 
 ## Removing a bad publish
 
@@ -885,9 +888,20 @@ downloaded for good: publish the fix as a new version.
 
 To drop one bad build of a SNAPSHOT, delete its timestamped files and
 their `.json` records under `<dir>/files/`; the version's
-`maven-metadata.xml` is built from the records that remain. Leave
-`maven/~case/`: it holds the case in which each artifact was first
-deployed.
+`maven-metadata.xml` is built from the records that remain.
+
+`maven/~case/<esc(lowercased groupId:artifactId)>` holds the case in which
+an artifact was first deployed, and refuses a deploy of it in another
+case. Leave it while files remain under that spelling. A first deploy
+reserves it even when it fails, so a mistyped first deploy can block the
+right spelling. Delete the entry once nothing remains under
+`maven/<esc(groupId)>/<esc(artifactId)>/` for the reserved spelling.
+
+A release file stored without its `.json` record (a deploy interrupted
+between the two writes) isn't served, but blocks a deploy of other bytes
+under its name with `409`. To unblock it, delete the orphan file under
+`<dir>/files/`, then deploy again. The same bytes again complete the
+interrupted deploy without that.
 
 ### A Composer version from a git tag
 
