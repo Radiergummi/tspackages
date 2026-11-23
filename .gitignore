@@ -9,3 +9,6 @@
 /.vale/styles/*
 !/.vale/styles/Tspackages/
 !/.vale/styles/config/
+# The mvn tests' local repository (make maven-seed) and its build output.
+/.maven-seed/
+/integration/testdata/maven/seed/**/target/

@@ -22,14 +22,17 @@ Composer(?:'s)?
 Dependabot
 flock
 govulncheck
+Gradle(?:'s)?
 HuJSON
 IPs
 JSON
+Maven(?:'s)?
 MinIO
 npm
 OAuth
 Packagist
 pnpm
+POM(?:s|'s)?
 PyPI
 setuptools
 SHA-?(?:1|256|512)

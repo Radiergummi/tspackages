@@ -15,7 +15,8 @@ registry credentials.
 Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
 uploads with `twine`/`uv publish`), Go (`git` + `registry` + sumdb
 proxy) and npm (`storage` + `registry`; npm and pnpm, CI publishes with a
-dummy `_authToken`) ship; then OCI and Maven.
+dummy `_authToken`) and Maven (`storage` + `registry`; mvn and Gradle,
+no `<server>` or `credentials` entry) ship; OCI is next.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -25,7 +26,8 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real Composer/pip/uv/twine/go/npm/pnpm end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine/go/npm/pnpm/mvn/gradle end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm, a JDK, mvn, gradle and gpg (S3 variant: TSP_TEST_S3_ENDPOINT)
+make maven-seed    # once, with network: the local repository the mvn tests' fake Central serves (TSP_TEST_MAVEN_SEED; missing: skip, fail under CI=true)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
@@ -79,9 +81,16 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   `storage` source (dist-tags, precedence claims) and the `registry`
   source (tarballs, keys, attestations), the HTTP handler. Must not import
   `composer`, `pypi` or `goproxy` (nor the reverse).
+- `internal/ecosystem/maven` — coordinates, layout paths and claims, the
+  `ComparableVersion` port, the safe XML reader, checksums, deploy
+  inspection (POM, `.module`, metadata), the `storage` source (write-once
+  releases, overwritable SNAPSHOT files, generated metadata) and the `registry`
+  source (files verified by the upstream's `.sha1`, metadata passed
+  through), the HTTP handler. Must not import `composer`, `pypi`,
+  `goproxy` or `npm` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
 - `integration/` — end-to-end tests with real Composer, pip, uv, twine,
-  the go command, npm and pnpm (`-tags integration`).
+  the go command, npm, pnpm, mvn and Gradle (`-tags integration`).
 
 ## Invariants — do not break
 
@@ -150,6 +159,26 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   by SHA-512 (or SHA-1 when that is all a version declares) before
   caching; versions without either are dropped. Never answer `401`: npm
   turns it into an OTP or login prompt; deny is `403`.
+- Maven: claims and `maven:` rules are `*`, `<group>` or
+  `<group>:<artifact>`, the group dotted segments of `[a-z0-9_-]` whose
+  last may be `*` (one or more trailing segments, so `com.acme.*` doesn't
+  cover `com.acme`), the artifact `[a-z0-9._-]` and `*`, matched against
+  the lowercased `groupId:artifactId`. Coordinates are stored and served
+  in their exact case; a deploy that differs from an existing artifact
+  only in case is `409`. A `maven-metadata.xml` path is claimed when
+  either reading (artifact level `g:a`, group level `g.a`) matches a
+  claim. Every key segment from a coordinate or file name goes through
+  `storage.EscapeSegment`, so coordinate parts are at most 156 bytes, and
+  storage accepts file names of at most 153 bytes and `groupId:artifactId`
+  of at most 156. Release files are write-once (same bytes `201`, other
+  bytes `409`), and a version is listed once its POM is stored; SNAPSHOT
+  files may be overwritten. Uploaded checksums and `maven-metadata.xml`
+  are checked and discarded: tspackages serves its own, generated from
+  the bytes it serves. Registry files are verified against the upstream's
+  `.sha1` before caching; without one, a missing file is `404`, a
+  signature is streamed uncached and anything else is `502`. A `404` has a
+  plain-text body (Maven reads a problem+json `404` as a transfer error);
+  other errors are problem+json. Never answer `401`; deny is `403`.
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

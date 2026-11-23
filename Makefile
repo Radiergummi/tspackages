@@ -1,4 +1,4 @@
-.PHONY: check lint lint-go lint-workflows lint-docs vuln fmt fmt-check test integration tailnet cover build
+.PHONY: check lint lint-go lint-workflows lint-docs vuln fmt fmt-check test integration maven-seed tailnet cover build
 
 ## The gate CI runs: lint, formatting, vet and the race-enabled tests
 check: lint fmt-check
@@ -27,9 +27,15 @@ fmt-check:
 test:
 	go test ./...
 
-## Run the end-to-end tests against real Composer, pip, uv, twine, the go command, npm and pnpm (needs composer 2.x, git, python3 with pip, uv and twine, go, and node with npm and pnpm; the PyPI tests download pinned build backends once)
+## Run the end-to-end tests against real Composer, pip, uv, twine, the go command, npm, pnpm, mvn and gradle (needs composer 2.x, git, python3 with pip, uv and twine, go, node with npm and pnpm, a JDK, mvn, gradle and gpg; the PyPI tests download pinned build backends once, the mvn tests need make maven-seed)
 integration:
-	go test -tags integration ./integration/...
+	TSP_TEST_MAVEN_SEED="$${TSP_TEST_MAVEN_SEED:-$(MAVEN_SEED)}" go test -timeout 30m -tags integration ./integration/...
+
+## Fill the local Maven repository that the mvn tests' fake upstream serves: every plugin and dependency they use, fetched once from Maven Central
+MAVEN_SEED ?= $(CURDIR)/.maven-seed
+
+maven-seed:
+	mvn -B -ntp -Dmaven.repo.local=$(MAVEN_SEED) -f integration/testdata/maven/seed/pom.xml package install:help deploy:help
 
 ## Run tspackages and a client as real tsnet nodes against an in-process control server, including main's startup and shutdown
 tailnet:

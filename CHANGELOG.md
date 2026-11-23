@@ -27,6 +27,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The relay verifies SHA-512 digests: npm tarballs from a `registry`
   source are checked against the declared `integrity` (SHA-512, or SHA-1
   for old versions that declare nothing else) before they are cached.
+- A Maven repository at `/maven/` for Maven 3 and Gradle 9: artifacts,
+  POMs, `.module` files, signatures, checksums and `maven-metadata.xml`,
+  `mvn deploy` and Gradle's `maven-publish`, releases and SNAPSHOT versions.
+  Sources: `storage`, which writes release files once, generates
+  `maven-metadata.xml` and the `.sha1`, `.md5`, `.sha256` and `.sha512`
+  files, and checks uploaded checksums and POM coordinates; and `registry`
+  for Maven Central pass-through, whose files are checked against the
+  upstream's `.sha1` before they are cached. Clients need one mirror and
+  no `<server>` entry or `credentials`. The status page lists the
+  `settings.xml`, `distributionManagement` and Gradle settings, and
+  upstream files that changed.
 
 ### Changed
 

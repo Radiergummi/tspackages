@@ -282,3 +282,81 @@ fail and the status page names it. The caps:
 | `package.json` | published tarball | 1MiB, nesting 64 |
 | Tarball | publish | the `archive` limits of every upload |
 | `integrity` | upstream, client | 1KiB, `sha512` and `sha1` only |
+
+## Maven
+
+- Coordinates are case-sensitive, but claims and `maven:` rules match the
+  lowercased `groupId:artifactId`, so `com.Acme:lib` can't slip past a
+  `com.acme` claim. Claims and rules accept `*`, `<group>` or
+  `<group>:<artifact>`: the group dotted segments of `[a-z0-9_-]` whose
+  last segment may be `*`, the artifact `[a-z0-9._-]` and `*`; anything
+  else is a config error, or a rule that grants nothing. `com.acme.*`
+  doesn't cover `com.acme`. A storage source refuses a deploy whose
+  coordinates differ from an existing artifact's only in case (`409`).
+- Configure clients with tspackages as their only repository (Maven
+  `<mirrorOf>*</mirrorOf>`, a single Gradle `maven { }` repository, or
+  `exclusiveContent` for private groups). Both clients try the next
+  repository after a `403`, so a second repository with the same
+  coordinates would serve a denied caller the public artifact.
+- **Private coordinates never reach an upstream.** A claimed artifact is
+  looked up only on its claiming sources, through files, POMs, checksums
+  and metadata alike. A `maven-metadata.xml` path names either an
+  artifact (`com/acme/lib`: `com.acme:lib`) or a group (`com.acme.lib`);
+  it counts as claimed when either reading matches a claim. Upstream URLs
+  are built only from a parsed and re-serialized path.
+- **Checksums describe the bytes served.** tspackages generates `.sha1`,
+  `.md5`, `.sha256`, `.sha512` and the `X-Checksum-Sha1`, `X-Checksum-Md5`
+  and `ETag` headers from the bytes it stores or verified; uploaded
+  checksums are compared with the file (`400` on a mismatch) and
+  discarded. Uploaded `maven-metadata.xml` is checked for the deployed
+  coordinates and discarded; tspackages serves metadata it generates from
+  stored POMs. Checksums of uploaded metadata are checked for form only,
+  since the metadata they describe is gone by the time they arrive.
+- A release file never changes bytes. The same bytes deployed again
+  succeed; other bytes are `409`. SNAPSHOT files may be overwritten, and
+  each overwrite is audited with the replaced SHA256. There is no delete
+  (`405`).
+- **Deployed POMs bind their coordinates.** A POM's `groupId`,
+  `artifactId` and `version` (or its parent's) must equal the path's, and
+  a `${…}` in them is refused. Elements with a namespace prefix or a
+  namespace other than Maven's are refused, since Maven's own reader
+  ignores them and could see other coordinates than tspackages. A
+  `.module` file must name the same coordinates, and its files must be in
+  the same version directory. Everything else (jars, sources, signatures)
+  is stored as uploaded, without inspection.
+- **No response is a `401`.** A caller without a matching rule gets `403`
+  with `forbidden: no maven:<groupId>:<artifactId> read rule` (or `write`),
+  and an upstream `401` becomes a `502`. Clients need no `<server>` entry or
+  `credentials`, and any `Authorization` header is stripped. A deploy
+  needs a read rule as well as a write rule, because both clients read
+  `maven-metadata.xml` while they deploy; write still doesn't imply read.
+- Upstream files are verified against the upstream's `<file>.sha1` by the
+  relay before they are cached: by SHA-1 alone, which trusts the upstream
+  not to serve a crafted collision. A file whose SHA256 differs from the
+  first one recorded for it is served, logged at warn and listed on the
+  status page. Without an upstream `.sha1`, a missing file is `404`, any
+  other file `502`, except signatures (`.asc`, `.sigstore`,
+  `.sigstore.json`), for which Maven Central often publishes no checksum,
+  are streamed uncached and unverified, up to 64KiB, without
+  checksum headers. A signature is checked by the client against its
+  signer's key; tspackages can't vouch for one.
+- No XML document can expand, recurse or load anything. POMs and
+  `maven-metadata.xml`, uploaded or upstream, are refused with a DTD, an
+  entity declaration or a processing instruction other than the XML
+  declaration, before they are decoded. Upstream metadata is passed
+  through byte for byte once it has been checked.
+- No artifact code runs on the server, and no plugin or build either.
+
+Uploads are spooled to disk before inspection, and XML and JSON are read
+whole only up to their caps. The caps:
+
+| Parser | Input | Caps |
+|---|---|---|
+| Paths | request paths | segments and coordinate parts of at most 156 bytes, a `groupId` of at most 156, classifiers 64, extensions 32 |
+| Storage keys | deploys to a storage source | file names of at most 153 bytes, `groupId:artifactId` of at most 156 (each is one escaped key segment) |
+| XML (POM, `maven-metadata.xml`) | deploys, upstream metadata | 1MiB uploaded, 4MiB upstream; depth 32, 10,000 elements, no DTD, entities or processing instructions |
+| `.module` JSON | deploys | 1MiB, nesting 32 |
+| Checksum files | deploys, upstream `.sha1` | 1KiB, first line |
+| Signatures | deploys, upstream without `.sha1` | 64KiB |
+| Other files | deploys, upstream | `max_upload_bytes`, `max_artifact_bytes` |
+| Version ordering | generated metadata | versions of at most 156 bytes |

@@ -572,6 +572,182 @@ waiting at least 10 seconds each time (`fetch-retries`,
 `fetch-retry-mintimeout`), so a limit that is too tight makes installs slow
 before it fails them.
 
+## Maven
+
+### Client setup
+
+tspackages must be the client's only repository. Maven and Gradle both
+treat a `403` as "try the next repository": with Maven Central next to
+tspackages, a caller without a read rule for a private artifact would get
+a public artifact with the same coordinates from there. tspackages itself
+never asks an upstream for claimed coordinates; keeping clients from
+asking is the client configuration's job.
+
+For Maven, `~/.m2/settings.xml` (the status page shows it with the host
+filled in):
+
+```xml
+<settings>
+  <mirrors>
+    <mirror>
+      <id>tspackages</id>
+      <mirrorOf>*</mirrorOf>
+      <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+    </mirror>
+  </mirrors>
+  <profiles>
+    <profile>
+      <id>tspackages</id>
+      <repositories>
+        <repository>
+          <id>tspackages</id>
+          <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+          <snapshots><enabled>true</enabled></snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>tspackages</activeProfile>
+  </activeProfiles>
+</settings>
+```
+
+`<mirrorOf>*</mirrorOf>` sends every repository to tspackages, including
+the ones POMs declare and plugin repositories. A mirror of Central takes
+Central's policy, which turns SNAPSHOT versions off, so the profile adds a
+repository with SNAPSHOT versions on that the mirror also covers. Without SNAPSHOT
+dependencies, the mirror alone is enough.
+
+For Gradle, in `build.gradle.kts`, or in `settings.gradle.kts` under
+`dependencyResolutionManagement`:
+
+```kotlin
+repositories {
+    maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") }
+}
+```
+
+Neither client needs a `<server>` entry or a `credentials` block: without
+one they send no `Authorization` header, and tspackages strips any that
+arrives. Nothing answers `401`, so neither client prompts for a password.
+
+### Deploying from CI
+
+A deploy reads as well as writes: both clients fetch `maven-metadata.xml`
+before they upload theirs, and Maven aborts on anything but a `200` or
+`404` there. Give the CI node's tag both rules for its own artifacts:
+
+```hujson
+"app": {"github.com/radiergummi/tspackages": [
+  {"read": ["maven:com.acme:lib"], "write": ["maven:com.acme:lib"]}
+]}
+```
+
+Its builds also read their plugins and dependencies through tspackages,
+so in practice the CI tag reads `*`. In `pom.xml`:
+
+```xml
+<distributionManagement>
+  <repository>
+    <id>tspackages</id>
+    <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+  </repository>
+  <snapshotRepository>
+    <id>tspackages</id>
+    <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+  </snapshotRepository>
+</distributionManagement>
+```
+
+and run `mvn deploy`. For Gradle's `maven-publish`, in `build.gradle.kts`:
+
+```kotlin
+publishing {
+    repositories {
+        maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") }
+    }
+}
+```
+
+and run `gradle publish`. Signatures from Gradle's `signing` plugin or
+`maven-gpg-plugin` (`.asc`) are stored and served like any file.
+
+- Deploying the same bytes again succeeds; other bytes for a file of a
+  release fail the build with `409`, and the stored file stays. Maven's
+  jars carry build timestamps, so a second `mvn deploy` of a release
+  without `project.build.outputTimestamp` fails. Bump the version.
+- A POM whose `groupId`, `artifactId` or `version` holds a `${…}` property
+  is refused with `400 unresolved property … deploy a flattened POM`. With
+  CI-friendly versions (`${revision}`), deploy through the
+  `flatten-maven-plugin`.
+- Uploaded checksums must match the file (`400 checksum mismatch`), and
+  uploaded `maven-metadata.xml` must name the deployed artifact. Both are
+  then discarded; tspackages serves its own.
+- A `maven-plugin` deploys like any artifact. Storage sources serve no
+  group-level `maven-metadata.xml`, so a private plugin doesn't resolve by
+  its prefix (`mvn foo:goal`); call it by its coordinates,
+  `mvn com.acme:foo-maven-plugin:1.0:goal`.
+- A release version is listed once its POM is stored, before the deploy
+  has uploaded everything. A build that resolves it in that moment gets a
+  `404` for the jar, which Maven remembers for a day (`mvn -U` retries).
+  Resolve after the deploy job ends.
+
+### SNAPSHOT versions
+
+Each SNAPSHOT deploy adds timestamped files (`lib-1.0-20261123.101010-3.jar`)
+and the version's `maven-metadata.xml` points at the newest. They are kept
+without limit; there is no retention. Two deploys of one SNAPSHOT version
+at the same moment may pick the same build number, and the later one
+overwrites the files of the earlier one.
+
+Consumers need the profile from [Client setup](#client-setup-2). Maven
+looks for a newer SNAPSHOT once a day (`mvn -U` forces it), Gradle every
+24 hours (`--refresh-dependencies`).
+
+### Gradle plugins
+
+The Gradle Plugin Portal isn't proxied. A plugin's marker artifact lives
+in a group named after the plugin ID, so the portal can't be a claimed
+source, and Maven Central is the one unclaimed source. Keep the portal for
+public plugins and send your own groups only to tspackages, in
+`settings.gradle.kts`:
+
+```kotlin
+pluginManagement {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") } }
+            filter { includeGroupByRegex("com\\.acme(\\..*)?") }
+        }
+        gradlePluginPortal()
+    }
+}
+```
+
+Public plugins then come from the portal directly, not through tspackages.
+
+### Upstream files without a checksum
+
+Files from a `registry` source are verified against the upstream's
+`<file>.sha1` before they are cached. Maven Central publishes none for
+many signature files (`.asc`): those are fetched from the upstream on every
+request, up to 64KiB, served without checksum headers and never cached.
+Clients check signatures against the signer's key, not a digest. Any other
+file without an upstream `.sha1` answers `502 upstream declares no checksum
+for <file>`.
+
+### Cold cache and rate limits
+
+A file that isn't cached yet costs two upstream fetches, its `.sha1` and
+then the file, and a Maven build's plugins alone are a few hundred files.
+At the default `upstream_fetches_per_second` of 10 per node, the first
+`mvn deploy` of a small project on an empty cache spends about a minute
+waiting for the limiter; later builds are served from the cache. Raise
+the limit for CI nodes that build against a cold cache. Cached files carry
+`X-Checksum-Sha1` and `X-Checksum-Md5`, so Maven doesn't request the
+checksum files.
+
 ## Removing a bad publish
 
 tspackages has no delete or yank: published bytes never change, so lock files
@@ -685,6 +861,33 @@ sits under the version without build metadata (`<pkg>/<esc(1.0.0)>/` for
 published again, but other bytes for that version, or a version differing
 from it only in build metadata, are refused with `409`. Publish a new
 version.
+
+### A deploy to a Maven storage source
+
+Maven keys keep the exact case: every segment is the encoded `groupId`,
+`artifactId`, version or file name as deployed (`esc com.acme` is
+`cdnmqbj1cdmma`, `esc lib` is `dhkm4`, `esc 1.0` is `64n30`). With `<art>`
+for `maven/<esc(groupId)>/<esc(artifactId)>` and `<dir>` for
+`<art>/<esc(version)>`, to remove a whole version:
+
+1. Delete `<dir>/~pom`, the version's claim.
+2. Delete `<art>/index.json`.
+3. Delete everything under `<dir>/files/`: each file and its `.json`
+   record.
+
+After the second step, reads rebuild the artifact's `maven-metadata.xml`
+from the remaining `~pom` claims, scanning the artifact on every read until
+its next deploy writes a new index. Check that the version is gone from
+`/maven/<group path>/<artifactId>/maven-metadata.xml` and that the jar's
+URL answers `404`. No restart is needed. Nothing then stops the same
+version from being deployed again, but Maven and Gradle keep a release they
+downloaded for good: publish the fix as a new version.
+
+To drop one bad build of a SNAPSHOT, delete its timestamped files and
+their `.json` records under `<dir>/files/`; the version's
+`maven-metadata.xml` is built from the records that remain. Leave
+`maven/~case/`: it holds the case in which each artifact was first
+deployed.
 
 ### A Composer version from a git tag
 
