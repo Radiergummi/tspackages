@@ -600,7 +600,8 @@ Before you do:
 
 Names in keys are normalised: Composer's `<vendor>/<name>` is in lowercase;
 a PyPI name is normalised as PEP 503 says (lowercase; runs of `-`, `_` and
-`.` become `-`, so `Acme_Utils` is `acme-utils`). Some segments are then
+`.` become `-`, so `Acme_Utils` is `acme-utils`); an npm name is in
+lowercase, scope included (`@Acme/X` is `@acme/x`). Some segments are then
 encoded as lowercase base32hex without padding. This computes one (Python
 3.10 or later):
 
@@ -647,6 +648,43 @@ Leave the release's claim files (`<dir>/~sdist` and
 `<dir>/<esc(~wheel-<tags>)>`). They hold the filename: the same filename can
 be uploaded again, but a corrected file under another filename can't take
 that version's sdist or wheel. Publish a new version.
+
+### An upload to an npm storage source
+
+Every segment is encoded, the name as a whole with its scope and slash:
+`esc @acme/x` is `81gm6rb55ts0`, `esc 1.0.0` is `64n30bhg`. With `<pkg>`
+for `npm/<esc(name)>` and `<dir>` for `<pkg>/<esc(version)>` (the version
+as published, build metadata included):
+
+1. If a dist-tag points at the version (`npm view <name> dist-tags`), move
+   it first: `npm dist-tag add <name>@<other-version> latest`, and
+   `npm dist-tag rm <name> <tag>` for other tags. A tag left on a removed
+   version disappears from the packument; without `latest`,
+   `npm install <name>` fails.
+2. Delete `<dir>/package.json`, the version's record.
+3. Delete `<pkg>/index.json`.
+4. Delete `<dir>/package.tgz` and, where present, `<dir>/package.sigstore`.
+
+Between the second and the third step, reads of the package fail with
+`502`. After it, reads rebuild the index from the remaining
+`package.json` records, scanning the package on every read until its next
+publish writes a new index. Check that
+`/npm/<name>/-/<base>-<version>.tgz` (`<base>` without the scope) answers
+`404` and that `npm view <name> versions` no longer lists it. No restart is
+needed.
+
+If the tags weren't moved first, delete `<pkg>/dist-tags.json` as well:
+`latest` then falls back to the highest remaining release, the status page
+reports the lost document, and the next tag change (a publish or
+`npm dist-tag add`) writes it afresh, holding only the fallback `latest`
+and that change. Re-add the other tags.
+
+Leave `<dir>/~claim`, `<dir>/~tagged` and the `~precedence` claim, which
+sits under the version without build metadata (`<pkg>/<esc(1.0.0)>/` for
+`1.0.0+a`). The claim holds the SHA256 of the tarball: the same bytes can be
+published again, but other bytes for that version, or a version differing
+from it only in build metadata, are refused with `409`. Publish a new
+version.
 
 ### A Composer version from a git tag
 
@@ -738,9 +776,11 @@ To keep that window small and harmless:
   first git index pass runs.
 - **Keep client caches.** Composer keeps downloaded archives in its cache
   directory and installs from a lock file without fetching them again, and
-  npm and pnpm keep tarballs by their integrity. Every tspackages response
-  except an npm packument carries `Cache-Control: private, no-store`, so
-  don't count on a client's HTTP cache.
+  npm and pnpm keep tarballs by their integrity. npm packuments and version
+  documents carry `Cache-Control: no-cache` (checked again on every use) and
+  npm tarballs `private, max-age=31536000, immutable`; every other
+  tspackages response carries `private, no-store`, so don't count on a
+  client's HTTP cache.
 - **Cache in CI.** Persist Composer's cache directory between runs
   (`composer config cache-dir`), and npm's cache or pnpm's store
   (`npm config get cache`, `pnpm store path`). pip's cache is mostly an HTTP cache, which
