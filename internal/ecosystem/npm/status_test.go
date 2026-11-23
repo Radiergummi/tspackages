@@ -29,6 +29,7 @@ func statusPage(t *testing.T, read ...string) string {
 		Sections: []web.Section{npm.StatusSection(func() []npm.ChangedTarball {
 			return []npm.ChangedTarball{
 				{Package: "@acme/core", Version: "1.0.0", Source: "npmjs", FirstSHA256: "aaaa", NowSHA256: "bbbb", Seen: time.Unix(0, 0).UTC()},
+				{Package: "JSONStream", Version: "1.3.5", Source: "npmjs", FirstSHA256: "cccc", NowSHA256: "dddd", Seen: time.Unix(0, 0).UTC()},
 			}
 		})},
 	})
@@ -64,5 +65,9 @@ func TestStatusSectionNPM(t *testing.T) {
 	// The npm: rule does not match this package, so its row stays hidden.
 	if body := statusPage(t, "npm:@other/*"); strings.Contains(body, "@acme/core") {
 		t.Error("changed tarball shown to a caller without a matching rule")
+	}
+	// Rules match the normalised name; the row keeps the exact one.
+	if body := statusPage(t, "npm:jsonstream"); !strings.Contains(body, "JSONStream") || !strings.Contains(body, "dddd") {
+		t.Error("changed tarball of JSONStream hidden from npm:jsonstream")
 	}
 }

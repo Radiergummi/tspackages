@@ -2,6 +2,7 @@ package npm
 
 import (
 	"html/template"
+	"strings"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/web"
@@ -44,7 +45,8 @@ func StatusSection(changed func() []ChangedTarball) web.Section {
 					var rows []web.Row
 					for _, c := range changed() {
 						rows = append(rows, web.Row{
-							Packages: []string{c.Package},
+							// Rules match normalised names; c.Package is exact.
+							Packages: []string{strings.ToLower(c.Package)},
 							Cells: []web.Cell{
 								{Lines: []string{c.Package}}, {Lines: []string{c.Version}}, {Lines: []string{c.Source}},
 								{Lines: []string{c.FirstSHA256}, Code: true}, {Lines: []string{c.NowSHA256}, Code: true},

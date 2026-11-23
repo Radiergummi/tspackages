@@ -56,6 +56,8 @@ type NPM struct {
 	maxUpload int64
 	tmpDir    string
 	log       *slog.Logger
+	// createTemp creates a publish spool: os.CreateTemp, replaced in tests.
+	createTemp func(dir, pattern string) (*os.File, error)
 }
 
 var _ ecosystem.Ecosystem = (*NPM)(nil)
@@ -68,7 +70,7 @@ func New(sources []Source, maxUpload int64, tmpDir string, log *slog.Logger) *NP
 	if log == nil {
 		log = slog.Default()
 	}
-	return &NPM{sources: sources, maxUpload: maxUpload, tmpDir: tmpDir, log: log}
+	return &NPM{sources: sources, maxUpload: maxUpload, tmpDir: tmpDir, log: log, createTemp: os.CreateTemp}
 }
 
 func (h *NPM) Name() string { return ecoName }
@@ -431,7 +433,7 @@ func (h *NPM) publish(w http.ResponseWriter, r *http.Request, caller identity.Ca
 	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(publishReadTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		h.log.Warn("npm publish: set read deadline", "error", err)
 	}
-	f, err := os.CreateTemp(h.tmpDir, "publish-*")
+	f, err := h.createTemp(h.tmpDir, "publish-*")
 	if err != nil {
 		h.log.Error("npm publish: spool", "error", err)
 		jsonError(w, http.StatusInternalServerError, "internal server error")
@@ -439,7 +441,13 @@ func (h *NPM) publish(w http.ResponseWriter, r *http.Request, caller identity.Ca
 	}
 	defer func() { f.Close(); os.Remove(f.Name()) }() //nolint:gosec // our own os.CreateTemp file
 	limit := (h.maxUpload*4+2)/3 + 2<<20
-	size, err := io.Copy(f, io.LimitReader(r.Body, limit+1))
+	body := &readErr{r: io.LimitReader(r.Body, limit+1)}
+	size, err := io.Copy(f, body)
+	if err != nil && body.err == nil {
+		h.log.Error("npm publish: spool", "error", err)
+		jsonError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, "could not read the publish body")
 		return
@@ -464,6 +472,21 @@ func (h *NPM) publish(w http.ResponseWriter, r *http.Request, caller identity.Ca
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+// readErr remembers the error of a failed read, telling a body the client
+// failed to send from a spool that could not be written.
+type readErr struct {
+	r   io.Reader
+	err error
+}
+
+func (e *readErr) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		e.err = err
+	}
+	return n, err
 }
 
 // keys serves the unclaimed source's signing keys. They are public, but

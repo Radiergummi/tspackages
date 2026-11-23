@@ -663,3 +663,48 @@ func TestMalformedRulesMatchNothing(t *testing.T) {
 		t.Fatalf("log: %s", out)
 	}
 }
+
+// errReader fails every read.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("client went away") }
+
+func TestPublishSpoolErrors(t *testing.T) {
+	dir := t.TempDir()
+	var logs bytes.Buffer
+	st := storageFake()
+	h := New([]Source{st}, 1<<20, dir, slog.New(slog.NewTextHandler(&logs, nil)))
+	mux := http.NewServeMux()
+	h.Mount(mux)
+	srv := identity.Middleware(testutil.Who{Cap: hCap, Rules: []string{writeAll}}, hCap, nil)(mux)
+
+	// A body the client fails to send is the client's fault.
+	if w := do(srv, "PUT", "/npm/@s%2fn", errReader{}, "Content-Type", "application/json"); w.Code != 400 {
+		t.Errorf("client read error: %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("client read error logged as an error: %s", logs.String())
+	}
+
+	// A spool that cannot be written (a full disk) is ours.
+	h.createTemp = func(dir, pattern string) (*os.File, error) {
+		f, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		f.Close()
+		return os.Open(f.Name())
+	}
+	if w := do(srv, "PUT", "/npm/@s%2fn", strings.NewReader("{}"), "Content-Type", "application/json"); w.Code != 500 || w.Body.String() != `{"error":"internal server error"}` {
+		t.Errorf("spool write error: %d %s", w.Code, w.Body)
+	}
+	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "spool") {
+		t.Errorf("spool write error not logged: %s", logs.String())
+	}
+	if len(st.published) != 0 {
+		t.Error("a body that failed to spool reached Publish")
+	}
+	if left, err := os.ReadDir(dir); err != nil || len(left) != 0 {
+		t.Errorf("spool dir: %v %v", left, err)
+	}
+}
