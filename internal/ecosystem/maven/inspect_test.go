@@ -35,6 +35,10 @@ func pom(inner string) string {
 <project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>` + inner + `</project>`
 }
 
+// smuggledPOM names com.matchory only in a foreign-namespace element, which
+// Maven does not read as the groupId; Maven uses the parent's org.other.
+const smuggledPOM = `<project xmlns="http://maven.apache.org/POM/4.0.0"><parent><groupId>org.other</groupId><artifactId>x</artifactId><version>1.0</version></parent><x:groupId xmlns:x="urn:x">com.matchory</x:groupId><artifactId>lib</artifactId></project>`
+
 func TestInspectPOM(t *testing.T) {
 	release := mustPath(t, "com/matchory/lib/1.0/lib-1.0.pom")
 	snapshot := mustPath(t, "com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.pom")
@@ -44,12 +48,14 @@ func TestInspectPOM(t *testing.T) {
 		p         Path
 		packaging string
 	}{
-		"gradle":    {readTestdata(t, "lib-1.0.pom"), release, "jar"},
-		"direct":    {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><packaging>bundle</packaging>`), release, "bundle"},
-		"inherited": {pom(`<parent><groupId>com.matchory</groupId><artifactId>parent</artifactId><version>1.0</version></parent><artifactId>lib</artifactId>`), release, "jar"},
-		"own wins":  {pom(`<parent><groupId>org.other</groupId><artifactId>parent</artifactId><version>9</version></parent><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, "jar"},
-		"trimmed":   {pom("<groupId>\n  com.matchory\n</groupId><artifactId> lib </artifactId><version>1.0</version>"), release, "jar"},
-		"snapshot":  {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version>`), snapshot, "jar"},
+		"gradle":       {readTestdata(t, "lib-1.0.pom"), release, "jar"},
+		"no namespace": {`<project><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version></project>`, release, "jar"},
+		"xsi":          {`<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd"><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><build><plugins><plugin><artifactId>p</artifactId></plugin></plugins></build></project>`, release, "jar"},
+		"direct":       {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><packaging>bundle</packaging>`), release, "bundle"},
+		"inherited":    {pom(`<parent><groupId>com.matchory</groupId><artifactId>parent</artifactId><version>1.0</version></parent><artifactId>lib</artifactId>`), release, "jar"},
+		"own wins":     {pom(`<parent><groupId>org.other</groupId><artifactId>parent</artifactId><version>9</version></parent><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, "jar"},
+		"trimmed":      {pom("<groupId>\n  com.matchory\n</groupId><artifactId> lib </artifactId><version>1.0</version>"), release, "jar"},
+		"snapshot":     {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version>`), snapshot, "jar"},
 	} {
 		info, err := InspectPOM(strings.NewReader(tc.doc), tc.p)
 		if err != nil {
@@ -79,6 +85,10 @@ func TestInspectPOM(t *testing.T) {
 		"doctype":             {`<!DOCTYPE project SYSTEM "file:///etc/passwd">` + pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "DOCTYPE"},
 		"not a project":       {`<metadata><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version></metadata>`, release, 400, "project"},
 		"too large":           {pom(strings.Repeat(" ", 1<<20)), release, 413, "1 MiB"},
+		"prefixed groupId":    {smuggledPOM, release, 400, `element <groupId> is in namespace "urn:x"; POMs use only http://maven.apache.org/POM/4.0.0`},
+		"prefixed root":       {`<x:project xmlns:x="urn:x"><x:groupId>com.matchory</x:groupId><x:artifactId>lib</x:artifactId><x:version>1.0</x:version></x:project>`, release, 400, `element <project> is in namespace "urn:x"`},
+		"nested foreign":      {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><build><plugins><y:plugin xmlns:y="urn:y"/></plugins></build>`), release, 400, `element <plugin> is in namespace "urn:y"`},
+		"undeclared prefix":   {pom(`<z:groupId>com.matchory</z:groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "element <groupId> is in namespace"},
 	} {
 		_, err := InspectPOM(strings.NewReader(tc.doc), tc.p)
 		wantRequestError(t, name, err, tc.status, tc.detail)
