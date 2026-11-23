@@ -84,3 +84,14 @@ ecosystems:
         type: registry
         url: https://proxy.golang.org
         fetch_hosts: [proxy.golang.org, sum.golang.org]   # sum.golang.org is required
+
+  npm:
+    sources:
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["@example/*"]
+      - name: npmjs
+        type: registry
+        url: https://registry.npmjs.org/
+        fetch_hosts: [registry.npmjs.org]
