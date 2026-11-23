@@ -746,6 +746,27 @@ func TestSHA512Verified(t *testing.T) {
 	}
 }
 
+// TestSHA512OnlyWhenWanted: a download that declares no SHA-512 is not
+// hashed with it.
+func TestSHA512OnlyWhenWanted(t *testing.T) {
+	r, _, _ := newRelay(t)
+	data := []byte("go module zip")
+	var calls atomic.Int32
+	var got Result
+	onCommit := func(_ context.Context, res Result) error { got = res; return nil }
+	rc, _, _, err := r.Open(context.Background(), "k", Digest{SHA256: digestOf(data).SHA256}, bytesFetch(data, &calls), onCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if got.SHA512 != "" || got.SHA1 == "" || got.SHA256 != digestOf(data).SHA256 {
+		t.Fatalf("onCommit saw %+v", got)
+	}
+}
+
 func TestSHA512Mismatch(t *testing.T) {
 	r, cache, _ := newRelay(t)
 	var calls atomic.Int32
