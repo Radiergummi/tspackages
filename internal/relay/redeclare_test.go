@@ -149,14 +149,20 @@ func TestEvictSHA512(t *testing.T) {
 	have := Digest{SHA256: digestOf(data).SHA256, SHA512: sha512Hex(data)}
 	other := Digest{SHA256: have.SHA256, SHA512: hex.EncodeToString(make([]byte, 64))}
 	for _, c := range []struct {
-		name string
-		want Digest
-		kept bool
-	}{{"same", have, true}, {"other sha512", other, false}} {
+		name     string
+		dl, want Digest
+		kept     bool
+	}{
+		{"same", have, have, true},
+		{"other sha512", have, other, false},
+		// A download that declared no SHA-512 didn't compute one: the entry
+		// is kept, and reads expecting a SHA-512 verify it themselves.
+		{"not computed", Digest{SHA256: have.SHA256}, have, true},
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			r, cache, release := newHeldRelay(t)
 			var calls atomic.Int32
-			readAllOf(t, r, have, bytesFetch(data, &calls))
+			readAllOf(t, r, c.dl, bytesFetch(data, &calls))
 			r.beforeWait = release
 			if err := r.Evict(context.Background(), "k", c.want); err != nil {
 				t.Fatal(err)

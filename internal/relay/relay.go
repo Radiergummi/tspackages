@@ -96,7 +96,7 @@ func (r *Relay) Evict(ctx context.Context, key string, want Digest) error {
 			return err
 		}
 		dl.mu.Lock()
-		keep := dl.err == nil && check(want, dl.res) == nil
+		keep := dl.err == nil && check(computed(want, dl.res), dl.res) == nil
 		dl.mu.Unlock()
 		if keep {
 			return nil
@@ -186,7 +186,7 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 				return nil, 0, false, err
 			}
 			dl.mu.Lock()
-			stale := dl.err == nil && check(want, dl.res) != nil
+			stale := dl.err == nil && check(computed(want, dl.res), dl.res) != nil
 			dl.mu.Unlock()
 			if stale {
 				if err := r.cache.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -398,6 +398,16 @@ func (dl *download) copy(body io.Reader, h1, h256, h512 hash.Hash, progress func
 			return Result{}, rerr
 		}
 	}
+}
+
+// computed is want without the SHA-512 when got has none: a download that
+// declared no SHA-512 didn't compute one, and a cache read expecting it
+// verifies it itself.
+func computed(want Digest, got Result) Digest {
+	if got.SHA512 == "" {
+		want.SHA512 = ""
+	}
+	return want
 }
 
 func check(want Digest, got Result) error {
