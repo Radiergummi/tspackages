@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Builds once against Maven Central (make maven-seed) so that the local
+  repository holds every plugin and dependency the Maven integration tests
+  use. Plugin versions here must match the test projects in ../.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.seed</groupId>
+  <artifactId>seed</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>lib</module>
+    <module>plugin</module>
+  </modules>
+</project>

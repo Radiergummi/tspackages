@@ -6,7 +6,7 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Composer, PyPI, Go and npm ship today. OCI and Maven follow. Read
+Composer, PyPI, Go, npm and Maven ship today. OCI follows. Read
 [docs/security.md](docs/security.md) before you deploy, and
 [docs/operations.md](docs/operations.md) for backups, upgrades and monitoring.
 
@@ -272,6 +272,43 @@ version on publish, and a package's first version is always `latest`.
 Unpublish and deprecate answer `405`, and `npm audit` gets `404` (see
 [docs/operations.md](docs/operations.md#npm-audit)).
 
+## Maven sources
+
+`/maven/` speaks the Maven 2 repository layout for Maven 3 and Gradle.
+Maven has `storage` and `registry` sources; there is no `git` source.
+
+```yaml
+ecosystems:
+  maven:
+    sources:
+      - {name: hosted, type: storage, store: main, claims: ["com.acme", "com.acme.*"]}
+      - name: central
+        type: registry
+        url: https://repo.maven.apache.org/maven2/
+        fetch_hosts: [repo.maven.apache.org]
+```
+
+| Type | Keys | Does |
+|------|------|------|
+| `storage` | `store`, `claims` | Hosts artifacts deployed with `mvn deploy` or Gradle's `maven-publish`, and generates their `maven-metadata.xml`. |
+| `registry` | `url` (`https://`, ending in `/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to Maven Central or another Maven repository. Files are checked against the upstream's `.sha1` before they are cached. |
+
+A claim is `*`, `<group>` or `<group>:<artifact>`. The group is dotted
+segments of `[a-z0-9_-]` whose last segment may be `*`, matching one or
+more trailing segments, so `com.acme.*` doesn't match `com.acme`; claim
+both. The artifact is `[a-z0-9._-]` with `*` wildcards. Claims match the
+lowercased `groupId:artifactId`; coordinates are stored in their exact
+case. Other public repositories (Google's, a company Nexus) are claimed
+`registry` sources, since only one source may be unclaimed.
+
+A release file is written once: the same bytes again succeed, other bytes
+are `409`. A release version is listed in `maven-metadata.xml` once its POM
+is stored. SNAPSHOT files may be overwritten, and are kept without limit.
+tspackages generates `.sha1`, `.md5`, `.sha256` and `.sha512` for every
+file and checks the ones clients upload. Deleting answers `405`. See
+[docs/operations.md](docs/operations.md#maven) for deploys, SNAPSHOT
+versions and Gradle plugins.
+
 ## Client setup
 
 ### Composer
@@ -374,6 +411,34 @@ Lockfiles written against registry.npmjs.org install unchanged. Publish
 with `npm publish` or `pnpm publish`, with `publishConfig.registry` set in
 `package.json` (see [docs/operations.md](docs/operations.md#publishing-from-ci)).
 
+### Maven and Gradle
+
+tspackages must be the only repository: both clients try the next
+repository after a `403`. In `~/.m2/settings.xml`, mirror everything to it:
+
+```xml
+<mirrors>
+  <mirror>
+    <id>tspackages</id>
+    <mirrorOf>*</mirrorOf>
+    <url>https://registry.<tailnet>.ts.net/maven/</url>
+  </mirror>
+</mirrors>
+```
+
+In Gradle, list it as the only repository:
+
+```kotlin
+repositories {
+    maven { url = uri("https://registry.<tailnet>.ts.net/maven/") }
+}
+```
+
+Neither needs a `<server>` entry or a `credentials` block, for reading or
+deploying. The status page shows the full snippets, including SNAPSHOT
+consumers, `distributionManagement` and Gradle's `publishing`; see also
+[docs/operations.md](docs/operations.md#maven).
+
 ## Tailnet policy
 
 Humans read; each publishing repo gets its own CI tag with write on its own
@@ -409,7 +474,8 @@ unioned. The capability name is configurable (`tailscale.capability`).
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
-make integration   # end-to-end with real Composer, pip, uv, twine, go, npm and pnpm
+make maven-seed    # once: the plugins the mvn tests need, from Maven Central
+make integration   # end-to-end with real Composer, pip, uv, twine, go, npm, pnpm, mvn and Gradle
 make tailnet       # real tsnet nodes against an in-process control server
 make vuln          # govulncheck, failing on reachable findings
 ```
