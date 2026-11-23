@@ -77,7 +77,7 @@ func FuzzInspectPOM(f *testing.F) {
 		plainPOM, pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`),
 		pom(`<parent><groupId>com.matchory</groupId><version>${revision}</version></parent><artifactId>lib</artifactId>`),
 		`<!DOCTYPE project []><project/>`,
-		smuggledPOM,
+		smuggledPOM, pomPrefixedPOM, emptyPrefixPOM,
 	} {
 		f.Add([]byte(s))
 	}

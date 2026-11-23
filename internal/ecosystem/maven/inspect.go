@@ -67,26 +67,44 @@ func decodeUploadXML(r io.Reader, what string, v any) ([]byte, error) {
 	return b, nil
 }
 
-// pomNamespace is the namespace of Maven 4.0.0 POMs.
-const pomNamespace = "http://maven.apache.org/POM/4.0.0"
+const (
+	// pomNamespace is the namespace of Maven 4.0.0 POMs.
+	pomNamespace = "http://maven.apache.org/POM/4.0.0"
+	// metadataNamespace is the namespace of maven-metadata.xml 1.1.0.
+	metadataNamespace = "http://maven.apache.org/METADATA/1.1.0"
+)
 
-// checkPOMNamespaces refuses any element of doc, a document DecodeXML
-// accepted, in a namespace other than none or pomNamespace. Maven reads POMs
-// without namespace processing, so a prefixed element such as
-// <x:groupId xmlns:x="urn:x"> is not the groupId Maven uses, while
+// checkElementNames refuses any element of doc, a document DecodeXML
+// accepted, whose raw name has a prefix, or whose namespace is neither none
+// nor ns. Maven reads POMs and metadata without namespace processing, so
+// <m:groupId> is not the groupId Maven uses whatever m is bound to, while
 // encoding/xml would match it. Attributes are not checked.
-func checkPOMNamespaces(doc []byte) error {
-	d := newXMLDecoder(bytes.TrimPrefix(doc, utf8BOM))
+func checkElementNames(doc []byte, what, ns string) error {
+	doc = bytes.TrimPrefix(doc, utf8BOM)
+	raw := newXMLDecoder(doc)
+	for {
+		tok, err := raw.RawToken()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return badRequest("invalid %s: %v", what, err)
+		}
+		if t, ok := tok.(xml.StartElement); ok && t.Name.Space != "" {
+			return badRequest("element <%s:%s> has a namespace prefix; %s elements are unprefixed", t.Name.Space, t.Name.Local, what)
+		}
+	}
+	d := newXMLDecoder(doc)
 	for {
 		tok, err := d.Token()
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		if err != nil {
-			return badRequest("invalid POM: %v", err)
+			return badRequest("invalid %s: %v", what, err)
 		}
-		if t, ok := tok.(xml.StartElement); ok && t.Name.Space != "" && t.Name.Space != pomNamespace {
-			return badRequest("element <%s> is in namespace %q; POMs use only %s", t.Name.Local, t.Name.Space, pomNamespace)
+		if t, ok := tok.(xml.StartElement); ok && t.Name.Space != "" && t.Name.Space != ns {
+			return badRequest("element <%s> is in namespace %q; %s uses only %s", t.Name.Local, t.Name.Space, what, ns)
 		}
 	}
 }
@@ -139,7 +157,7 @@ func InspectPOM(r io.Reader, p Path) (POMInfo, error) {
 	if err != nil {
 		return POMInfo{}, err
 	}
-	if err := checkPOMNamespaces(b); err != nil {
+	if err := checkElementNames(b, what, pomNamespace); err != nil {
 		return POMInfo{}, err
 	}
 	if doc.XMLName.Local != "project" {
@@ -302,7 +320,11 @@ type metadataDoc struct {
 func InspectMetadataUpload(r io.Reader, p Path) (MetadataLevel, error) {
 	const what = "maven-metadata.xml"
 	var doc metadataDoc
-	if _, err := decodeUploadXML(r, what, &doc); err != nil {
+	b, err := decodeUploadXML(r, what, &doc)
+	if err != nil {
+		return 0, err
+	}
+	if err := checkElementNames(b, what, metadataNamespace); err != nil {
 		return 0, err
 	}
 	if doc.XMLName.Local != "metadata" {

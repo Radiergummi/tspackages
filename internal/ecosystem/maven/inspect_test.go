@@ -35,6 +35,14 @@ func pom(inner string) string {
 <project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>` + inner + `</project>`
 }
 
+// pomPrefixedPOM binds a prefix to the POM namespace; Maven reads
+// <m:groupId> as an unknown element and uses the parent's groupId.
+const pomPrefixedPOM = `<project xmlns:m="http://maven.apache.org/POM/4.0.0"><parent><groupId>org.other</groupId><artifactId>x</artifactId><version>1.0</version></parent><m:groupId>com.matchory</m:groupId><artifactId>lib</artifactId></project>`
+
+// emptyPrefixPOM binds a prefix to no namespace, which encoding/xml resolves
+// to an unqualified name.
+const emptyPrefixPOM = `<project xmlns:x=""><parent><groupId>org.other</groupId><artifactId>x</artifactId><version>1.0</version></parent><x:groupId>com.matchory</x:groupId><artifactId>lib</artifactId></project>`
+
 // smuggledPOM names com.matchory only in a foreign-namespace element, which
 // Maven does not read as the groupId; Maven uses the parent's org.other.
 const smuggledPOM = `<project xmlns="http://maven.apache.org/POM/4.0.0"><parent><groupId>org.other</groupId><artifactId>x</artifactId><version>1.0</version></parent><x:groupId xmlns:x="urn:x">com.matchory</x:groupId><artifactId>lib</artifactId></project>`
@@ -73,22 +81,27 @@ func TestInspectPOM(t *testing.T) {
 		status int
 		detail string
 	}{
-		"artifactId mismatch": {pom(`<groupId>com.matchory</groupId><artifactId>other</artifactId><version>1.0</version>`), release, 400, "artifactId"},
-		"groupId mismatch":    {pom(`<groupId>com.other</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "groupId"},
-		"version mismatch":    {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.1</version>`), release, 400, "version"},
-		"no version":          {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId>`), release, 400, "version"},
-		"mixed case":          {pom(`<groupId>com.Matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "groupId"},
-		"revision":            {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>${revision}</version>`), release, 400, "unresolved property in version; deploy a flattened POM"},
-		"parent revision":     {pom(`<parent><groupId>com.matchory</groupId><artifactId>p</artifactId><version>${revision}</version></parent><artifactId>lib</artifactId>`), release, 400, "unresolved property in parent/version; deploy a flattened POM"},
-		"property groupId":    {pom(`<groupId>${g}</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "unresolved property in groupId"},
-		"timestamped version": {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0-20261123.101010-3</version>`), snapshot, 400, "version"},
-		"doctype":             {`<!DOCTYPE project SYSTEM "file:///etc/passwd">` + pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "DOCTYPE"},
-		"not a project":       {`<metadata><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version></metadata>`, release, 400, "project"},
-		"too large":           {pom(strings.Repeat(" ", 1<<20)), release, 413, "1 MiB"},
-		"prefixed groupId":    {smuggledPOM, release, 400, `element <groupId> is in namespace "urn:x"; POMs use only http://maven.apache.org/POM/4.0.0`},
-		"prefixed root":       {`<x:project xmlns:x="urn:x"><x:groupId>com.matchory</x:groupId><x:artifactId>lib</x:artifactId><x:version>1.0</x:version></x:project>`, release, 400, `element <project> is in namespace "urn:x"`},
-		"nested foreign":      {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><build><plugins><y:plugin xmlns:y="urn:y"/></plugins></build>`), release, 400, `element <plugin> is in namespace "urn:y"`},
-		"undeclared prefix":   {pom(`<z:groupId>com.matchory</z:groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "element <groupId> is in namespace"},
+		"artifactId mismatch":    {pom(`<groupId>com.matchory</groupId><artifactId>other</artifactId><version>1.0</version>`), release, 400, "artifactId"},
+		"groupId mismatch":       {pom(`<groupId>com.other</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "groupId"},
+		"version mismatch":       {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.1</version>`), release, 400, "version"},
+		"no version":             {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId>`), release, 400, "version"},
+		"mixed case":             {pom(`<groupId>com.Matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "groupId"},
+		"revision":               {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>${revision}</version>`), release, 400, "unresolved property in version; deploy a flattened POM"},
+		"parent revision":        {pom(`<parent><groupId>com.matchory</groupId><artifactId>p</artifactId><version>${revision}</version></parent><artifactId>lib</artifactId>`), release, 400, "unresolved property in parent/version; deploy a flattened POM"},
+		"property groupId":       {pom(`<groupId>${g}</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "unresolved property in groupId"},
+		"timestamped version":    {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0-20261123.101010-3</version>`), snapshot, 400, "version"},
+		"doctype":                {`<!DOCTYPE project SYSTEM "file:///etc/passwd">` + pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "DOCTYPE"},
+		"not a project":          {`<metadata><groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version></metadata>`, release, 400, "project"},
+		"too large":              {pom(strings.Repeat(" ", 1<<20)), release, 413, "1 MiB"},
+		"prefixed groupId":       {smuggledPOM, release, 400, "element <x:groupId> has a namespace prefix"},
+		"POM-namespace prefix":   {pomPrefixedPOM, release, 400, "element <m:groupId> has a namespace prefix"},
+		"empty-bound prefix":     {emptyPrefixPOM, release, 400, "element <x:groupId> has a namespace prefix"},
+		"prefixed root":          {`<x:project xmlns:x="urn:x"><x:groupId>com.matchory</x:groupId><x:artifactId>lib</x:artifactId><x:version>1.0</x:version></x:project>`, release, 400, "element <x:project> has a namespace prefix"},
+		"POM-prefixed root":      {`<m:project xmlns:m="http://maven.apache.org/POM/4.0.0"><m:groupId>com.matchory</m:groupId><m:artifactId>lib</m:artifactId><m:version>1.0</m:version></m:project>`, release, 400, "element <m:project> has a namespace prefix"},
+		"nested prefixed":        {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><build><plugins><y:plugin xmlns:y="urn:y"/></plugins></build>`), release, 400, "element <y:plugin> has a namespace prefix"},
+		"undeclared prefix":      {pom(`<z:groupId>com.matchory</z:groupId><artifactId>lib</artifactId><version>1.0</version>`), release, 400, "element <z:groupId> has a namespace prefix"},
+		"default foreign":        {pom(`<parent><groupId>org.other</groupId><artifactId>x</artifactId><version>1.0</version></parent><groupId xmlns="urn:x">com.matchory</groupId><artifactId>lib</artifactId>`), release, 400, `element <groupId> is in namespace "urn:x"; POM uses only http://maven.apache.org/POM/4.0.0`},
+		"nested default foreign": {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version><build><plugins><plugin xmlns="urn:y"/></plugins></build>`), release, 400, `element <plugin> is in namespace "urn:y"`},
 	} {
 		_, err := InspectPOM(strings.NewReader(tc.doc), tc.p)
 		wantRequestError(t, name, err, tc.status, tc.detail)
@@ -162,6 +175,7 @@ func TestInspectMetadataUpload(t *testing.T) {
 	}{
 		"artifact":         {readTestdata(t, "artifact-metadata.xml"), artifact, LevelArtifact},
 		"version":          {versionDoc, version, LevelArtifact},
+		"1.1.0 namespace":  {`<metadata xmlns="http://maven.apache.org/METADATA/1.1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/METADATA/1.1.0 https://maven.apache.org/xsd/repository-metadata-1.1.0.xsd"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, LevelArtifact},
 		"plugin group":     {plugin, group, LevelGroup},
 		"plugin group id":  {strings.Replace(plugin, "<plugins>", "<groupId>com.matchory</groupId><plugins>", 1), group, LevelGroup},
 		"plugin group sub": {plugin, mustPath(t, "com/matchory/plugins/maven-metadata.xml"), LevelGroup},
@@ -185,6 +199,9 @@ func TestInspectMetadataUpload(t *testing.T) {
 		"project root":          {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), artifact, 400, "metadata"},
 		"neither":               {`<metadata><groupId>com.matchory</groupId></metadata>`, artifact, 400, "artifactId"},
 		"doctype":               {`<!DOCTYPE metadata []>` + plugin, group, 400, "DOCTYPE"},
+		"prefixed groupId":      {`<metadata xmlns:m="urn:m"><groupId>com.other</groupId><m:groupId>com.matchory</m:groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, "element <m:groupId> has a namespace prefix"},
+		"prefixed plugins":      {strings.Replace(strings.Replace(plugin, "<plugins>", `<m:plugins xmlns:m="">`, 1), "</plugins>", "</m:plugins>", 1), group, 400, "element <m:plugins> has a namespace prefix"},
+		"foreign namespace":     {`<metadata xmlns="urn:x"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, `element <metadata> is in namespace "urn:x"`},
 		"too large":             {plugin + strings.Repeat(" ", 1<<20), group, 413, "1 MiB"},
 	} {
 		_, err := InspectMetadataUpload(strings.NewReader(tc.doc), tc.p)
