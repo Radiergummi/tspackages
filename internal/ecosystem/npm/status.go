@@ -17,7 +17,7 @@ func StatusSection(changed func() []ChangedTarball) web.Section {
 		Match:     Match,
 		Snippets: []web.Snippet{
 			{
-				Intro: template.HTML("npm and Yarn (<code>.npmrc</code>). The token is never checked, but npm wants one for publishing. Don't add <code>@scope:registry=</code> lines that point elsewhere:"),
+				Intro: template.HTML("npm (<code>.npmrc</code>). The token is never checked, but npm wants one for publishing. Don't add <code>@scope:registry=</code> lines that point elsewhere:"),
 				Code:  npmrc,
 			},
 			{
