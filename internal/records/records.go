@@ -79,7 +79,9 @@ type Audit struct {
 	// Attempt groups the "dist-tag" records of one try at a dist-tags write.
 	// They are written before the write; a "dist-tag-commit" record with
 	// the same Attempt says the write stuck. Records of an attempt without
-	// one describe moves that never took effect.
+	// one most likely lost a concurrent write, but may have taken effect
+	// (a crash or a failed commit record after the write): the dist-tags
+	// document is the truth.
 	Attempt string `json:"attempt,omitempty"`
 }
 
