@@ -318,6 +318,9 @@ func (h *NPM) tarball(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		return
 	}
 	e.source = src.Name()
+	// A tarball URL names immutable, integrity-checked bytes; errors above
+	// keep no-store.
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	h.serveArtifact(w, r, e, art, "application/octet-stream")
 }
 
