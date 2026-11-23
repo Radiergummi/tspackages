@@ -95,3 +95,14 @@ ecosystems:
         type: registry
         url: https://registry.npmjs.org/
         fetch_hosts: [registry.npmjs.org]
+
+  maven:
+    sources:
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["com.example.*"]
+      - name: central
+        type: registry
+        url: https://repo.maven.apache.org/maven2/
+        fetch_hosts: [repo.maven.apache.org]
