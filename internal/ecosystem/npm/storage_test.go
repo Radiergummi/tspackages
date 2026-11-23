@@ -256,7 +256,8 @@ func TestPublishAndRead(t *testing.T) {
 			t.Errorf("provenance: %+v %v", prov, err)
 		}
 		a := e.audits(t)
-		if len(a) != 1 || a[0].Action != "publish" || a[0].Package != "@s/a" || a[0].Version != "1.0.0" || a[0].Uploader.Login != publisher.Login {
+		if len(a) != 2 || a[0].Action != "publish" || a[0].Package != "@s/a" || a[0].Version != "1.0.0" || a[0].Uploader.Login != publisher.Login ||
+			a[1].Action != "dist-tag" || a[1].Tag != "latest" || a[1].Version != "1.0.0" {
 			t.Errorf("audit: %+v", a)
 		}
 	})
@@ -489,7 +490,7 @@ func TestDistTagMoves(t *testing.T) {
 	}
 	var moves []records.Audit
 	for _, a := range e.audits(t) {
-		if a.Action == "dist-tag" {
+		if a.Action == "dist-tag" && a.Tag == "beta" {
 			moves = append(moves, a)
 		}
 	}
@@ -593,5 +594,109 @@ func TestIndexRebuild(t *testing.T) {
 		t.Fatal(err)
 	} else if b, _ := io.ReadAll(rc); rc.Close() == nil && string(b) != "{garbage" {
 		t.Errorf("dist-tags.json was rewritten by a read: %s", b)
+	}
+}
+
+func TestConcurrentPublishSamePrecedence(t *testing.T) {
+	drivers(t, func(t *testing.T, d func(t *testing.T) storage.Driver) {
+		ba, bb := npmBody(t, withVersion("1.0.0+a")), npmBody(t, withVersion("1.0.0+b"))
+		b2 := npmBody(t, withVersion("2.0.0"))
+		ctx := context.Background()
+		for i := range 50 {
+			e := newStoreEnv(t, d(t))
+			var wg sync.WaitGroup
+			var errA, errB error
+			wg.Go(func() { _, errA = e.publish(t, "pkg", ba) })
+			wg.Go(func() { _, errB = e.publish(t, "pkg", bb) })
+			wg.Wait()
+			if (errA == nil) == (errB == nil) || !errors.Is(errA, ErrVersionExists) && !errors.Is(errB, ErrVersionExists) {
+				t.Fatalf("run %d: %v, %v; want one success and one ErrVersionExists", i, errA, errB)
+			}
+			winner := "1.0.0+a"
+			if errA != nil {
+				winner = "1.0.0+b"
+			}
+			if err := e.d.Delete(ctx, pkgKey("pkg", "index.json")); err != nil {
+				t.Fatal(err)
+			}
+			e.mustPublish(t, "pkg", b2)
+			p := e.packument(t, "pkg", false)
+			if len(p.Versions) != 2 || p.Versions[winner] == nil || p.Versions["2.0.0"] == nil {
+				t.Fatalf("run %d: winner %s, versions %d", i, winner, len(p.Versions))
+			}
+			var published []string
+			for _, a := range e.audits(t) {
+				if a.Action == "publish" {
+					published = append(published, a.Version)
+				}
+			}
+			if len(published) != 2 {
+				t.Fatalf("run %d: publish audits %v, want the winner and 2.0.0", i, published)
+			}
+		}
+	})
+}
+
+func TestRepublishKeepsMovedTag(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	body := npmBody(t, withVersion("1.0.0"), withTag("beta", "1.0.0"))
+	e.mustPublish(t, "pkg", body)
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.1.0")))
+	if err := e.src.SetTag(context.Background(), publisher, mustName(t, "pkg"), "beta", "1.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	e.mustPublish(t, "pkg", body)
+	if tags := e.tags(t, "pkg"); tags["beta"] != "1.1.0" || tags["latest"] != "1.1.0" {
+		t.Errorf("after republishing 1.0.0: %v", tags)
+	}
+}
+
+func TestPublishTagAudits(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0"), withTag("beta", "1.0.0")))
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.1.0")))
+	got := map[string]records.Audit{}
+	var n int
+	for _, a := range e.audits(t) {
+		if a.Action == "dist-tag" {
+			n++
+			got[a.Tag+"@"+a.Version] = a
+		}
+	}
+	want := map[string]string{"latest@1.0.0": "", "beta@1.0.0": "", "latest@1.1.0": "1.0.0"}
+	if n != len(want) {
+		t.Errorf("%d dist-tag audits, want %d: %v", n, len(want), got)
+	}
+	for k, prev := range want {
+		if a, ok := got[k]; !ok || a.Previous != prev || a.Uploader.Login != publisher.Login {
+			t.Errorf("audit %s: %+v, want Previous %q", k, a, prev)
+		}
+	}
+}
+
+// failAudits fails every audit record write.
+type failAudits struct{ storage.Driver }
+
+func (f failAudits) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if strings.HasPrefix(key, "audit/") {
+		return storage.Info{}, errors.New("injected audit failure")
+	}
+	return f.Driver.PutIfAbsent(ctx, key, r)
+}
+
+func TestSetTagAuditFailure(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	n := mustName(t, "pkg")
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0")))
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.1.0")))
+	e.src.rec = records.New(failAudits{e.recD})
+	if err := e.src.SetTag(context.Background(), publisher, n, "beta", "1.0.0"); err == nil {
+		t.Fatal("SetTag succeeded without its audit record")
+	}
+	if err := e.src.RemoveTag(context.Background(), publisher, n, "beta"); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("RemoveTag after the failed SetTag: %v", err)
+	}
+	if tags := e.tags(t, "pkg"); len(tags) != 1 || tags["latest"] != "1.1.0" {
+		t.Errorf("dist-tags %v", tags)
 	}
 }
