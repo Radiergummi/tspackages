@@ -42,6 +42,7 @@ type Provenance struct {
 	Ecosystem      string    `json:"ecosystem"`
 	Package        string    `json:"package"`
 	Version        string    `json:"version"`
+	File           string    `json:"file,omitempty"` // the file within the version, where a version has several
 	Source         string    `json:"source"`
 	SourceType     string    `json:"source_type"`
 	UpstreamURL    string    `json:"upstream_url,omitempty"`
@@ -64,6 +65,7 @@ type Audit struct {
 	Ecosystem string    `json:"ecosystem"`
 	Package   string    `json:"package"`
 	Version   string    `json:"version"`
+	File      string    `json:"file,omitempty"` // the file within the version, where a version has several
 	SHA256    string    `json:"sha256"`
 	Uploader  Uploader  `json:"uploader"`
 	// Attestation is the identity of a verified attestation (e.g. a Sigstore

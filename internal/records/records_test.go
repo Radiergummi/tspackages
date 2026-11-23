@@ -192,3 +192,49 @@ func TestAuditDistTag(t *testing.T) {
 		t.Fatalf("records = %d", seen)
 	}
 }
+
+func TestFileField(t *testing.T) {
+	s, d := newStore(t)
+	ctx := context.Background()
+	p := Provenance{Ecosystem: "maven", Package: "com.acme:lib", Version: "1.0", File: "lib-1.0.jar", Source: "central", SHA256: sum}
+	if err := s.PutProvenance(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetProvenance(ctx, "maven", "com.acme:lib", "1.0", sum)
+	if err != nil || got.File != "lib-1.0.jar" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	// A record written without a file (every earlier ecosystem) has no key.
+	other := strings.Repeat("d", 64)
+	if err := s.PutProvenance(ctx, Provenance{Ecosystem: "npm", Package: "a", Version: "1.0.0", SHA256: other}); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := d.Get(ctx, provPrefix("npm", "a", "1.0.0")+other+".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(rc)
+	rc.Close()
+	if strings.Contains(string(raw), `"file"`) {
+		t.Fatalf("record without file has the key: %s", raw)
+	}
+	at := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+	if err := s.PutAudit(ctx, Audit{Action: "publish", Ecosystem: "maven", Package: "com.acme:lib", Version: "1.0", File: "lib-1.0.pom", SHA256: sum, Time: at}); err != nil {
+		t.Fatal(err)
+	}
+	for info, err := range d.List(ctx, "audit/2026/01/03/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, _, err := d.Get(ctx, info.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a Audit
+		err = json.NewDecoder(rc).Decode(&a)
+		rc.Close()
+		if err != nil || a.File != "lib-1.0.pom" {
+			t.Fatalf("audit = %+v, %v", a, err)
+		}
+	}
+}
