@@ -314,3 +314,34 @@ func TestRenderDistTags(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+func TestTokenLookalikesStayEscaped(t *testing.T) {
+	fake := "\x01base\x01x" // decoded from upstream JSON "\u0001base\u0001x"
+	var fb, cb bytes.Buffer
+	w := NewDocWriter(&fb, &cb)
+	obj := map[string]json.RawMessage{
+		"name": json.RawMessage(`"p"`), "version": json.RawMessage(`"1.0.0"`),
+		fake: json.RawMessage(`"v"`),
+	}
+	f, c, err := RenderVersion(obj, Dist{Tarball: BaseToken + "p/-/p-1.0.0.tgz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Version(fake, f, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(map[string]string{fake: "1.0.0"}, map[string]string{fake: fake, "modified": fake}); err != nil {
+		t.Fatal(err)
+	}
+	tf, tc := w.Tokens()
+	if tf != 1 || tc != 1 {
+		t.Errorf("tokens = %d, %d, want 1, 1", tf, tc)
+	}
+	for _, b := range [][]byte{fb.Bytes(), cb.Bytes()} {
+		out := string(expandAll(t, b))
+		if n := strings.Count(out, testBase); n != 1 {
+			t.Errorf("%d substitutions, want 1:\n%s", n, out)
+		}
+		decode(t, []byte(out))
+	}
+}
