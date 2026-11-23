@@ -84,7 +84,7 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
 - `internal/ecosystem/maven` — coordinates, layout paths and claims, the
   `ComparableVersion` port, the safe XML reader, checksums, deploy
   inspection (POM, `.module`, metadata), the `storage` source (write-once
-  releases, overwritable SNAPSHOT files, generated metadata) and the `registry`
+  release and timestamped SNAPSHOT files, generated metadata) and the `registry`
   source (files verified by the upstream's `.sha1`, metadata passed
   through), the HTTP handler. Must not import `composer`, `pypi`,
   `goproxy` or `npm` (nor the reverse).
@@ -170,9 +170,10 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   claim. Every key segment from a coordinate or file name goes through
   `storage.EscapeSegment`, so coordinate parts are at most 156 bytes, and
   storage accepts file names of at most 153 bytes and `groupId:artifactId`
-  of at most 156. Release files are write-once (same bytes `201`, other
-  bytes `409`), and a version is listed once its POM is stored; SNAPSHOT
-  files may be overwritten. Uploaded checksums and `maven-metadata.xml`
+  of at most 156. Release and timestamped SNAPSHOT files are write-once
+  (same bytes `201`, other bytes `409`: they are served immutable), and a
+  version is listed once its POM is stored; other SNAPSHOT files may be
+  overwritten. Provenance is kept per file. Uploaded checksums and `maven-metadata.xml`
   are checked and discarded: tspackages serves its own, generated from
   the bytes it serves. Registry files are verified against the upstream's
   `.sha1` before caching; without one, a missing file is `404`, a

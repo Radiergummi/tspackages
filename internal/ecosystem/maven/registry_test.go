@@ -194,10 +194,11 @@ func TestFileVerifiedAndCached(t *testing.T) {
 	}
 
 	want := allDigests(jarData)
-	prov, err := e.rec.GetProvenance(ctx, "maven", "com.matchory:lib", "1.0", want.SHA256)
-	if err != nil {
-		t.Fatal(err)
+	provs, err := e.rec.FileProvenance(ctx, "maven", "com.matchory:lib", "1.0", "lib-1.0.jar")
+	if err != nil || len(provs) != 1 {
+		t.Fatalf("provenance = %+v, %v", provs, err)
 	}
+	prov := provs[0]
 	if prov.File != "lib-1.0.jar" || prov.Source != "central" || prov.SourceType != "registry" ||
 		prov.DeclaredDigest != "sha1:"+want.SHA1 || prov.SHA1 != want.SHA1 || prov.UpstreamURL != e.up.srv.URL+upJar {
 		t.Fatalf("provenance = %+v", prov)
@@ -489,6 +490,37 @@ func TestChangedFileBackToFirst(t *testing.T) {
 				t.Fatalf("fetch 2: changed = %+v", got)
 			}
 		}
+	}
+}
+
+// TestChangedIdenticalFiles: two files of one version with the same bytes
+// each keep a first record, so a later change of either is listed.
+func TestChangedIdenticalFiles(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	sources, javadoc := "/com/matchory/lib/1.0/lib-1.0-sources.jar", "/com/matchory/lib/1.0/lib-1.0-javadoc.jar"
+	for _, f := range []string{sources, javadoc} {
+		e.up.set(f, jarData)
+		e.up.set(f+".sha1", sha1Hex(jarData))
+		if _, err := readFile(e.src.File(ctx, mustPath(t, f))); err != nil {
+			t.Fatal(err)
+		}
+		e.relay.Wait()
+	}
+	changed := jarData + " changed"
+	e.up.set(javadoc, changed)
+	e.up.set(javadoc+".sha1", sha1Hex(changed))
+	for _, k := range append(e.keys(t, "maven/central/paths/"), e.keys(t, "maven/central/files/")...) {
+		if err := e.cache.Delete(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := readFile(e.src.File(ctx, mustPath(t, javadoc))); err != nil {
+		t.Fatal(err)
+	}
+	e.relay.Wait()
+	if got := e.src.Changed(); len(got) != 1 || got[0].File != "lib-1.0-javadoc.jar" || got[0].FirstSHA256 != allDigests(jarData).SHA256 {
+		t.Fatalf("changed = %+v", got)
 	}
 }
 

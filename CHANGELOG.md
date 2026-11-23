@@ -30,7 +30,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A Maven repository at `/maven/` for Maven 3 and Gradle 9: artifacts,
   POMs, `.module` files, signatures, checksums and `maven-metadata.xml`,
   `mvn deploy` and Gradle's `maven-publish`, releases and SNAPSHOT versions.
-  Sources: `storage`, which writes release files once, generates
+  Sources: `storage`, which writes release and timestamped SNAPSHOT files
+  once, generates
   `maven-metadata.xml` and the `.sha1`, `.md5`, `.sha256` and `.sha512`
   files, and checks uploaded checksums and POM coordinates; and `registry`
   for Maven Central pass-through, whose files are checked against the

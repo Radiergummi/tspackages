@@ -121,7 +121,7 @@ func (s *RegistrySource) digestsKey(sha1Hex string) string {
 }
 
 // mapping is a file path's cached lookup: the SHA-1 its upstream declares
-// (its bytes are at filesKey(SHA1)), or Miss when neither it nor its .sha1
+// (its bytes are at filesKey(p, SHA1)), or Miss when neither it nor its .sha1
 // exist.
 type mapping struct {
 	SHA1 string `json:"sha1,omitempty"`
@@ -223,7 +223,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: res.SHA512, MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
 		})
 	}
-	body, size, hit, err := s.relay.Open(ctx, s.filesKey(m.SHA1), relay.Digest{SHA1: m.SHA1}, fetch, onCommit)
+	body, size, hit, err := s.relay.Open(ctx, s.filesKey(p, m.SHA1), relay.Digest{SHA1: m.SHA1}, fetch, onCommit)
 	if err != nil {
 		return File{}, err
 	}
@@ -309,8 +309,11 @@ func (s *RegistrySource) readMapping(ctx context.Context, key string) (mapping, 
 	return m, written, true
 }
 
-func (s *RegistrySource) filesKey(sha1Hex string) string {
-	return "maven/" + s.name + "/files/sha1-" + sha1Hex
+// filesKey is the relay key of p's bytes with sha1Hex. It is per file, not
+// per digest: each file's first fetch commits, and so records provenance,
+// even when another file has the same bytes.
+func (s *RegistrySource) filesKey(p Path, sha1Hex string) string {
+	return s.pathKey("files", p) + "-sha1-" + sha1Hex
 }
 
 func (s *RegistrySource) writeMapping(ctx context.Context, p Path, m mapping) error {
@@ -468,18 +471,14 @@ func (s *RegistrySource) get(ctx context.Context, rawURL string, maxBytes int64)
 // recorded for the same file; a difference is served, logged and listed by
 // Changed.
 func (s *RegistrySource) checkChanged(ctx context.Context, pkg, version, file, sha256Hex string) error {
-	digests, err := s.rec.ProvenanceDigests(ctx, ecoName, pkg, version)
+	recs, err := s.rec.FileProvenance(ctx, ecoName, pkg, version, file)
 	if err != nil {
 		return fmt.Errorf("read provenance: %w", err)
 	}
 	var first *records.Provenance
-	for _, d := range digests {
-		p, err := s.rec.GetProvenance(ctx, ecoName, pkg, version, d)
-		if err != nil {
-			return fmt.Errorf("read provenance: %w", err)
-		}
-		if p.Source == s.name && p.File == file && (first == nil || p.Created.Before(first.Created)) {
-			first = &p
+	for i, p := range recs {
+		if p.Source == s.name && (first == nil || p.Created.Before(first.Created)) {
+			first = &recs[i]
 		}
 	}
 	if first == nil || first.SHA256 == sha256Hex {

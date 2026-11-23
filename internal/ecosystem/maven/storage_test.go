@@ -249,9 +249,9 @@ func TestReleaseDeployAndRead(t *testing.T) {
 		if !slices.Equal(files, []string{"lib-1.0.jar", "lib-1.0.pom"}) {
 			t.Errorf("audited files = %v", files)
 		}
-		prov, err := records.New(e.recD).GetProvenance(context.Background(), ecoName, "com.matchory:lib", "1.0", jd.SHA256)
-		if err != nil || prov.File != "lib-1.0.jar" || prov.SourceType != "storage" || prov.SHA1 != jd.SHA1 || prov.Uploader == nil {
-			t.Errorf("provenance = %+v, %v", prov, err)
+		provs, err := records.New(e.recD).FileProvenance(context.Background(), ecoName, "com.matchory:lib", "1.0", "lib-1.0.jar")
+		if err != nil || len(provs) != 1 || provs[0].File != "lib-1.0.jar" || provs[0].SourceType != "storage" || provs[0].SHA1 != jd.SHA1 || provs[0].SHA256 != jd.SHA256 || provs[0].Uploader == nil {
+			t.Errorf("provenance = %+v, %v", provs, err)
 		}
 		// Group-level metadata is never served from storage.
 		if _, err := e.src.Metadata(context.Background(), mustPath(t, "com/matchory/maven-metadata.xml")); !errors.Is(err, resolve.ErrNotFound) {
@@ -395,13 +395,26 @@ func TestSnapshotDeploy(t *testing.T) {
 			t.Errorf("artifact metadata = %+v", am)
 		}
 
-		// Timestamped files are immutable to clients but may be overwritten.
+		// Timestamped files are immutable to clients, so they are written
+		// once: the same bytes again succeed, other bytes are 409.
 		if _, f := e.file(t, snapDir+b2+".jar"); !f.Immutable {
 			t.Error("timestamped file not immutable")
 		}
-		e.mustDeploy(t, snapDir+b2+".jar", "jar 2 again")
-		if got, f := e.file(t, snapDir+b2+".jar"); got != "jar 2 again" || f.Digests != allDigests(got) {
-			t.Errorf("overwritten jar = %q %+v", got, f.Digests)
+		e.mustDeploy(t, snapDir+b2+".jar", "jar 2")
+		if err := e.deploy(t, snapDir+b2+".jar", "jar 2 again"); !errors.Is(err, ErrExists) {
+			t.Errorf("timestamped overwrite: err = %v, want ErrExists", err)
+		}
+		if got, _ := e.file(t, snapDir+b2+".jar"); got != "jar 2" {
+			t.Errorf("timestamped jar after refused overwrite = %q", got)
+		}
+
+		// Non-timestamped SNAPSHOT names are overwritable and not immutable;
+		// an overwrite is audited with the replaced sha256.
+		plain := "lib-1.0-SNAPSHOT.jar"
+		e.mustDeploy(t, snapDir+plain, "plain 1")
+		e.mustDeploy(t, snapDir+plain, "plain 2")
+		if got, f := e.file(t, snapDir+plain); got != "plain 2" || f.Immutable || f.Digests != allDigests(got) {
+			t.Errorf("plain SNAPSHOT jar = %q, immutable %v, digests %+v", got, f.Immutable, f.Digests)
 		}
 		var previous []string
 		for _, a := range e.audits(t) {
@@ -409,26 +422,19 @@ func TestSnapshotDeploy(t *testing.T) {
 				previous = append(previous, a.File+" "+a.Previous+" "+a.SHA256)
 			}
 		}
-		if want := b2 + ".jar " + allDigests("jar 2").SHA256 + " " + allDigests("jar 2 again").SHA256; !slices.Equal(previous, []string{want}) {
+		if want := plain + " " + allDigests("plain 1").SHA256 + " " + allDigests("plain 2").SHA256; !slices.Equal(previous, []string{want}) {
 			t.Errorf("audits with Previous = %v, want %v", previous, want)
-		}
-
-		// Non-timestamped SNAPSHOT names are overwritable and not immutable.
-		e.mustDeploy(t, snapDir+"lib-1.0-SNAPSHOT.jar", "plain 1")
-		e.mustDeploy(t, snapDir+"lib-1.0-SNAPSHOT.jar", "plain 2")
-		if got, f := e.file(t, snapDir+"lib-1.0-SNAPSHOT.jar"); got != "plain 2" || f.Immutable {
-			t.Errorf("plain SNAPSHOT jar = %q, immutable %v", got, f.Immutable)
 		}
 	})
 }
 
-// TestConcurrentSnapshotOverwrite deploys other bytes to one timestamped
-// file from two goroutines: every deploy succeeds and the served digests
-// match the served bytes.
+// TestConcurrentSnapshotOverwrite deploys other bytes to one
+// non-timestamped SNAPSHOT file from two goroutines: every deploy succeeds
+// and the served digests match the served bytes.
 func TestConcurrentSnapshotOverwrite(t *testing.T) {
 	drivers(t, func(t *testing.T, d func(t *testing.T) storage.Driver) {
 		e := newStEnv(t, d(t))
-		path := snapDir + "lib-1.0-20261123.101010-1.jar"
+		path := snapDir + "lib-1.0-SNAPSHOT.jar"
 		for run := range 10 {
 			var wg sync.WaitGroup
 			var errs [2]error

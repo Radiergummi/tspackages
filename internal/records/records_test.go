@@ -200,8 +200,8 @@ func TestFileField(t *testing.T) {
 	if err := s.PutProvenance(ctx, p); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetProvenance(ctx, "maven", "com.acme:lib", "1.0", sum)
-	if err != nil || got.File != "lib-1.0.jar" {
+	got, err := s.FileProvenance(ctx, "maven", "com.acme:lib", "1.0", "lib-1.0.jar")
+	if err != nil || len(got) != 1 || got[0].File != "lib-1.0.jar" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 	// A record written without a file (every earlier ecosystem) has no key.
@@ -236,5 +236,50 @@ func TestFileField(t *testing.T) {
 		if err != nil || a.File != "lib-1.0.pom" {
 			t.Fatalf("audit = %+v, %v", a, err)
 		}
+	}
+}
+
+// TestFileProvenanceKeyedByFile: files of one version with the same bytes
+// each keep their record, and FileProvenance lists one file's records only.
+func TestFileProvenanceKeyedByFile(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	other := strings.Repeat("d", 64)
+	for _, p := range []Provenance{
+		{File: "lib-1.0-sources.jar", SHA256: sum},
+		{File: "lib-1.0-javadoc.jar", SHA256: sum},
+		{File: "lib-1.0-javadoc.jar", SHA256: other},
+		{File: strings.Repeat("Ä", 200), SHA256: sum}, // longer than a key segment once escaped
+	} {
+		p.Ecosystem, p.Package, p.Version, p.Source = "maven", "com.acme:lib", "1.0", "central"
+		if err := s.PutProvenance(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for file, want := range map[string][]string{
+		"lib-1.0-sources.jar":    {sum},
+		"lib-1.0-javadoc.jar":    {sum, other},
+		strings.Repeat("Ä", 200): {sum},
+		"lib-1.0.jar":            nil,
+	} {
+		got, err := s.FileProvenance(ctx, "maven", "com.acme:lib", "1.0", file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sums []string
+		for _, p := range got {
+			if p.File != file {
+				t.Errorf("%s: record for %s", file, p.File)
+			}
+			sums = append(sums, p.SHA256)
+		}
+		slices.Sort(sums)
+		if !slices.Equal(sums, want) {
+			t.Errorf("%s: sha256s = %v, want %v", file[:min(len(file), 20)], sums, want)
+		}
+	}
+	// File records are not version-level records.
+	if d, err := s.ProvenanceDigests(ctx, "maven", "com.acme:lib", "1.0"); err != nil || len(d) != 0 {
+		t.Errorf("ProvenanceDigests = %v, %v", d, err)
 	}
 }

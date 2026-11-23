@@ -303,7 +303,8 @@ case. Other public repositories (Google's, a company Nexus) are claimed
 
 A release file is written once: the same bytes again succeed, other bytes
 are `409`. A release version is listed in `maven-metadata.xml` once its POM
-is stored. SNAPSHOT files may be overwritten, and are kept without limit.
+is stored. Timestamped SNAPSHOT files are written once too; other SNAPSHOT
+files may be overwritten. SNAPSHOT files are kept without limit.
 tspackages generates `.sha1`, `.md5`, `.sha256` and `.sha512` for every
 file and checks the ones clients upload. Deleting answers `405`. See
 [docs/operations.md](docs/operations.md#maven) for deploys, SNAPSHOT

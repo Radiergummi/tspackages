@@ -697,9 +697,10 @@ and run `gradle publish`. Signatures from Gradle's `signing` plugin or
 
 Each SNAPSHOT deploy adds timestamped files (`lib-1.0-20261123.101010-3.jar`)
 and the version's `maven-metadata.xml` points at the newest. They are kept
-without limit; there is no retention. Two deploys of one SNAPSHOT version
-at the same moment may pick the same build number, and the later one
-overwrites the files of the earlier one.
+without limit; there is no retention. Timestamped files are written once:
+two deploys of one SNAPSHOT version at the same moment may pick the same
+build number, and the later one then fails with `409` (run it again for
+a new build number).
 
 Consumers need the profile from [Client setup](#client-setup-2). Maven
 looks for a newer SNAPSHOT once a day (`mvn -U` forces it), Gradle every
