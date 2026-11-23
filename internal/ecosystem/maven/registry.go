@@ -430,54 +430,22 @@ func (s *RegistrySource) fetchMetadata(ctx context.Context, p Path) ([]byte, err
 	return b, nil
 }
 
-// get opens rawURL as upstream.Client.Open does (a non-2xx answer is a
-// *upstream.StatusError, more than maxBytes is upstream.ErrTooLarge) and
-// also returns its Last-Modified time (zero when absent or unparseable).
+// get waits for the upstream limit, then opens rawURL with
+// upstream.Client.OpenWithHeader and returns its Last-Modified time (zero
+// when absent or unparseable).
 func (s *RegistrySource) get(ctx context.Context, rawURL string, maxBytes int64) (io.ReadCloser, int64, time.Time, error) {
 	if err := s.wait(ctx); err != nil {
 		return nil, 0, time.Time{}, err
 	}
 	start := time.Now()
-	resp, err := s.c.Get(ctx, rawURL)
+	body, size, hdr, err := s.c.OpenWithHeader(ctx, rawURL, maxBytes)
 	metrics.ObserveUpstream(s.name, time.Since(start))
 	if err != nil {
 		return nil, 0, time.Time{}, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		resp.Body.Close()
-		return nil, 0, time.Time{}, &upstream.StatusError{Code: resp.StatusCode, URL: resp.Request.URL.Redacted()}
-	}
-	if resp.ContentLength > maxBytes {
-		resp.Body.Close()
-		return nil, 0, time.Time{}, upstream.ErrTooLarge
-	}
-	mod, _ := http.ParseTime(resp.Header.Get("Last-Modified")) // zero when absent or unparseable
-	return &cappedBody{rc: resp.Body, left: maxBytes}, resp.ContentLength, mod, nil
+	mod, _ := http.ParseTime(hdr.Get("Last-Modified")) // zero when absent or unparseable
+	return body, size, mod, nil
 }
-
-// cappedBody fails with upstream.ErrTooLarge once more than its limit has
-// been read.
-type cappedBody struct {
-	rc   io.ReadCloser
-	left int64
-}
-
-func (b *cappedBody) Read(p []byte) (int, error) {
-	if b.left < 0 {
-		return 0, upstream.ErrTooLarge
-	}
-	if int64(len(p)) > b.left+1 {
-		p = p[:b.left+1] // one byte more than allowed detects overflow
-	}
-	n, err := b.rc.Read(p)
-	b.left -= int64(n)
-	if b.left < 0 {
-		return n + int(b.left), upstream.ErrTooLarge
-	}
-	return n, err
-}
-
-func (b *cappedBody) Close() error { return b.rc.Close() }
 
 // checkChanged compares sha256Hex with the first digest this source
 // recorded for the same file; a difference is served, logged and listed by
@@ -489,9 +457,6 @@ func (s *RegistrySource) checkChanged(ctx context.Context, pkg, version, file, s
 	}
 	var first *records.Provenance
 	for _, d := range digests {
-		if d == sha256Hex {
-			continue
-		}
 		p, err := s.rec.GetProvenance(ctx, ecoName, pkg, version, d)
 		if err != nil {
 			return fmt.Errorf("read provenance: %w", err)
@@ -500,7 +465,7 @@ func (s *RegistrySource) checkChanged(ctx context.Context, pkg, version, file, s
 			first = &p
 		}
 	}
-	if first == nil {
+	if first == nil || first.SHA256 == sha256Hex {
 		return nil
 	}
 	s.log.Warn("maven file changed upstream; serving the new bytes", "source", s.name, "package", pkg,
