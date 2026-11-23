@@ -3,6 +3,7 @@ package npm
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -486,11 +487,14 @@ type tagMove struct{ Tag, Version, Previous string }
 
 // moveTags applies change to the dist-tags of n, read afresh on every
 // attempt; a lost document starts from fallbackTags, whose tags count as
-// moves too. The moves of an attempt are audited before its
-// write, so a failed audit leaves the tags as they were.
+// moves too. The moves of an attempt are audited, under the attempt's ID,
+// before its write, so a failed audit leaves the tags as they were; a
+// dist-tag-commit record for the ID follows the write that sticks.
 func (s *StorageSource) moveTags(ctx context.Context, c identity.Caller, n Name, change func(tags map[string]string) ([]tagMove, error)) error {
 	up := records.UploaderFrom(c)
+	var attempt string // the ID of the attempt whose moves are audited
 	err := s.update(ctx, tagsKey(n), func() ([]byte, string, bool, error) {
+		attempt = ""
 		tags, info, lost, err := s.readTags(ctx, n)
 		if err != nil {
 			return nil, "", false, err
@@ -520,18 +524,29 @@ func (s *StorageSource) moveTags(ctx context.Context, c identity.Caller, n Name,
 		if len(tags) > maxTags {
 			return nil, "", false, tooManyTags()
 		}
+		id := crand.Text()
 		for _, m := range moves {
 			if err := s.rec.PutAudit(ctx, records.Audit{Time: time.Now().UTC(), Action: "dist-tag", Ecosystem: ecoName,
-				Package: n.Norm, Version: m.Version, Tag: m.Tag, Previous: m.Previous, Uploader: up}); err != nil {
+				Package: n.Norm, Version: m.Version, Tag: m.Tag, Previous: m.Previous, Uploader: up, Attempt: id}); err != nil {
 				return nil, "", false, fmt.Errorf("record audit: %w", err)
 			}
 		}
+		attempt = id
 		return RenderDistTags(tags), info.ETag, true, nil
 	})
-	if err == nil {
-		s.noteTags(n, false)
+	if err != nil {
+		return err
 	}
-	return err
+	s.noteTags(n, false)
+	if attempt == "" {
+		return nil
+	}
+	if err := s.rec.PutAudit(context.WithoutCancel(ctx), records.Audit{Time: time.Now().UTC(), Action: "dist-tag-commit", Ecosystem: ecoName,
+		Package: n.Norm, Uploader: up, Attempt: attempt}); err != nil {
+		s.log.Error("npm: dist-tags written but their commit record failed", "source", s.name, "package", n.Norm, "attempt", attempt, "error", err)
+		return fmt.Errorf("record audit: %w", err)
+	}
+	return nil
 }
 
 // tagPublish applies the publish rules: a package's first version is

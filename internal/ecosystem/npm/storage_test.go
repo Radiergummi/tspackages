@@ -258,8 +258,9 @@ func TestPublishAndRead(t *testing.T) {
 			t.Errorf("provenance: %+v %v", prov, err)
 		}
 		a := e.audits(t)
-		if len(a) != 2 || a[0].Action != "publish" || a[0].Package != "@s/a" || a[0].Version != "1.0.0" || a[0].Uploader.Login != publisher.Login ||
-			a[1].Action != "dist-tag" || a[1].Tag != "latest" || a[1].Version != "1.0.0" {
+		if len(a) != 3 || a[0].Action != "publish" || a[0].Package != "@s/a" || a[0].Version != "1.0.0" || a[0].Uploader.Login != publisher.Login ||
+			a[1].Action != "dist-tag" || a[1].Tag != "latest" || a[1].Version != "1.0.0" || a[1].Attempt == "" ||
+			a[2].Action != "dist-tag-commit" || a[2].Package != "@s/a" || a[2].Attempt != a[1].Attempt {
 			t.Errorf("audit: %+v", a)
 		}
 	})
@@ -684,6 +685,58 @@ func (f failAudits) PutIfAbsent(ctx context.Context, key string, r io.Reader) (s
 		return storage.Info{}, errors.New("injected audit failure")
 	}
 	return f.Driver.PutIfAbsent(ctx, key, r)
+}
+
+// loseTagRace fails the first If-Match write of a dist-tags document, as
+// when another writer got there first.
+type loseTagRace struct {
+	storage.Driver
+	lost atomic.Bool
+}
+
+func (l *loseTagRace) PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (storage.Info, error) {
+	if strings.HasSuffix(key, "/dist-tags.json") && l.lost.CompareAndSwap(false, true) {
+		return storage.Info{}, storage.ErrPrecondition
+	}
+	return l.Driver.PutIfMatch(ctx, key, r, etag)
+}
+
+// TestTagAuditAttempts: the dist-tag records of an attempt that lost its
+// write stay pending; only the attempt that stuck has a dist-tag-commit.
+func TestTagAuditAttempts(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	n := mustName(t, "pkg")
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0")))
+	race := &loseTagRace{Driver: e.d}
+	e.src.d = race
+	if err := e.src.SetTag(context.Background(), publisher, n, "beta", "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if !race.lost.Load() {
+		t.Fatal("no write was lost")
+	}
+	committed := map[string]bool{}
+	var moves []records.Audit
+	for _, a := range e.audits(t) {
+		switch {
+		case a.Action == "dist-tag-commit":
+			committed[a.Attempt] = true
+		case a.Action == "dist-tag" && a.Tag == "beta":
+			moves = append(moves, a)
+		}
+	}
+	if len(moves) != 2 || moves[0].Attempt == moves[1].Attempt {
+		t.Fatalf("beta records %+v, want one per attempt", moves)
+	}
+	var applied int
+	for _, m := range moves {
+		if committed[m.Attempt] {
+			applied++
+		}
+	}
+	if applied != 1 {
+		t.Errorf("%d committed beta records, want 1 (commits %v)", applied, committed)
+	}
 }
 
 func TestSetTagAuditFailure(t *testing.T) {

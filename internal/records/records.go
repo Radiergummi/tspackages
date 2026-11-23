@@ -62,7 +62,7 @@ type Provenance struct {
 // Audit records one write action.
 type Audit struct {
 	Time      time.Time `json:"time"`
-	Action    string    `json:"action"` // "publish" or "dist-tag"
+	Action    string    `json:"action"` // "publish", "deploy", "dist-tag" or "dist-tag-commit"
 	Ecosystem string    `json:"ecosystem"`
 	Package   string    `json:"package"`
 	Version   string    `json:"version"`
@@ -76,6 +76,11 @@ type Audit struct {
 	// and the version it pointed at before ("" if it was new).
 	Tag      string `json:"tag,omitempty"`
 	Previous string `json:"previous,omitempty"`
+	// Attempt groups the "dist-tag" records of one try at a dist-tags write.
+	// They are written before the write; a "dist-tag-commit" record with
+	// the same Attempt says the write stuck. Records of an attempt without
+	// one describe moves that never took effect.
+	Attempt string `json:"attempt,omitempty"`
 }
 
 type Store struct{ d storage.Driver }
