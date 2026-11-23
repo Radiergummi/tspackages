@@ -34,10 +34,11 @@ const (
 	maxFileName = (storage.MaxSegment - len(sidecarSuffix)) * 5 / 8
 )
 
-// StorageSource holds deployed artifacts in a store. Release files are
-// written once; SNAPSHOT files may be overwritten. A version is listed in
-// artifact-level metadata once its POM is stored; an artifact's index is
-// rebuildable from the ~pom claims and the POMs' sidecars.
+// StorageSource holds deployed artifacts in a store. Release and timestamped
+// SNAPSHOT files are written once; other SNAPSHOT files may be overwritten.
+// A version is listed in artifact-level metadata once its POM is stored; an
+// artifact's index is rebuildable from the ~pom claims and the POMs'
+// sidecars.
 //
 // Layout, with every coordinate and file name through storage.EscapeSegment:
 //
@@ -243,7 +244,8 @@ func (s *StorageSource) reserve(ctx context.Context, key, value string) (string,
 // storeFile stores body as p's file, then its sidecar, and returns the
 // sidecar in effect and, when it replaced a SNAPSHOT file, the replaced
 // sha256. The same bytes again are a success that keeps the first sidecar;
-// other bytes are ErrExists for a release file and replace a SNAPSHOT file.
+// other bytes are ErrExists for an immutable file (a release or timestamped
+// SNAPSHOT file) and replace a non-timestamped SNAPSHOT file.
 // A stored file is compared by its sidecar when the sidecar was written for
 // it, by its bytes otherwise. A concurrent change of the file or its
 // sidecar reruns the attempt. The file and sidecar writes run to their end
@@ -328,7 +330,7 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 			}
 			return sc, "", err
 		}
-		if !p.Snapshot() {
+		if p.Immutable() {
 			return sidecar{}, "", fmt.Errorf("%s %w", p.File, ErrExists)
 		}
 		if err := rewind(); err != nil {

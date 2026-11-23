@@ -313,7 +313,9 @@ fail and the status page names it. The caps:
   stored POMs. Checksums of uploaded metadata are checked for form only,
   since the metadata they describe is gone by the time they arrive.
 - A release file never changes bytes. The same bytes deployed again
-  succeed; other bytes are `409`. SNAPSHOT files may be overwritten, and
+  succeed; other bytes are `409`. Timestamped SNAPSHOT files
+  (`lib-1.0-20261123.101010-3.jar`) are served immutable, so they are
+  written once the same way. Other SNAPSHOT files may be overwritten, and
   each overwrite is audited with the replaced SHA256. There is no delete
   (`405`).
 - **Deployed POMs bind their coordinates.** A POM's `groupId`,
