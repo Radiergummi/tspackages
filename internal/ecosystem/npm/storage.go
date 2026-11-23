@@ -50,9 +50,14 @@ const (
 //	npm/<name>/index.json                  {"versions": {"<version>": indexEntry}}
 //	npm/<name>/dist-tags.json              {"<tag>": "<version>"}
 //	npm/<name>/<version>/~claim            claim: the tarball's sha256
+//	npm/<name>/<version>/~precedence       claim: the version holding this precedence
+//	npm/<name>/<version>/~tagged           marker: the publish's tag step is done
 //	npm/<name>/<version>/package.tgz       the tarball
 //	npm/<name>/<version>/package.json      its sidecar
 //	npm/<name>/<version>/package.sigstore  its provenance bundle, if published with one
+//
+// A ~precedence claim sits below the version without build metadata, so
+// 1.0.0+a and 1.0.0+b compete for npm/<name>/1.0.0/~precedence.
 type StorageSource struct {
 	name      string
 	claims    []string
@@ -118,6 +123,10 @@ func tagsKey(n Name) string   { return pkgPrefix(n) + "dist-tags.json" }
 func versionKey(n Name, v, file string) string {
 	return pkgPrefix(n) + storage.EscapeSegment(v) + "/" + file
 }
+func precedenceKey(n Name, v Version) string {
+	v.Build = ""
+	return versionKey(n, v.String(), "~precedence")
+}
 
 // Publish inspects a publish body and stores its version. The same bytes
 // published again are a success, and complete a publish interrupted after
@@ -130,6 +139,9 @@ func (s *StorageSource) Publish(ctx context.Context, c identity.Caller, n Name, 
 	defer func() { pub.Tarball.Close(); os.Remove(pub.Tarball.Name()) }() //nolint:gosec // Inspect's own temp file
 	v := pub.Version.String()
 	if err := s.precheck(ctx, n, pub.Version, pub.Tag); err != nil {
+		return "", err
+	}
+	if err := s.claimPrecedence(ctx, n, pub.Version); err != nil {
 		return "", err
 	}
 	if err := s.claim(ctx, n, v, pub.SHA256); err != nil {
@@ -168,7 +180,22 @@ func (s *StorageSource) Publish(ctx context.Context, c identity.Caller, n Name, 
 	if err := s.addToIndex(ctx, n, pub.Version, sc); err != nil {
 		return "", err
 	}
-	return s.tagPublish(ctx, n, pub.Version, sc.Tag)
+	// A publish of these bytes that finished its tag step must not move the
+	// tags again: they may have been moved on since.
+	tagged := versionKey(n, v, "~tagged")
+	if _, err := s.d.Stat(ctx, tagged); err == nil {
+		return "", nil
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return "", err
+	}
+	notice, err := s.tagPublish(ctx, c, n, pub.Version, sc.Tag)
+	if err != nil {
+		return "", err
+	}
+	if err := s.putIfAbsent(ctx, tagged, strings.NewReader(sc.Tag)); err != nil {
+		return "", err
+	}
+	return notice, nil
 }
 
 // precheck refuses, before anything is written, a version with the
@@ -208,18 +235,38 @@ func samePrecedence(idx map[string]indexEntry, v Version) error {
 // claim reserves version v for a tarball. A claim already held by the same
 // digest is a retry.
 func (s *StorageSource) claim(ctx context.Context, n Name, v, sha string) error {
-	key := versionKey(n, v, "~claim")
-	if _, err := s.d.PutIfAbsent(ctx, key, strings.NewReader(sha)); !errors.Is(err, storage.ErrExists) {
-		return err
-	}
-	held, _, err := s.get(ctx, key, 128)
+	held, err := s.reserve(ctx, versionKey(n, v, "~claim"), sha)
 	if err != nil {
 		return err
 	}
-	if string(held) != sha {
+	if held != sha {
 		return fmt.Errorf("%w: %s", ErrVersionExists, v)
 	}
 	return nil
+}
+
+// claimPrecedence reserves the precedence of v for v, so that two versions
+// differing only in build metadata are never both stored. A claim already
+// held by v is a retry.
+func (s *StorageSource) claimPrecedence(ctx context.Context, n Name, v Version) error {
+	held, err := s.reserve(ctx, precedenceKey(n, v), v.String())
+	if err != nil {
+		return err
+	}
+	if held != v.String() {
+		return fmt.Errorf("%w: %s has the precedence of %s", ErrVersionExists, v, held)
+	}
+	return nil
+}
+
+// reserve stores value at key unless the key exists, and returns the value
+// held there.
+func (s *StorageSource) reserve(ctx context.Context, key, value string) (string, error) {
+	if _, err := s.d.PutIfAbsent(ctx, key, strings.NewReader(value)); !errors.Is(err, storage.ErrExists) {
+		return value, err
+	}
+	held, _, err := s.get(ctx, key, 256)
+	return string(held), err
 }
 
 func (s *StorageSource) putIfAbsent(ctx context.Context, key string, r io.Reader) error {
@@ -286,7 +333,9 @@ func (s *StorageSource) readIndex(ctx context.Context, n Name) (idx map[string]i
 	return idx, info.ETag, true, err
 }
 
-// scan rebuilds a package's index from its sidecars.
+// scan rebuilds a package's index from its sidecars, skipping a version
+// that does not hold its precedence claim (the loser of a race between
+// versions differing only in build metadata).
 func (s *StorageSource) scan(ctx context.Context, n Name) (map[string]indexEntry, error) {
 	idx := map[string]indexEntry{}
 	for info, err := range s.d.List(ctx, pkgPrefix(n)) {
@@ -304,6 +353,18 @@ func (s *StorageSource) scan(ctx context.Context, n Name) (map[string]indexEntry
 		sc, err := s.readSidecar(ctx, n, v)
 		if err != nil {
 			s.log.Warn("npm: skipping unreadable sidecar", "source", s.name, "key", info.Key, "error", err)
+			continue
+		}
+		pv, err := ParseVersion(sc.Version)
+		if err != nil {
+			s.log.Warn("npm: skipping sidecar with an invalid version", "source", s.name, "key", info.Key, "error", err)
+			continue
+		}
+		owner, _, err := s.get(ctx, precedenceKey(n, pv), 256)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+		if string(owner) != sc.Version {
 			continue
 		}
 		idx[sc.Version] = indexEntry{Published: sc.Published, SHA256: sc.SHA256}
@@ -406,10 +467,16 @@ func fallbackTags(idx map[string]indexEntry) map[string]string {
 	return tags
 }
 
+// tagMove is one dist-tag change; Version is "" for a removal and
+// Previous "" for a new tag.
+type tagMove struct{ Tag, Version, Previous string }
+
 // moveTags applies change to the dist-tags of n, read afresh on every
-// attempt; a lost document starts from fallbackTags and is written even
-// when change reports no change.
-func (s *StorageSource) moveTags(ctx context.Context, n Name, change func(tags map[string]string) (changed bool, err error)) error {
+// attempt; a lost document starts from fallbackTags, whose tags count as
+// moves too. The moves of an attempt are audited before its
+// write, so a failed audit leaves the tags as they were.
+func (s *StorageSource) moveTags(ctx context.Context, c identity.Caller, n Name, change func(tags map[string]string) ([]tagMove, error)) error {
+	up := records.UploaderFrom(c)
 	err := s.update(ctx, tagsKey(n), func() ([]byte, string, bool, error) {
 		tags, info, lost, err := s.readTags(ctx, n)
 		if err != nil {
@@ -422,12 +489,29 @@ func (s *StorageSource) moveTags(ctx context.Context, n Name, change func(tags m
 			}
 			tags = fallbackTags(idx)
 		}
+		// A lost document is written afresh, its fallback tags included.
+		var moves []tagMove
+		if lost {
+			for t, v := range tags {
+				moves = append(moves, tagMove{Tag: t, Version: v})
+			}
+		}
 		changed, err := change(tags)
-		if err != nil || !changed && !lost {
+		if err != nil {
 			return nil, "", false, err
+		}
+		moves = append(moves, changed...)
+		if len(moves) == 0 {
+			return nil, "", false, nil
 		}
 		if len(tags) > maxTags {
 			return nil, "", false, tooManyTags()
+		}
+		for _, m := range moves {
+			if err := s.rec.PutAudit(ctx, records.Audit{Time: time.Now().UTC(), Action: "dist-tag", Ecosystem: ecoName,
+				Package: n.Norm, Version: m.Version, Tag: m.Tag, Previous: m.Previous, Uploader: up}); err != nil {
+				return nil, "", false, fmt.Errorf("record audit: %w", err)
+			}
 		}
 		return RenderDistTags(tags), info.ETag, true, nil
 	})
@@ -440,27 +524,31 @@ func (s *StorageSource) moveTags(ctx context.Context, n Name, change func(tags m
 // tagPublish applies the publish rules: a package's first version is
 // latest; latest moves to v only when v is higher (otherwise the notice
 // says where it stayed); any other tag moves to v.
-func (s *StorageSource) tagPublish(ctx context.Context, n Name, v Version, tag string) (string, error) {
+func (s *StorageSource) tagPublish(ctx context.Context, c identity.Caller, n Name, v Version, tag string) (string, error) {
 	vs := v.String()
 	var notice string
-	err := s.moveTags(ctx, n, func(tags map[string]string) (bool, error) {
+	err := s.moveTags(ctx, c, n, func(tags map[string]string) ([]tagMove, error) {
 		notice = ""
-		changed := false
+		var moves []tagMove
+		set := func(t string) {
+			moves = append(moves, tagMove{Tag: t, Version: vs, Previous: tags[t]})
+			tags[t] = vs
+		}
 		cur, ok := tags["latest"]
 		switch {
 		case !ok:
-			tags["latest"], changed = vs, true
+			set("latest")
 		case tag == "latest" && cur != vs:
 			if cv, err := ParseVersion(cur); err == nil && Compare(v, cv) <= 0 {
 				notice = "latest stayed at " + cur
 			} else {
-				tags["latest"], changed = vs, true
+				set("latest")
 			}
 		}
 		if tag != "latest" && tags[tag] != vs {
-			tags[tag], changed = vs, true
+			set(tag)
 		}
-		return changed, nil
+		return moves, nil
 	})
 	return notice, err
 }
@@ -480,16 +568,14 @@ func (s *StorageSource) SetTag(ctx context.Context, c identity.Caller, n Name, t
 	if _, ok := idx[version]; !ok {
 		return badRequest("%s has no version %q", n.Norm, version)
 	}
-	var previous string
-	err = s.moveTags(ctx, n, func(tags map[string]string) (bool, error) {
-		previous = tags[tag]
+	return s.moveTags(ctx, c, n, func(tags map[string]string) ([]tagMove, error) {
+		previous := tags[tag]
+		if previous == version {
+			return nil, nil
+		}
 		tags[tag] = version
-		return previous != version, nil
+		return []tagMove{{Tag: tag, Version: version, Previous: previous}}, nil
 	})
-	if err != nil || previous == version {
-		return err
-	}
-	return s.auditTag(ctx, c, n, tag, version, previous)
 }
 
 // RemoveTag removes a dist-tag other than latest.
@@ -497,27 +583,14 @@ func (s *StorageSource) RemoveTag(ctx context.Context, c identity.Caller, n Name
 	if tag == "latest" {
 		return badRequest("the latest dist-tag cannot be removed")
 	}
-	var previous string
-	err := s.moveTags(ctx, n, func(tags map[string]string) (bool, error) {
-		var ok bool
-		if previous, ok = tags[tag]; !ok {
-			return false, fmt.Errorf("%w: dist-tag %s of %s", resolve.ErrNotFound, tag, n.Norm)
+	return s.moveTags(ctx, c, n, func(tags map[string]string) ([]tagMove, error) {
+		previous, ok := tags[tag]
+		if !ok {
+			return nil, fmt.Errorf("%w: dist-tag %s of %s", resolve.ErrNotFound, tag, n.Norm)
 		}
 		delete(tags, tag)
-		return true, nil
+		return []tagMove{{Tag: tag, Previous: previous}}, nil
 	})
-	if err != nil {
-		return err
-	}
-	return s.auditTag(ctx, c, n, tag, "", previous)
-}
-
-func (s *StorageSource) auditTag(ctx context.Context, c identity.Caller, n Name, tag, version, previous string) error {
-	if err := s.rec.PutAudit(ctx, records.Audit{Time: time.Now().UTC(), Action: "dist-tag", Ecosystem: ecoName,
-		Package: n.Norm, Version: version, Tag: tag, Previous: previous, Uploader: records.UploaderFrom(c)}); err != nil {
-		return fmt.Errorf("record audit: %w", err)
-	}
-	return nil
 }
 
 // noteTags records whether the dist-tags document of n was lost, for Health.
