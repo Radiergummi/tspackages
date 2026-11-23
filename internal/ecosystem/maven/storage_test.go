@@ -21,6 +21,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/lru"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -562,4 +563,25 @@ func TestSidecarOfOtherBytes(t *testing.T) {
 			t.Errorf("Digests = %+v, %v; want %+v", got, err, allDigests("jar 2"))
 		}
 	})
+}
+
+// TestRenderedMetaBounded: artifact-level metadata is kept within the
+// cache's byte cap; an evicted artifact's metadata is rendered again.
+func TestRenderedMetaBounded(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	e.mustDeploy(t, "com/matchory/lib/1.0/lib-1.0.pom", libPOM("1.0", ""))
+	e.metadata(t, artMeta)
+	m, ok := e.src.meta.Get("com.matchory:lib")
+	if !ok {
+		t.Fatal("metadata not cached")
+	}
+	e.src.meta = lru.New(int64(len(m.body)), func(m renderedMeta) int64 { return int64(len(m.body)) })
+	e.metadata(t, artMeta)
+	e.mustDeploy(t, "com/matchory/lib/1.1/lib-1.1.pom", libPOM("1.1", "")) // longer metadata: over the cap
+	if got := e.metadata(t, artMeta); !slices.Equal(got.Versioning.Versions, []string{"1.0", "1.1"}) {
+		t.Errorf("versions = %v", got.Versioning.Versions)
+	}
+	if _, ok := e.src.meta.Get("com.matchory:lib"); ok {
+		t.Error("metadata over the cap kept")
+	}
 }
