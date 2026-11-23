@@ -1,0 +1,276 @@
+{
+ "_id": "left-pad",
+ "_rev": "116-x",
+ "name": "left-pad",
+ "dist-tags": {
+  "latest": "1.3.0"
+ },
+ "versions": {
+  "1.0.0": {
+   "name": "left-pad",
+   "version": "1.0.0",
+   "keywords": [
+    "leftpad",
+    "left",
+    "pad",
+    "padding",
+    "string"
+   ],
+   "author": "azer",
+   "license": "WTFPL",
+   "_id": "left-pad@1.0.0",
+   "maintainers": [
+    {
+     "name": "sebmck",
+     "email": "sebmck@gmail.com"
+    },
+    {
+     "name": "westlac",
+     "email": "cameron.westland@autodesk.com"
+    }
+   ],
+   "dist": {
+    "shasum": "c84e2417581bbb8eaf2b9e3d7a122e572ab1af37",
+    "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz",
+    "integrity": "sha512-Xvly4CWfzT+7TGZRB2Qd7ub2dmJDomZCNf3BuT3XXfrNerQHtta82NNhbvToU4Qiz7IHrg21YB3UpL/6npCtmg==",
+    "signatures": [
+     {
+      "sig": "MEYCIQClgdZWSSwoL3s3Volt/JNzCxNFkX0wd4eVliIDaXI7RgIhAMh/1mwbUPJseXx/15IZx7DrM+8K4PYIwXeVVNZIGkUy",
+      "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+     }
+    ],
+    "noattachment": true
+   },
+   "main": "index.js",
+   "_from": "left-pad@1.0.0",
+   "_shasum": "c84e2417581bbb8eaf2b9e3d7a122e572ab1af37",
+   "scripts": {
+    "install": "node-gyp rebuild"
+   },
+   "_npmUser": {
+    "name": "npm",
+    "email": "support@npmjs.com"
+   },
+   "deprecated": "use String.prototype.padStart()",
+   "repository": {
+    "url": "git@github.com:azer/left-pad.git",
+    "type": "git"
+   },
+   "_npmVersion": "0.0.0-fake",
+   "description": "String left pad",
+   "directories": {},
+   "_nodeVersion": "0.0.0-fake",
+   "devDependencies": {
+    "tape": "*"
+   },
+   "_resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"
+  },
+  "1.2.0": {
+   "name": "left-pad",
+   "version": "1.2.0",
+   "keywords": [
+    "leftpad",
+    "left",
+    "pad",
+    "padding",
+    "string",
+    "repeat"
+   ],
+   "author": {
+    "name": "azer"
+   },
+   "license": "WTFPL",
+   "_id": "left-pad@1.2.0",
+   "maintainers": [
+    {
+     "name": "sebmck",
+     "email": "sebmck@gmail.com"
+    },
+    {
+     "name": "stevemao",
+     "email": "maochenyan@gmail.com"
+    },
+    {
+     "name": "westlac",
+     "email": "cameron.westland@autodesk.com"
+    }
+   ],
+   "homepage": "https://github.com/stevemao/left-pad#readme",
+   "bugs": {
+    "url": "https://github.com/stevemao/left-pad/issues"
+   },
+   "dist": {
+    "shasum": "d30a73c6b8201d8f7d8e7956ba9616087a68e0ee",
+    "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+    "integrity": "sha512-OQadpCyFCT/VLniZQgym8d3/ofIJtuZyw2ibsVeIUOexKgW/osn8+mMFJbwGMPeDC4GnLzD8q115WPCDx4YRWg==",
+    "signatures": [
+     {
+      "sig": "MEUCIQCuPZdY7rcdASHHNLlWFxK77Owv8QzxqGnsT3JfmqYB8gIgfzI9SFt1m0ho7EQVC3KII2cn98jvFgyBCtGejs3o/ok=",
+      "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+     }
+    ],
+    "attestations": {
+     "url": "https://registry.npmjs.org/-/npm/v1/attestations/left-pad@1.2.0",
+     "provenance": {
+      "predicateType": "https://slsa.dev/provenance/v1"
+     }
+    },
+    "npm-signature": "-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n"
+   },
+   "main": "index.js",
+   "_from": ".",
+   "types": "index.d.ts",
+   "_shasum": "d30a73c6b8201d8f7d8e7956ba9616087a68e0ee",
+   "gitHead": "1f8f21b762a7426a7c73286d854c07d9f9e78486",
+   "scripts": {
+    "test": "node test",
+    "bench": "node perf/perf.js"
+   },
+   "_npmUser": {
+    "name": "stevemao",
+    "email": "maochenyan@gmail.com"
+   },
+   "deprecated": "use String.prototype.padStart()",
+   "repository": {
+    "url": "git+ssh://git@github.com/stevemao/left-pad.git",
+    "type": "git"
+   },
+   "_npmVersion": "3.10.10",
+   "description": "String left pad",
+   "directories": {},
+   "_nodeVersion": "6.10.3",
+   "devDependencies": {
+    "tape": "*",
+    "benchmark": "^2.1.0"
+   },
+   "_npmOperationalInternal": {
+    "tmp": "tmp/left-pad-1.2.0.tgz_1510897718867_0.7524343002587557",
+    "host": "s3://npm-registry-packages"
+   }
+  },
+  "1.3.0": {
+   "name": "left-pad",
+   "version": "1.3.0",
+   "keywords": [
+    "leftpad",
+    "left",
+    "pad",
+    "padding",
+    "string",
+    "repeat"
+   ],
+   "author": {
+    "name": "azer"
+   },
+   "license": "WTFPL",
+   "_id": "left-pad@1.3.0",
+   "maintainers": [
+    {
+     "name": "sebmck",
+     "email": "sebmck@gmail.com"
+    },
+    {
+     "name": "stevemao",
+     "email": "maochenyan@gmail.com"
+    },
+    {
+     "name": "westlac",
+     "email": "cameron.westland@autodesk.com"
+    }
+   ],
+   "homepage": "https://github.com/stevemao/left-pad#readme",
+   "bugs": {
+    "url": "https://github.com/stevemao/left-pad/issues"
+   },
+   "dist": {
+    "shasum": "5b8a3a7765dfe001261dde915589e782f8c94d1e",
+    "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+    "fileCount": 10,
+    "integrity": "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==",
+    "signatures": [
+     {
+      "sig": "MEYCIQD6P3wA64go2fjiRW+yNvdi0x7Jtge3eAxAlwNaK2wyfQIhAKMCJXCFKygnFmsVuppuZIuNzTCYx2WlrJSg8B6wMqZk",
+      "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+     }
+    ],
+    "unpackedSize": 9752
+   },
+   "main": "index.js",
+   "types": "index.d.ts",
+   "gitHead": "ff8e7ba8b4122829cf66125ca8445cac7f073bce",
+   "scripts": {
+    "test": "node test",
+    "bench": "node perf/perf.js"
+   },
+   "_npmUser": {
+    "name": "stevemao",
+    "email": "maochenyan@gmail.com"
+   },
+   "deprecated": "use String.prototype.padStart()",
+   "repository": {
+    "url": "git+ssh://git@github.com/stevemao/left-pad.git",
+    "type": "git"
+   },
+   "_npmVersion": "5.5.1",
+   "description": "String left pad",
+   "directories": {},
+   "_nodeVersion": "9.2.1",
+   "_hasShrinkwrap": false,
+   "devDependencies": {
+    "tape": "*",
+    "benchmark": "^2.1.0",
+    "fast-check": "0.0.8"
+   },
+   "_npmOperationalInternal": {
+    "tmp": "tmp/left-pad_1.3.0_1523236245678_0.2849598021556574",
+    "host": "s3://npm-registry-packages"
+   }
+  }
+ },
+ "time": {
+  "created": "2014-03-14T09:09:20.762Z",
+  "modified": "2026-11-18T13:37:02.787Z",
+  "1.0.0": "2016-03-22T21:42:18.002Z",
+  "1.2.0": "2017-11-17T05:48:38.934Z",
+  "1.3.0": "2018-04-09T01:10:45.796Z"
+ },
+ "bugs": {
+  "url": "https://github.com/stevemao/left-pad/issues"
+ },
+ "author": {
+  "name": "azer"
+ },
+ "license": "WTFPL",
+ "homepage": "https://github.com/stevemao/left-pad#readme",
+ "keywords": [
+  "leftpad",
+  "left",
+  "pad",
+  "padding",
+  "string",
+  "repeat"
+ ],
+ "repository": {
+  "url": "git+ssh://git@github.com/stevemao/left-pad.git",
+  "type": "git"
+ },
+ "description": "String left pad",
+ "maintainers": [
+  {
+   "name": "stevemao",
+   "email": "maochenyan@gmail.com"
+  },
+  {
+   "name": "westlac",
+   "email": "cameron.westland@autodesk.com"
+  }
+ ],
+ "readme": "## left-pad\n\nString left pad\n\n[![Build Status][travis-image]][travis-url]\n\n## Install\n\n```bash\n$ npm install left-pad\n```\n\n## Usage\n\n```js\nconst leftPad = require('left-pad')\n\nleftPad('foo', 5)\n// => \"  foo\"\n\nleftPad('foobar', 6)\n// => \"foobar\"\n\nleftPad(1, 2, '0')\n// => \"01\"\n\nleftPad(17, 5, 0)\n// =>",
+ "readmeFilename": "README.md",
+ "users": {
+  "vigo": true,
+  "iusfof": true,
+  "alexyan": true
+ },
+ "_attachments": {}
+}
