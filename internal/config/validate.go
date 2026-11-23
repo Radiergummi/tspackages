@@ -346,6 +346,10 @@ var (
 	// npmClaimRe is npm.ValidPattern's grammar without the "*" alternative:
 	// "@scope/name" or "name" in lowercase [a-z0-9._*-].
 	npmClaimRe = regexp.MustCompile(`^(@[a-z0-9._*-]+/[a-z0-9._*-]+|[a-z0-9._*-]+)$`)
+	// mavenClaimRe is maven.ValidPattern's grammar without the "*"
+	// alternative: a dotted group whose last segment may be "*", then an
+	// optional ":<artifact>".
+	mavenClaimRe = regexp.MustCompile(`^[a-z0-9_-]+(\.[a-z0-9_-]+)*(\.\*)?(:[a-z0-9._*-]+)?$`)
 )
 
 // validClaim accepts "*" or a pattern in the ecosystem's normalised name
@@ -361,16 +365,23 @@ func validClaim(eco, c string) bool {
 	if eco == "npm" {
 		return npmClaimRe.MatchString(c)
 	}
+	if eco == "maven" {
+		return mavenClaimRe.MatchString(c)
+	}
 	return claimRe.MatchString(c)
 }
 
 // claimsOverlap reports whether some package name matches both valid claims.
 // "*" matches every name; otherwise only "*" is special within a segment (it
 // matches any run of characters). Composer claims have two segments, pypi
-// claims one, npm claims one or, with a "@scope/" prefix, two.
+// claims one, npm claims one or, with a "@scope/" prefix, two, Maven claims a
+// group and optionally an artifact.
 func claimsOverlap(eco, a, b string) bool {
 	if a == "*" || b == "*" {
 		return true
+	}
+	if eco == "maven" {
+		return mavenOverlap(a, b)
 	}
 	if eco == "pypi" {
 		return globsOverlap(a, b)
@@ -389,6 +400,37 @@ func claimsOverlap(eco, a, b string) bool {
 	av, an, _ := strings.Cut(a, "/")
 	bv, bn, _ := strings.Cut(b, "/")
 	return globsOverlap(av, bv) && globsOverlap(an, bn)
+}
+
+// mavenOverlap reports whether some group:artifact matches both valid Maven
+// claims: their groups can match a common group and, when both name an
+// artifact pattern, so can the artifacts.
+func mavenOverlap(a, b string) bool {
+	ag, aa, aHas := strings.Cut(a, ":")
+	bg, ba, bHas := strings.Cut(b, ":")
+	if !mavenGroupsOverlap(ag, bg) {
+		return false
+	}
+	return !aHas || !bHas || globsOverlap(aa, ba)
+}
+
+// mavenGroupsOverlap reports whether some group matches both group patterns:
+// literal dotted segments, the last of which may be "*" for one or more
+// further segments.
+func mavenGroupsOverlap(a, b string) bool {
+	ap, aOpen := strings.CutSuffix(a, ".*")
+	bp, bOpen := strings.CutSuffix(b, ".*")
+	as, bs := strings.Split(ap, "."), strings.Split(bp, ".")
+	switch {
+	case aOpen && bOpen:
+		n := min(len(as), len(bs))
+		return slices.Equal(as[:n], bs[:n])
+	case aOpen:
+		return len(bs) > len(as) && slices.Equal(as, bs[:len(as)])
+	case bOpen:
+		return len(as) > len(bs) && slices.Equal(bs, as[:len(bs)])
+	}
+	return slices.Equal(as, bs)
 }
 
 // globsOverlap reports whether some string matches both patterns, in which
