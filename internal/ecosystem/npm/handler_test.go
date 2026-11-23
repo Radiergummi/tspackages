@@ -435,8 +435,8 @@ func TestPublishRouting(t *testing.T) {
 		t.Fatalf("published %d bodies, name %+v", len(st.published), st.lastName)
 	}
 	st.notice = "latest stayed at 2.0.0"
-	if w := put(h, "/npm/@s%2fn", "application/json", "{}"); w.Code != 201 || w.Header().Get("npm-notice") != st.notice {
-		t.Fatalf("notice: %d %q", w.Code, w.Header().Get("npm-notice"))
+	if w := put(h, "/npm/@s%2fn", "application/json", "{}"); w.Code != 201 || w.Header().Get("Npm-Notice") != st.notice {
+		t.Fatalf("notice: %d %q", w.Code, w.Header().Get("Npm-Notice"))
 	}
 	st.notice = ""
 	if w := put(h, "/npm/@s%2fn", "application/json", "{}"); w.Header().Values("npm-notice") != nil {
