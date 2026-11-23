@@ -244,8 +244,8 @@ func (s *StorageSource) inspect(data []byte, dist distribution) ([]byte, error) 
 		}
 		return found, nil
 	}
-	files, err := archive.InspectTarGz(bytes.NewReader(data), s.limits, func(name string) bool {
-		dir, base, ok := strings.Cut(name, "/")
+	files, err := archive.InspectTarGz(bytes.NewReader(data), s.limits, func(e archive.Entry) bool {
+		dir, base, ok := strings.Cut(e.Name, "/")
 		return ok && dir != "" && base == "PKG-INFO"
 	})
 	if err != nil {

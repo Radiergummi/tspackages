@@ -280,7 +280,7 @@ func TestInspectValid(t *testing.T) {
 // npmBodyManifest returns the tarball's package/package.json.
 func npmBodyManifest(t *testing.T, body []byte) []byte {
 	t.Helper()
-	files, err := archive.InspectTarGz(bytes.NewReader(attachedTarball(t, body)), inspectLimits, func(string) bool { return true })
+	files, err := archive.InspectTarGz(bytes.NewReader(attachedTarball(t, body)), inspectLimits, func(archive.Entry) bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}

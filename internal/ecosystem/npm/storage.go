@@ -25,6 +25,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -39,6 +40,9 @@ const (
 	maxSidecarBytes = 4 << 20
 	// maxStorageDocBytes caps each rendered packument, full and abbreviated.
 	maxStorageDocBytes = 64 << 20
+
+	// sidecarBatch is how many sidecars a render reads concurrently.
+	sidecarBatch = 16
 
 	// timeFormat is the layout of npm's time fields.
 	timeFormat = "2006-01-02T15:04:05.000Z"
@@ -625,7 +629,7 @@ func (s *StorageSource) noteTags(n Name, lost bool) {
 type rendered struct {
 	indexETag, tagsETag string
 	tags                map[string]string
-	versions            map[string][]byte // full version objects
+	versions            map[string][2]int // each full version object's offsets in full
 	full, corgi         []byte
 	sumFull, sumCorgi   string
 	tokFull, tokCorgi   int
@@ -705,7 +709,7 @@ func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, er
 	if lost {
 		tags = fallbackTags(idx)
 	}
-	r := &rendered{indexETag: indexETag, tagsETag: tInfo.ETag, tags: map[string]string{}, versions: map[string][]byte{}}
+	r := &rendered{indexETag: indexETag, tagsETag: tInfo.ETag, tags: map[string]string{}, versions: map[string][2]int{}}
 	for t, v := range tags {
 		if _, ok := idx[v]; ok {
 			r.tags[t] = v
@@ -716,36 +720,53 @@ func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, er
 	times := map[string]string{}
 	var created, modified time.Time
 	var latest map[string]json.RawMessage
-	for _, v := range sortedVersions(idx) {
-		sc, err := s.readSidecar(ctx, n, v)
-		if err != nil {
-			// Indexed but unreadable: a store fault, not a miss.
-			return nil, false, fmt.Errorf("npm: indexed version %s@%s: %w", n.Norm, v, err)
+	// Sidecars are read a batch at a time, concurrently within a batch, so
+	// store round trips overlap while memory holds one batch.
+	for batch := range slices.Chunk(sortedVersions(idx), sidecarBatch) {
+		scs := make([]sidecar, len(batch))
+		g, gctx := errgroup.WithContext(ctx)
+		for i, v := range batch {
+			g.Go(func() error {
+				sc, err := s.readSidecar(gctx, n, v)
+				if err != nil {
+					// Indexed but unreadable: a store fault, not a miss.
+					return fmt.Errorf("npm: indexed version %s@%s: %w", n.Norm, v, err)
+				}
+				scs[i] = sc
+				return nil
+			})
 		}
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(sc.Doc, &obj); err != nil {
-			return nil, false, fmt.Errorf("npm: version object of %s@%s: %w", n.Norm, v, err)
-		}
-		f, c, err := RenderVersion(obj, Dist{
-			Tarball: BaseToken + n.Exact + "/-/" + n.TarballFile(v), Integrity: sc.Dist.Integrity, Shasum: sc.Dist.Shasum,
-			FileCount: sc.Dist.FileCount, UnpackedSize: sc.Dist.UnpackedSize,
-		})
-		if err != nil {
+		if err := g.Wait(); err != nil {
 			return nil, false, err
 		}
-		if err := dw.Version(v, f, c); err != nil {
-			return nil, false, fmt.Errorf("npm: packument of %s: %w", n.Norm, err)
-		}
-		r.versions[v] = f
-		times[v] = sc.Published.UTC().Format(timeFormat)
-		if created.IsZero() || sc.Published.Before(created) {
-			created = sc.Published
-		}
-		if sc.Published.After(modified) {
-			modified = sc.Published
-		}
-		if v == r.tags["latest"] {
-			latest = obj
+		for i, v := range batch {
+			sc := scs[i]
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(sc.Doc, &obj); err != nil {
+				return nil, false, fmt.Errorf("npm: version object of %s@%s: %w", n.Norm, v, err)
+			}
+			f, c, err := RenderVersion(obj, Dist{
+				Tarball: BaseToken + n.Exact + "/-/" + n.TarballFile(v), Integrity: sc.Dist.Integrity, Shasum: sc.Dist.Shasum,
+				FileCount: sc.Dist.FileCount, UnpackedSize: sc.Dist.UnpackedSize,
+			})
+			if err != nil {
+				return nil, false, err
+			}
+			if err := dw.Version(v, f, c); err != nil {
+				return nil, false, fmt.Errorf("npm: packument of %s: %w", n.Norm, err)
+			}
+			// DocWriter.Version ends the full document with f.
+			r.versions[v] = [2]int{full.Len() - len(f), full.Len()}
+			times[v] = sc.Published.UTC().Format(timeFormat)
+			if created.IsZero() || sc.Published.Before(created) {
+				created = sc.Published
+			}
+			if sc.Published.After(modified) {
+				modified = sc.Published
+			}
+			if v == r.tags["latest"] {
+				latest = obj
+			}
 		}
 	}
 	if !lost && tInfo.ModTime.After(modified) {
@@ -792,11 +813,11 @@ func (s *StorageSource) Version(ctx context.Context, n Name, versionOrTag string
 	if t, ok := r.tags[versionOrTag]; ok {
 		v = t
 	}
-	obj, ok := r.versions[v]
+	off, ok := r.versions[v]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s@%s", resolve.ErrNotFound, n.Norm, versionOrTag)
 	}
-	return obj, nil
+	return r.full[off[0]:off[1]:off[1]], nil
 }
 
 // DistTags returns the dist-tags of n.
@@ -815,22 +836,21 @@ func (s *StorageSource) Tarball(ctx context.Context, n Name, file string) (Artif
 	if err != nil {
 		return Artifact{}, err
 	}
-	for v := range r.versions {
-		if n.TarballFile(v) != file {
-			continue
-		}
-		key := versionKey(n, v, "package.tgz")
-		rc, info, err := s.d.Get(ctx, key)
-		if errors.Is(err, storage.ErrNotFound) {
-			// Indexed but missing: a store fault, not a miss.
-			return Artifact{}, fmt.Errorf("npm: indexed object %s is missing", key)
-		}
-		if err != nil {
-			return Artifact{}, err
-		}
-		return Artifact{Body: rc, Size: info.Size}, nil
+	v, prefixed := strings.CutPrefix(file, n.Base+"-")
+	v, suffixed := strings.CutSuffix(v, ".tgz")
+	if _, ok := r.versions[v]; !prefixed || !suffixed || !ok {
+		return Artifact{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, file)
 	}
-	return Artifact{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, file)
+	key := versionKey(n, v, "package.tgz")
+	rc, info, err := s.d.Get(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		// Indexed but missing: a store fault, not a miss.
+		return Artifact{}, fmt.Errorf("npm: indexed object %s is missing", key)
+	}
+	if err != nil {
+		return Artifact{}, err
+	}
+	return Artifact{Body: rc, Size: info.Size}, nil
 }
 
 // Health reports whether the store answers and, per package, a dist-tags

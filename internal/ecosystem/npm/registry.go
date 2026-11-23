@@ -472,7 +472,7 @@ func (s *RegistrySource) refresh(ctx context.Context, n Name, haveCache bool) (m
 	fctx, cancel := context.WithTimeout(ctx, metaFetchTimeout)
 	defer cancel()
 	miss, err = s.fetchAndStore(fctx, n)
-	s.noteFetch(ctx, err, haveCache)
+	s.noteFetch(err, haveCache)
 	return miss, err
 }
 
@@ -761,12 +761,9 @@ func (s *RegistrySource) prepare(n Name, key string, raw []byte) (prepared, bool
 	return prepared{full: full, corgi: corgi, files: files, entry: e}, true
 }
 
-// noteFetch records the outcome of a packument fetch for Health; a
-// cancelled request says nothing about upstream.
-func (s *RegistrySource) noteFetch(ctx context.Context, err error, haveCache bool) {
-	if ctx.Err() != nil {
-		return
-	}
+// noteFetch records the outcome of a packument fetch for Health. Fetches
+// run detached from the request, so a client leaving never shows up here.
+func (s *RegistrySource) noteFetch(err error, haveCache bool) {
 	s.hmu.Lock()
 	defer s.hmu.Unlock()
 	switch {
