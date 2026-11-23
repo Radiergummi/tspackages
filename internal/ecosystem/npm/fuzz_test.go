@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/upstream"
 )
 
@@ -104,6 +105,35 @@ func FuzzPackumentStream(f *testing.F) {
 		}
 		if idx := append(append([]byte(`{`), entries.Bytes()...), '}'); !json.Valid(idx) {
 			t.Fatalf("file index is not valid JSON:\n%s", idx)
+		}
+	})
+}
+
+func FuzzInspect(f *testing.F) {
+	f.Add(npmBody(f))
+	f.Add(npmBody(f, withName("@s/tool"), withManifest(func(m map[string]any) { m["bin"] = "cli.js" })))
+	f.Add(npmBody(f, withAttachment("pkg-1.0.0.sigstore", `{"data":"{}"}`)))
+	f.Add(npmBody(f, withTop("_attachments", "")))
+	f.Add([]byte(`{"name":"pkg","versions":{"1.0.0":{}},"dist-tags":{"latest":"1.0.0"},"_attachments":{"pkg-1.0.0.tgz":{"data":"H4sI","length":3}}}`))
+	n, err := ParseName("pkg")
+	if err != nil {
+		f.Fatal(err)
+	}
+	// Small limits keep a gzip bomb from stalling the fuzzer.
+	limits := archive.Limits{MaxBytes: 1 << 20, MaxDecompressed: 4 << 20, MaxEntries: 100}
+	dir := f.TempDir()
+	f.Fuzz(func(t *testing.T, body []byte) {
+		p, err := Inspect(bytes.NewReader(body), n, 1<<20, limits, dir)
+		if err != nil {
+			if left, _ := os.ReadDir(dir); len(left) != 0 {
+				t.Fatalf("temp files left after %v", err)
+			}
+			return
+		}
+		p.Tarball.Close()
+		os.Remove(p.Tarball.Name())
+		if !json.Valid(p.Doc) {
+			t.Fatalf("Doc is not valid JSON: %s", p.Doc)
 		}
 	})
 }
