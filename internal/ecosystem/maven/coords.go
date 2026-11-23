@@ -55,8 +55,19 @@ type Path struct {
 	Coords   Coords // artifact-level reading; Version is empty for KindArtifactMetadata
 	File     string // the file name without a checksum suffix
 	Checksum string // "", "sha1", "md5", "sha256" or "sha512"
-	Group    string // KindArtifactMetadata only: the group-level reading, Group + "." + Artifact
-	Snapshot bool   // Coords.Version ends in "-SNAPSHOT"
+}
+
+// Snapshot reports whether p's version ends in "-SNAPSHOT".
+func (p Path) Snapshot() bool { return IsSnapshot(p.Coords.Version) }
+
+// Group is the group-level reading of a KindArtifactMetadata path:
+// Coords.Group + "." + Coords.Artifact.
+func (p Path) Group() string { return p.Coords.Group + "." + p.Coords.Artifact }
+
+// Immutable reports whether p's file never changes: a release file, or a
+// timestamped SNAPSHOT file.
+func (p Path) Immutable() bool {
+	return !p.Snapshot() || !strings.HasPrefix(p.File, p.Coords.Artifact+"-"+p.Coords.Version)
 }
 
 // ParsePath parses a URL-decoded repository path (what follows "/maven/").
@@ -98,11 +109,9 @@ func parsePath(p string) (Path, error) {
 		if n >= 4 && strings.HasSuffix(segs[n-2], snapshotSfx) {
 			out.Kind = KindVersionMetadata
 			out.Coords = Coords{strings.Join(segs[:n-3], "."), segs[n-3], segs[n-2]}
-			out.Snapshot = true
 		} else {
 			out.Kind = KindArtifactMetadata
 			out.Coords = Coords{strings.Join(segs[:n-2], "."), segs[n-2], ""}
-			out.Group = strings.Join(segs[:n-1], ".")
 		}
 		return out, validate(out.Coords)
 	}
@@ -110,7 +119,6 @@ func parsePath(p string) (Path, error) {
 		return Path{}, errors.New("file path needs group, artifact, version and file")
 	}
 	out.Coords = Coords{strings.Join(segs[:n-3], "."), segs[n-3], segs[n-2]}
-	out.Snapshot = strings.HasSuffix(out.Coords.Version, snapshotSfx)
 	if err := validate(out.Coords); err != nil {
 		return Path{}, err
 	}

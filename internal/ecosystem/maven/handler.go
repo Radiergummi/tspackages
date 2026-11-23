@@ -466,7 +466,7 @@ func (h *Maven) candidates(p Path) (cands []Source, claimed bool, name string, m
 		switch {
 		case slices.ContainsFunc(s.Claims(), func(c string) bool { return Match(c, p.Coords) }):
 			art = append(art, s)
-		case slices.ContainsFunc(s.Claims(), func(c string) bool { return MatchGroup(c, p.Group) }):
+		case slices.ContainsFunc(s.Claims(), func(c string) bool { return MatchGroup(c, p.Group()) }):
 			grp = append(grp, s)
 		}
 	}
@@ -474,7 +474,7 @@ func (h *Maven) candidates(p Path) (cands []Source, claimed bool, name string, m
 	case len(art) > 0:
 		return append(art, grp...), true, key, matchKey
 	case len(grp) > 0:
-		return grp, true, strings.ToLower(p.Group), MatchGroup
+		return grp, true, strings.ToLower(p.Group()), MatchGroup
 	}
 	cands, _ = resolve.Candidates(h.sources, key, matchKey)
 	return cands, false, key, matchKey

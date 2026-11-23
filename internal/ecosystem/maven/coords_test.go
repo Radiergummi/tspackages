@@ -18,13 +18,13 @@ func TestParsePath(t *testing.T) {
 		{"com/matchory/lib/1.0/lib-1.0.jar.sha1", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0"}, File: "lib-1.0.jar", Checksum: "sha1"}},
 		{"com/matchory/lib/1.0/lib-1.0.pom.sha512", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0"}, File: "lib-1.0.pom", Checksum: "sha512"}},
 		{"Com/Matchory/Lib/1.0/Lib-1.0.jar", Path{Kind: KindFile, Coords: Coords{"Com.Matchory", "Lib", "1.0"}, File: "Lib-1.0.jar"}},
-		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.jar", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-20261123.101010-3.jar", Snapshot: true}},
-		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3-sources.jar", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-20261123.101010-3-sources.jar", Snapshot: true}},
-		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.pom", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-SNAPSHOT.pom", Snapshot: true}},
-		{"com/matchory/lib/maven-metadata.xml", Path{Kind: KindArtifactMetadata, Coords: Coords{"com.matchory", "lib", ""}, File: "maven-metadata.xml", Group: "com.matchory.lib"}},
-		{"com/matchory/lib/maven-metadata.xml.md5", Path{Kind: KindArtifactMetadata, Coords: Coords{"com.matchory", "lib", ""}, File: "maven-metadata.xml", Checksum: "md5", Group: "com.matchory.lib"}},
-		{"com/matchory/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1", Path{Kind: KindVersionMetadata, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "maven-metadata.xml", Checksum: "sha1", Snapshot: true}},
-		{"org/apache/maven/plugins/maven-metadata.xml", Path{Kind: KindArtifactMetadata, Coords: Coords{"org.apache.maven", "plugins", ""}, File: "maven-metadata.xml", Group: "org.apache.maven.plugins"}},
+		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.jar", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-20261123.101010-3.jar"}},
+		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3-sources.jar", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-20261123.101010-3-sources.jar"}},
+		{"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.pom", Path{Kind: KindFile, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "lib-1.0-SNAPSHOT.pom"}},
+		{"com/matchory/lib/maven-metadata.xml", Path{Kind: KindArtifactMetadata, Coords: Coords{"com.matchory", "lib", ""}, File: "maven-metadata.xml"}},
+		{"com/matchory/lib/maven-metadata.xml.md5", Path{Kind: KindArtifactMetadata, Coords: Coords{"com.matchory", "lib", ""}, File: "maven-metadata.xml", Checksum: "md5"}},
+		{"com/matchory/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1", Path{Kind: KindVersionMetadata, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "maven-metadata.xml", Checksum: "sha1"}},
+		{"org/apache/maven/plugins/maven-metadata.xml", Path{Kind: KindArtifactMetadata, Coords: Coords{"org.apache.maven", "plugins", ""}, File: "maven-metadata.xml"}},
 	} {
 		got, err := ParsePath(tc.in)
 		if err != nil {

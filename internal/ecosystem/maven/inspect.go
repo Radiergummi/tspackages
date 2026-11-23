@@ -11,8 +11,6 @@ import (
 )
 
 const (
-	// maxModule is the largest Gradle .module file accepted, in bytes.
-	maxModule = 1 << 20
 	// maxModuleDepth is the deepest nesting of JSON arrays and objects in a
 	// .module file.
 	maxModuleDepth = 32
@@ -211,7 +209,7 @@ func InspectPOM(r io.Reader, p Path) (POMInfo, error) {
 // hashes are not checked. Keys match exactly, as Gradle reads them.
 // Errors are *RequestError.
 func InspectModule(r io.Reader, p Path) error {
-	b, err := readUpload(r, maxModule, ".module", "1 MiB")
+	b, err := readUpload(r, maxDescriptor, ".module", "1 MiB")
 	if err != nil {
 		return err
 	}
@@ -315,7 +313,7 @@ type metadataDoc struct {
 // discarded afterwards, and returns the level its content addresses: a root
 // <artifactId> is artifact or version level and must name p.Coords' group
 // and artifact; <plugins> without <artifactId> is group level (maven-plugin
-// deploys) and a <groupId>, if any, must equal p.Group. Errors are
+// deploys) and a <groupId>, if any, must equal p.Group(). Errors are
 // *RequestError.
 func InspectMetadataUpload(r io.Reader, p Path) (MetadataLevel, error) {
 	const what = "maven-metadata.xml"
@@ -352,7 +350,7 @@ func InspectMetadataUpload(r io.Reader, p Path) (MetadataLevel, error) {
 			return 0, badRequest("group-level maven-metadata.xml is not accepted in a version directory")
 		}
 		if len(doc.GroupID) > 0 {
-			if err := matchField(what, "groupId", group, p.Group); err != nil {
+			if err := matchField(what, "groupId", group, p.Group()); err != nil {
 				return 0, err
 			}
 		}

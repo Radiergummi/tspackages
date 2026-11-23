@@ -120,25 +120,18 @@ func (s *RegistrySource) digestsKey(sha1Hex string) string {
 	return "maven/" + s.name + "/digests/sha1-" + sha1Hex + ".json"
 }
 
-// mapping is a file path's cached lookup: the SHA-1 its upstream declares and
-// the relay key of its bytes, or Miss when neither it nor its .sha1 exist.
+// mapping is a file path's cached lookup: the SHA-1 its upstream declares
+// (its bytes are at filesKey(SHA1)), or Miss when neither it nor its .sha1
+// exist.
 type mapping struct {
 	SHA1 string `json:"sha1,omitempty"`
-	Key  string `json:"key,omitempty"`
 	Miss bool   `json:"miss,omitempty"`
 }
 
 // digestsObject is what the cache holds about a file's verified bytes.
 type digestsObject struct {
-	SHA1     string    `json:"sha1"`
-	SHA256   string    `json:"sha256"`
-	SHA512   string    `json:"sha512"`
-	MD5      string    `json:"md5"`
+	Digests
 	Modified time.Time `json:"modified,omitzero"`
-}
-
-func (d digestsObject) digests() Digests {
-	return Digests{SHA1: d.SHA1, SHA256: d.SHA256, SHA512: d.SHA512, MD5: d.MD5}
 }
 
 // File serves p: verified through the relay when the upstream declares a
@@ -161,9 +154,9 @@ func (s *RegistrySource) Digests(ctx context.Context, p Path) (Digests, error) {
 	if err != nil {
 		return Digests{}, err
 	}
-	if m.Key != "" {
+	if m.SHA1 != "" {
 		if d, ok := s.readDigests(ctx, m.SHA1); ok {
-			return d.digests(), nil
+			return d.Digests, nil
 		}
 	}
 	f, err := s.open(ctx, p, m)
@@ -179,7 +172,7 @@ func (s *RegistrySource) Digests(ctx context.Context, p Path) (Digests, error) {
 	// Only bytes the relay verified are recorded; an unchecked signature's
 	// digests are answered and forgotten.
 	if f.Digests.SHA1 != "" {
-		if err := s.writeDigests(ctx, digestsObject{SHA1: d.SHA1, SHA256: d.SHA256, SHA512: d.SHA512, MD5: d.MD5, Modified: f.Modified}); err != nil {
+		if err := s.writeDigests(ctx, digestsObject{Digests: d, Modified: f.Modified}); err != nil {
 			s.log.Warn("cache maven digests", "source", s.name, "file", p.File, "error", err)
 		}
 	}
@@ -193,7 +186,6 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 		return s.openUnchecked(ctx, p)
 	}
 	rawURL := s.upstreamURL(p)
-	immutable := !p.Snapshot || !strings.HasPrefix(p.File, p.Coords.Artifact+"-"+p.Coords.Version)
 	md := md5.New() //nolint:gosec // see the md5 import
 	var modified time.Time
 	fetch := func(ctx context.Context) (io.ReadCloser, int64, error) {
@@ -231,15 +223,15 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: res.SHA512, MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
 		})
 	}
-	body, size, hit, err := s.relay.Open(ctx, m.Key, relay.Digest{SHA1: m.SHA1}, fetch, onCommit)
+	body, size, hit, err := s.relay.Open(ctx, s.filesKey(m.SHA1), relay.Digest{SHA1: m.SHA1}, fetch, onCommit)
 	if err != nil {
 		return File{}, err
 	}
-	f := File{Body: body, Size: size, Digests: Digests{SHA1: m.SHA1}, Modified: modified, Immutable: immutable}
+	f := File{Body: body, Size: size, Digests: Digests{SHA1: m.SHA1}, Modified: modified, Immutable: p.Immutable()}
 	if hit {
 		metrics.ObserveCacheHit(ecoName, s.name)
 		if d, ok := s.readDigests(ctx, m.SHA1); ok {
-			f.Digests, f.Modified = d.digests(), d.Modified
+			f.Digests, f.Modified = d.Digests, d.Modified
 		}
 	}
 	return f, nil
@@ -282,7 +274,7 @@ func (s *RegistrySource) openUnchecked(ctx context.Context, p Path) (File, error
 func (s *RegistrySource) lookup(ctx context.Context, p Path) (mapping, error) {
 	key := s.pathKey("paths", p) + ".json"
 	cached, written, have := s.readMapping(ctx, key)
-	permanent := have && cached.SHA1 != "" && !p.Snapshot
+	permanent := have && cached.SHA1 != "" && !p.Snapshot()
 	if !have || (!permanent && s.now().Sub(written) >= s.ttl) {
 		m, err := flight.Do(ctx, &s.mapFlight, key, func() (mapping, error) {
 			return s.refreshMapping(ctx, p, have)
@@ -311,7 +303,7 @@ func (s *RegistrySource) readMapping(ctx context.Context, key string) (mapping, 
 	}
 	defer rc.Close()
 	var m mapping
-	if json.NewDecoder(io.LimitReader(rc, maxChecksumFile)).Decode(&m) != nil || (!m.Miss && m.Key != s.filesKey(m.SHA1)) {
+	if json.NewDecoder(io.LimitReader(rc, maxChecksumFile)).Decode(&m) != nil || (!m.Miss && m.SHA1 == "") {
 		return mapping{}, time.Time{}, false
 	}
 	return m, written, true
@@ -355,7 +347,7 @@ func (s *RegistrySource) fetchMapping(ctx context.Context, p Path) (mapping, err
 	if err != nil {
 		return mapping{}, fmt.Errorf("upstream checksum of %s: %w", p.File, err)
 	}
-	m := mapping{SHA1: sha1Hex, Key: s.filesKey(sha1Hex)}
+	m := mapping{SHA1: sha1Hex}
 	return m, s.writeMapping(ctx, p, m)
 }
 
