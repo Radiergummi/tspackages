@@ -52,8 +52,14 @@ type Dist struct {
 	AttestationsProvenance json.RawMessage
 }
 
-// encString encodes s as a JSON string, leaving a leading BaseToken raw.
+// encString encodes s as a JSON string; a BaseToken in s is escaped.
 func encString(s string) []byte {
+	b, _ := json.Marshal(s)
+	return b
+}
+
+// encURL encodes a URL as a JSON string, leaving a leading BaseToken raw.
+func encURL(s string) []byte {
 	rest, hasToken := strings.CutPrefix(s, BaseToken)
 	b, _ := json.Marshal(rest)
 	if !hasToken {
@@ -73,7 +79,7 @@ func compact(raw json.RawMessage) (json.RawMessage, error) {
 func (d Dist) fields() (map[string][]byte, error) {
 	m := map[string][]byte{}
 	if d.Tarball != "" {
-		m["tarball"] = encString(d.Tarball)
+		m["tarball"] = encURL(d.Tarball)
 	}
 	if d.Integrity != "" {
 		m["integrity"], _ = json.Marshal(d.Integrity)
@@ -98,7 +104,7 @@ func (d Dist) fields() (map[string][]byte, error) {
 		m[k] = c
 	}
 	if d.AttestationsURL != "" {
-		a := append([]byte(`{"url":`), encString(d.AttestationsURL)...)
+		a := append([]byte(`{"url":`), encURL(d.AttestationsURL)...)
 		if len(d.AttestationsProvenance) > 0 {
 			c, err := compact(d.AttestationsProvenance)
 			if err != nil {
