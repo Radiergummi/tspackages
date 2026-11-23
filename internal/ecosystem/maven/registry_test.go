@@ -132,7 +132,7 @@ func newRegEnv(t *testing.T) *regEnv {
 	return e
 }
 
-func mustPath(t *testing.T, s string) Path {
+func mustPath(t testing.TB, s string) Path {
 	t.Helper()
 	p, err := ParsePath(strings.TrimPrefix(s, "/"))
 	if err != nil {

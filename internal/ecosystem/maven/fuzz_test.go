@@ -3,6 +3,7 @@ package maven
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -67,6 +68,47 @@ func FuzzParseChecksumFile(f *testing.F) {
 		}
 		if _, err := hex.DecodeString(sum); err != nil {
 			t.Fatalf("%q: not hex: %q", b, sum)
+		}
+	})
+}
+
+func FuzzInspectPOM(f *testing.F) {
+	for _, s := range []string{
+		plainPOM, pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`),
+		pom(`<parent><groupId>com.matchory</groupId><version>${revision}</version></parent><artifactId>lib</artifactId>`),
+		`<!DOCTYPE project []><project/>`,
+	} {
+		f.Add([]byte(s))
+	}
+	p := mustPath(f, "com/matchory/lib/1.0/lib-1.0.pom")
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if _, err := InspectPOM(bytes.NewReader(b), p); err != nil {
+			if _, ok := errors.AsType[*RequestError](err); !ok {
+				t.Fatalf("err = %v (%T), want *RequestError", err, err)
+			}
+		}
+	})
+}
+
+func FuzzInspectModule(f *testing.F) {
+	for _, s := range []string{
+		`{"formatVersion":"1.1","component":{"group":"com.matchory","module":"lib","version":"1.0"},"variants":[{"files":[{"url":"lib-1.0.jar"}]}]}`,
+		`{"formatVersion":"1.1","component":{"group":"com.matchory","module":"lib","version":"1.0"},"variants":[{"files":[{"url":"a/b"}]}]}`,
+		`[[[[]]]]`, `{"a":1}{}`, `null`,
+	} {
+		f.Add([]byte(s))
+	}
+	p := mustPath(f, "com/matchory/lib/1.0/lib-1.0.module")
+	f.Fuzz(func(t *testing.T, b []byte) {
+		err := InspectModule(bytes.NewReader(b), p)
+		if err == nil {
+			if !json.Valid(b) {
+				t.Fatalf("accepted invalid JSON %q", b)
+			}
+			return
+		}
+		if _, ok := errors.AsType[*RequestError](err); !ok {
+			t.Fatalf("err = %v (%T), want *RequestError", err, err)
 		}
 	})
 }
