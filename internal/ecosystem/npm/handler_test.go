@@ -31,6 +31,8 @@ const (
 	readAll  = `{"read":["npm:*"]}`
 	writeAll = `{"read":["npm:*"],"write":["npm:*"]}`
 	corgiAcc = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*"
+
+	tarballCache = "private, max-age=31536000, immutable"
 )
 
 // fakeSource serves stored documents keyed by normalised name. Full and
@@ -592,13 +594,31 @@ func TestNPMPackageTarball(t *testing.T) {
 		if w.Code != 200 || w.Body.String() != "NPM" || w.Header().Get("Content-Length") != "3" || w.Header().Get("Content-Type") != "application/octet-stream" {
 			t.Fatalf("%s: %d %v %s", path, w.Code, w.Header(), w.Body)
 		}
+		if w.Header().Get("Cache-Control") != tarballCache {
+			t.Fatalf("%s: Cache-Control %q", path, w.Header().Get("Cache-Control"))
+		}
 		if reg.lastName.Norm != "npm" || reg.lastName.Exact != "npm" || reg.lastFile != "npm-11.0.0.tgz" {
 			t.Fatalf("%s: Tarball(%+v, %q)", path, reg.lastName, reg.lastFile)
 		}
 	}
 	w := do(h, "HEAD", "/npm/left-pad/-/left-pad-1.0.0.tgz", nil)
-	if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "3" {
+	if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != "3" || w.Header().Get("Cache-Control") != tarballCache {
 		t.Fatalf("HEAD tarball: %d %v", w.Code, w.Header())
+	}
+	// Errors on the tarball route are not cacheable.
+	if w := do(h, "GET", "/npm/left-pad/-/left-pad-9.9.9.tgz", nil); w.Code != 404 || w.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("missing tarball: %d %q", w.Code, w.Header().Get("Cache-Control"))
+	}
+	reg.err = errors.New("boom")
+	if w := do(h, "GET", "/npm/left-pad/-/left-pad-1.0.0.tgz", nil); w.Code != 502 || w.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("failing tarball: %d %q", w.Code, w.Header().Get("Cache-Control"))
+	}
+	reg.err = nil
+	// Keys and attestations stay uncached.
+	for _, path := range []string{"/npm/-/npm/v1/keys", "/npm/-/npm/v1/attestations/left-pad@1.0.0"} {
+		if w := do(h, "GET", path, nil); w.Code != 200 || w.Header().Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("%s: %d %q", path, w.Code, w.Header().Get("Cache-Control"))
+		}
 	}
 }
 
