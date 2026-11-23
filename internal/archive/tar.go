@@ -8,27 +8,21 @@ import (
 	"strings"
 )
 
-// InspectTarGz reads a gzipped tar archive (an sdist) and rejects it as
-// InspectZip rejects a zip: more than l.MaxBytes compressed, more than
-// l.MaxEntries entries, more than l.MaxDecompressed bytes in total, a name
-// that is absolute, contains "..", a backslash or a drive prefix, is not
-// canonical or repeats another ignoring case, and any entry other than a
-// regular file or directory (symlinks, hard links, devices, FIFOs). It
-// returns the contents of the regular files want accepts.
-func InspectTarGz(r io.Reader, l Limits, want func(name string) bool) (map[string][]byte, error) {
-	return InspectTarGzFunc(r, l, want, nil)
-}
-
 // Entry is a regular file of an archive, with its size from the tar header.
 type Entry struct {
 	Name string
 	Size int64
 }
 
-// InspectTarGzFunc is InspectTarGz that also calls each, when not nil, for
-// every regular file whose name passed the checks, before want is asked
-// about it.
-func InspectTarGzFunc(r io.Reader, l Limits, want func(name string) bool, each func(Entry)) (map[string][]byte, error) {
+// InspectTarGz reads a gzipped tar archive (an sdist) and rejects it as
+// InspectZip rejects a zip: more than l.MaxBytes compressed, more than
+// l.MaxEntries entries, more than l.MaxDecompressed bytes in total, a name
+// that is absolute, contains "..", a backslash or a drive prefix, is not
+// canonical or repeats another ignoring case, and any entry other than a
+// regular file or directory (symlinks, hard links, devices, FIFOs). It asks
+// want about every regular file whose name passed the checks and returns
+// the contents of the ones it accepts.
+func InspectTarGz(r io.Reader, l Limits, want func(Entry) bool) (map[string][]byte, error) {
 	compressed := &countingReader{r: r, max: l.MaxBytes}
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
@@ -69,10 +63,7 @@ func InspectTarGzFunc(r io.Reader, l Limits, want func(name string) bool, each f
 		switch h.Typeflag {
 		case tar.TypeDir:
 		case tar.TypeReg:
-			if each != nil {
-				each(Entry{Name: h.Name, Size: h.Size})
-			}
-			if !want(h.Name) {
+			if !want(Entry{Name: h.Name, Size: h.Size}) {
 				continue // its bytes are read (and counted) by the next Next
 			}
 			b, err := io.ReadAll(tr)

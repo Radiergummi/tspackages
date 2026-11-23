@@ -469,7 +469,9 @@ type tarballInfo struct {
 
 func inspectTarball(f io.Reader, l archive.Limits) (tarballInfo, error) {
 	var t tarballInfo
-	each := func(e archive.Entry) {
+	// want sees each entry's size before its bytes are read, so an
+	// oversized package.json is never read.
+	want := func(e archive.Entry) bool {
 		t.files++
 		t.unpacked += e.Size
 		switch e.Name {
@@ -480,10 +482,9 @@ func inspectTarball(f io.Reader, l archive.Limits) (tarballInfo, error) {
 		case "package/npm-shrinkwrap.json":
 			t.shrinkwrap = true
 		}
+		return e.Name == manifestPath && e.Size <= maxManifestBytes
 	}
-	// each runs before want, so an oversized package.json is never read.
-	want := func(name string) bool { return name == manifestPath && t.manifestSize <= maxManifestBytes }
-	files, err := archive.InspectTarGzFunc(f, l, want, each)
+	files, err := archive.InspectTarGz(f, l, want)
 	if err != nil {
 		if ae, ok := errors.AsType[*archive.Error](err); ok {
 			return t, badRequest("tarball: %s", ae.Reason)

@@ -439,8 +439,8 @@ func TestPublishRouting(t *testing.T) {
 		t.Fatalf("notice: %d %q", w.Code, w.Header().Get("Npm-Notice"))
 	}
 	st.notice = ""
-	if w := put(h, "/npm/@s%2fn", "application/json", "{}"); w.Header().Values("npm-notice") != nil {
-		t.Fatalf("empty notice sent: %q", w.Header().Values("npm-notice"))
+	if w := put(h, "/npm/@s%2fn", "application/json", "{}"); w.Header().Values("Npm-Notice") != nil {
+		t.Fatalf("empty notice sent: %q", w.Header().Values("Npm-Notice"))
 	}
 
 	for _, tt := range []struct {

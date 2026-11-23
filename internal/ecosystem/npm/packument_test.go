@@ -212,6 +212,9 @@ func TestCorgiFields(t *testing.T) {
 	}
 }
 
+// distFields are the keys a rendered dist may have (spec §2).
+var distFields = []string{"tarball", "integrity", "shasum", "fileCount", "unpackedSize", "signatures", "npm-signature", "attestations"}
+
 func TestDistAllowlist(t *testing.T) {
 	obj := map[string]json.RawMessage{
 		"name": json.RawMessage(`"p"`), "version": json.RawMessage(`"1.0.0"`),

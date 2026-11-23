@@ -38,9 +38,6 @@ var corgiVersionFields = []string{
 	"license", "_hasShrinkwrap", "hasInstallScript", "bin", "deprecated", "workspaces",
 }
 
-// distFields are the keys a rendered dist may have.
-var distFields = []string{"tarball", "integrity", "shasum", "fileCount", "unpackedSize", "signatures", "npm-signature", "attestations"}
-
 // Dist is the dist object of a rendered version; zero fields are omitted.
 type Dist struct {
 	Tarball, Integrity, Shasum string
@@ -113,11 +110,6 @@ func (d Dist) fields() (map[string][]byte, error) {
 			a = append(append(a, `,"provenance":`...), c...)
 		}
 		m["attestations"] = append(a, '}')
-	}
-	for k := range m {
-		if !slices.Contains(distFields, k) {
-			delete(m, k)
-		}
 	}
 	return m, nil
 }
@@ -303,6 +295,7 @@ type expander struct {
 	w       io.Writer
 	base    []byte
 	pending []byte
+	joined  []byte // reused to join pending with the next write
 }
 
 // Expand replaces every BaseToken written through it with base. It holds at
@@ -313,7 +306,13 @@ func Expand(w io.Writer, base string) io.WriteCloser {
 }
 
 func (e *expander) Write(p []byte) (int, error) {
-	data := append(slices.Clone(e.pending), p...)
+	// Only a write following a held partial token needs joining; most
+	// writes are scanned in place.
+	data := p
+	if len(e.pending) > 0 {
+		e.joined = append(append(e.joined[:0], e.pending...), p...)
+		data = e.joined
+	}
 	tok := []byte(BaseToken)
 	for {
 		i := bytes.Index(data, tok)
