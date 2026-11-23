@@ -45,3 +45,20 @@ func FuzzParseVersion(f *testing.F) {
 		}
 	})
 }
+
+func FuzzParsePath(f *testing.F) {
+	for _, s := range []string{"@s%2fn", "@s/n/1.0.0", "%40s/n/-/n-1.0.0.tgz", "-/npm-11.0.0.tgz", "-/package/@s%2Fn/dist-tags/beta",
+		"-/npm/v1/keys", "-/npm/v1/attestations/@s/n@1.0.0", "n/-/n-1.0.0.tgz/-rev/1-abc", "-/npm/v1/security/advisories/bulk"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		r, err := ParsePath(s)
+		if err != nil || r.Kind == RouteKeys {
+			return
+		}
+		n, err := ParseName(r.Name.Exact)
+		if err != nil || n != r.Name {
+			t.Fatalf("%q: route name %+v, ParseName = %+v, %v", s, r.Name, n, err)
+		}
+	})
+}
