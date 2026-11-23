@@ -740,6 +740,39 @@ func TestTagAuditAttempts(t *testing.T) {
 	}
 }
 
+// failCommits fails the dist-tag-commit audit records only.
+type failCommits struct{ storage.Driver }
+
+func (f failCommits) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return storage.Info{}, err
+	}
+	if strings.HasPrefix(key, "audit/") && bytes.Contains(b, []byte(`"dist-tag-commit"`)) {
+		return storage.Info{}, errors.New("injected commit failure")
+	}
+	return f.Driver.PutIfAbsent(ctx, key, bytes.NewReader(b))
+}
+
+// TestTagCommitAuditFailure: once the dist-tags write stuck, a failed
+// commit record is logged, not reported: the tags moved, and a publish's
+// tag step counts as done.
+func TestTagCommitAuditFailure(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	n := mustName(t, "pkg")
+	e.src.rec = records.New(failCommits{e.recD})
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0")))
+	if _, _, err := e.d.Get(context.Background(), versionKey(n, "1.0.0", "~tagged")); err != nil {
+		t.Errorf("~tagged after a failed commit record: %v", err)
+	}
+	if err := e.src.SetTag(context.Background(), publisher, n, "beta", "1.0.0"); err != nil {
+		t.Errorf("SetTag: %v", err)
+	}
+	if tags := e.tags(t, "pkg"); tags["beta"] != "1.0.0" || tags["latest"] != "1.0.0" {
+		t.Errorf("dist-tags %v", tags)
+	}
+}
+
 func TestSetTagAuditFailure(t *testing.T) {
 	e := newStoreEnv(t, fsDriver(t))
 	n := mustName(t, "pkg")

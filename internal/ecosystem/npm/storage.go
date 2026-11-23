@@ -494,7 +494,10 @@ type tagMove struct{ Tag, Version, Previous string }
 // attempt; a lost document starts from fallbackTags, whose tags count as
 // moves too. The moves of an attempt are audited, under the attempt's ID,
 // before its write, so a failed audit leaves the tags as they were; a
-// dist-tag-commit record for the ID follows the write that sticks.
+// dist-tag-commit record for the ID follows the write that sticks. An
+// attempt without one most likely lost a concurrent write, but its moves
+// may still have taken effect (a crash or a failed commit record after
+// the write).
 func (s *StorageSource) moveTags(ctx context.Context, c identity.Caller, n Name, change func(tags map[string]string) ([]tagMove, error)) error {
 	up := records.UploaderFrom(c)
 	var attempt string // the ID of the attempt whose moves are audited
@@ -546,10 +549,11 @@ func (s *StorageSource) moveTags(ctx context.Context, c identity.Caller, n Name,
 	if attempt == "" {
 		return nil
 	}
+	// The tags moved: a failed commit record is logged, not reported, so a
+	// publish's tag step counts as done and a retry doesn't move them again.
 	if err := s.rec.PutAudit(context.WithoutCancel(ctx), records.Audit{Time: time.Now().UTC(), Action: "dist-tag-commit", Ecosystem: ecoName,
 		Package: n.Norm, Uploader: up, Attempt: attempt}); err != nil {
 		s.log.Error("npm: dist-tags written but their commit record failed", "source", s.name, "package", n.Norm, "attempt", attempt, "error", err)
-		return fmt.Errorf("record audit: %w", err)
 	}
 	return nil
 }
