@@ -264,8 +264,11 @@ tailnet. Read this before you deploy.
   bundles (`--provenance`) are stored and recorded, not served; a
   `registry` source passes `dist.attestations` and the signing keys through.
 
-Neither packuments nor publish bodies are held whole in memory: they are
-parsed as streams, one version object at a time. The caps:
+Upstream packuments and publish bodies aren't held whole in memory: they
+are parsed as streams, one version object at a time. A storage source's
+packument is rendered in memory, full and abbreviated, once per change and
+shared by concurrent reads; past 64MiB either way, reads of the package
+fail and the status page names it. The caps:
 
 | Parser | Input | Caps |
 |---|---|---|
@@ -273,6 +276,8 @@ parsed as streams, one version object at a time. The caps:
 | Versions | publish, request paths | strict SemVer 2.0.0, 156 bytes |
 | dist-tags | publish body, `npm dist-tag` | 64 bytes of `[a-z0-9._-]`, not a version or range; 100 tags per package |
 | Upstream packument | registry source | 256MiB, 200,000 versions, 4MiB per version, nesting 64, keys of 1KiB |
+| Upstream `dist-tags`, `time` | registry source | `dist-tags` 2MiB and 1,000 entries, `time` 32MiB; over either, the packument fails |
+| Storage packument | storage source | 64MiB rendered, full and abbreviated, 4MiB per version |
 | Publish body | client | `max_upload_bytes` × 4/3 + 2MiB, one version, one tarball of at most `max_upload_bytes`, a provenance bundle of at most 1MiB |
 | `package.json` | published tarball | 1MiB, nesting 64 |
 | Tarball | publish | the `archive` limits of every upload |
