@@ -1,9 +1,17 @@
 package npm
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/radiergummi/tspackages/internal/upstream"
 )
 
 func FuzzParseName(f *testing.F) {
@@ -59,6 +67,43 @@ func FuzzParsePath(f *testing.F) {
 		n, err := ParseName(r.Name.Exact)
 		if err != nil || n != r.Name {
 			t.Fatalf("%q: route name %+v, ParseName = %+v, %v", s, r.Name, n, err)
+		}
+	})
+}
+
+func FuzzPackumentStream(f *testing.F) {
+	for _, file := range []string{"packument-left-pad.json", "packument-scoped.json"} {
+		b, err := os.ReadFile(filepath.Join("testdata", file))
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add("left-pad", b)
+	}
+	f.Add("x", []byte(`{"name":"x","versions":{"1.0.0":{"name":"x","version":"1.0.0","dist":{"shasum":"`+strings.Repeat("a", 40)+`","tarball":"https://registry.npmjs.org/x/-/x-1.0.0.tgz"}}},"dist-tags":{"latest":"1.0.0"},"time":{"1.0.0":"t"}}`))
+	f.Add("x", []byte(`{"name":"x","time":{"unpublished":{}}}`))
+	c := upstream.New(upstream.Options{FetchHosts: []string{"registry.npmjs.org"}})
+	s := NewRegistrySource("fuzz", nil, "https://registry.npmjs.org/", c, nil, nil, nil, time.Minute, 1<<20, nil, nil)
+	f.Fuzz(func(t *testing.T, name string, body []byte) {
+		n, err := ParseName(name)
+		if err != nil {
+			return
+		}
+		var full, corgi, entries bytes.Buffer
+		res, err := s.build(n, bytes.NewReader(body), &full, &corgi, &entries)
+		if err != nil || res.miss {
+			return
+		}
+		for kind, b := range map[string][]byte{"full": full.Bytes(), "corgi": corgi.Bytes()} {
+			var out bytes.Buffer
+			ex := Expand(&out, "https://tsp.example/npm/")
+			ex.Write(b)
+			ex.Close()
+			if !json.Valid(out.Bytes()) {
+				t.Fatalf("%s is not valid JSON:\n%s", kind, out.Bytes())
+			}
+		}
+		if idx := append(append([]byte(`{`), entries.Bytes()...), '}'); !json.Valid(idx) {
+			t.Fatalf("file index is not valid JSON:\n%s", idx)
 		}
 	})
 }

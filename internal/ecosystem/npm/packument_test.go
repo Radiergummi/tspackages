@@ -37,7 +37,7 @@ func distFromInput(t *testing.T, name Name, version string, in map[string]json.R
 		FileCount: src.FileCount, UnpackedSize: src.UnpackedSize, Signatures: src.Signatures, NPMSignature: src.NPMSignature,
 	}
 	if src.Attestations != nil {
-		d.AttestationsURL = BaseToken + name.Exact + "/-/attestations/" + version
+		d.AttestationsURL = BaseToken + "-/npm/v1/attestations/" + name.Exact + "@" + version
 		d.AttestationsProvenance = src.Attestations.Provenance
 	}
 	return d
