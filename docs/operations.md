@@ -543,6 +543,10 @@ and `version already exists`, also with `--force`. A publish under the
 leaves `latest` where it was, and npm prints `latest stayed at <version>`.
 `npm dist-tag add` and `rm` work on names a `storage` source serves; `latest`
 can't be removed. `npm deprecate` and `npm unpublish` fail with `E405`.
+Each tag move is audited as a `dist-tag` record before it's written, with
+an `attempt` ID; a `dist-tag-commit` record with the same ID follows once
+the write took effect. `dist-tag` records whose attempt has no commit
+lost a concurrent write and changed nothing.
 
 `npm publish --provenance` works where npm can get an OIDC token (GitHub
 Actions with `id-token: write`). The bundle is stored and recorded in the
