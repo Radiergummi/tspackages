@@ -47,7 +47,7 @@ type Provenance struct {
 	UpstreamURL    string    `json:"upstream_url,omitempty"`
 	Remote         string    `json:"remote,omitempty"`
 	Commit         string    `json:"commit,omitempty"`
-	DeclaredDigest string    `json:"declared_digest,omitempty"` // "sha1:…", "sha256:…" or ""
+	DeclaredDigest string    `json:"declared_digest,omitempty"` // "sha1:…", "sha256:…", "sha512:…" or ""
 	SHA1           string    `json:"sha1,omitempty"`
 	SHA256         string    `json:"sha256"`
 	Uploader       *Uploader `json:"uploader,omitempty"`
@@ -60,7 +60,7 @@ type Provenance struct {
 // Audit records one write action.
 type Audit struct {
 	Time      time.Time `json:"time"`
-	Action    string    `json:"action"` // "publish"
+	Action    string    `json:"action"` // "publish" or "dist-tag"
 	Ecosystem string    `json:"ecosystem"`
 	Package   string    `json:"package"`
 	Version   string    `json:"version"`
@@ -69,6 +69,10 @@ type Audit struct {
 	// Attestation is the identity of a verified attestation (e.g. a Sigstore
 	// certificate identity); empty when none.
 	Attestation string `json:"attestation,omitempty"`
+	// Tag and Previous are set on "dist-tag" records: the tag moved to Version
+	// and the version it pointed at before ("" if it was new).
+	Tag      string `json:"tag,omitempty"`
+	Previous string `json:"previous,omitempty"`
 }
 
 type Store struct{ d storage.Driver }

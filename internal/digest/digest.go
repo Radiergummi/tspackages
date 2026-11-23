@@ -4,8 +4,10 @@ package digest
 import (
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"slices"
+	"strings"
 )
 
 // Of returns the lowercase hex SHA-1 and SHA-256 of b.
@@ -25,4 +27,40 @@ func IsHex(s string, lens ...int) bool {
 		}
 	}
 	return true
+}
+
+// ParseIntegrity picks the strongest supported digest of a Subresource
+// Integrity string (npm's "integrity"): a space-separated list of
+// "<algo>-<base64>" entries with optional "?options". It prefers sha512 over
+// sha1 and ignores other algorithms and malformed entries. The digest is
+// returned as lowercase hex.
+func ParseIntegrity(s string) (algo, hexDigest string, ok bool) {
+	if len(s) > 1024 {
+		return "", "", false
+	}
+	for entry := range strings.FieldsSeq(s) {
+		a, b64, found := strings.Cut(entry, "-")
+		if !found {
+			continue
+		}
+		b64, _, _ = strings.Cut(b64, "?")
+		var size int
+		switch a {
+		case "sha512":
+			size = 64
+		case "sha1":
+			size = 20
+		default:
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil || len(raw) != size {
+			continue
+		}
+		if a == "sha512" {
+			return a, hex.EncodeToString(raw), true
+		}
+		algo, hexDigest, ok = a, hex.EncodeToString(raw), true
+	}
+	return algo, hexDigest, ok
 }
