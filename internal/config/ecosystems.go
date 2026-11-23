@@ -47,6 +47,13 @@ var ecosystems = map[string]ecosystemRules{
 		overlap:    goClaimsOverlap,
 		source:     goSource,
 	},
+	"maven": {
+		types:      []string{"registry", "storage"},
+		validClaim: func(c string) bool { return validClaim("maven", c) },
+		hint:       `use "*", "<group>" or "<group>:<artifact>" in lowercase; a group is dotted [a-z0-9_-] segments and may end in ".*"`,
+		overlap:    func(a, b string) bool { return claimsOverlap("maven", a, b) },
+		source:     mavenSource,
+	},
 	"npm": {
 		types:      []string{"registry", "storage"},
 		validClaim: func(c string) bool { return validClaim("npm", c) },
@@ -115,6 +122,24 @@ func npmSource(s Source, _ []Source, _ ValidateOptions, add func(string, ...any)
 	}
 	if len(s.Modules) > 0 {
 		add("modules is not supported for npm")
+	}
+}
+
+func mavenSource(s Source, _ []Source, _ ValidateOptions, add func(string, ...any)) {
+	if s.Type == "registry" && s.URL != "" && !strings.HasSuffix(s.URL, "/") {
+		add("url %q must end in a trailing /", s.URL)
+	}
+	if len(s.Remotes) > 0 {
+		add("remotes is not supported for maven")
+	}
+	if len(s.Branches) > 0 {
+		add("branches is not supported for maven")
+	}
+	if len(s.Tags) > 0 {
+		add("tags is not supported for maven")
+	}
+	if len(s.Modules) > 0 {
+		add("modules is not supported for maven")
 	}
 }
 
