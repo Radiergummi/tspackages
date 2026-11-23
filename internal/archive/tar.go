@@ -16,6 +16,19 @@ import (
 // regular file or directory (symlinks, hard links, devices, FIFOs). It
 // returns the contents of the regular files want accepts.
 func InspectTarGz(r io.Reader, l Limits, want func(name string) bool) (map[string][]byte, error) {
+	return InspectTarGzFunc(r, l, want, nil)
+}
+
+// Entry is a regular file of an archive, with its size from the tar header.
+type Entry struct {
+	Name string
+	Size int64
+}
+
+// InspectTarGzFunc is InspectTarGz that also calls each, when not nil, for
+// every regular file whose name passed the checks, before want is asked
+// about it.
+func InspectTarGzFunc(r io.Reader, l Limits, want func(name string) bool, each func(Entry)) (map[string][]byte, error) {
 	compressed := &countingReader{r: r, max: l.MaxBytes}
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
@@ -56,6 +69,9 @@ func InspectTarGz(r io.Reader, l Limits, want func(name string) bool) (map[strin
 		switch h.Typeflag {
 		case tar.TypeDir:
 		case tar.TypeReg:
+			if each != nil {
+				each(Entry{Name: h.Name, Size: h.Size})
+			}
 			if !want(h.Name) {
 				continue // its bytes are read (and counted) by the next Next
 			}
