@@ -118,3 +118,22 @@ func TestSegmentCap(t *testing.T) {
 		t.Error("65 canonical segments accepted")
 	}
 }
+
+func TestImmutable(t *testing.T) {
+	for path, want := range map[string]bool{
+		"com/matchory/lib/1.0/lib-1.0.jar":                                 true,
+		"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.jar":      true,
+		"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar":               false,
+		"com/matchory/lib/1.0-SNAPSHOT/maven-metadata.xml":                 false,
+		"com/matchory/lib/maven-metadata.xml":                              false,
+		"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.jar.sha1": true,
+	} {
+		p, err := ParsePath(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.Immutable(); got != want {
+			t.Errorf("%s: Immutable() = %v, want %v", path, got, want)
+		}
+	}
+}

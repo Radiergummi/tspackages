@@ -38,24 +38,29 @@ type fakeRepo struct {
 	srv    *httptest.Server
 	mu     sync.Mutex
 	bodies map[string]string
-	status int // when not 0, every request answers it
+	mods   map[string]time.Time // Last-Modified by path; upModified when unset
+	status int                  // when not 0, every request answers it
 	paths  []string
 }
 
 func newFakeRepo(t *testing.T) *fakeRepo {
 	t.Helper()
-	f := &fakeRepo{bodies: map[string]string{}}
+	f := &fakeRepo{bodies: map[string]string{}, mods: map[string]time.Time{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.paths = append(f.paths, r.Method+" "+r.URL.EscapedPath())
 		status := f.status
 		body, ok := f.bodies[r.URL.EscapedPath()]
+		mod, set := f.mods[r.URL.EscapedPath()]
 		f.mu.Unlock()
+		if !set {
+			mod = upModified
+		}
 		switch {
 		case status != 0:
 			http.Error(w, "down", status)
 		case ok:
-			w.Header().Set("Last-Modified", upModified.Format(http.TimeFormat))
+			w.Header().Set("Last-Modified", mod.Format(http.TimeFormat))
 			io.WriteString(w, body)
 		default:
 			http.NotFound(w, r)
@@ -203,7 +208,7 @@ func TestFileVerifiedAndCached(t *testing.T) {
 		prov.DeclaredDigest != "sha1:"+want.SHA1 || prov.SHA1 != want.SHA1 || prov.UpstreamURL != e.up.srv.URL+upJar {
 		t.Fatalf("provenance = %+v", prov)
 	}
-	if keys := e.keys(t, "maven/central/digests/"); !slices.Equal(keys, []string{"maven/central/digests/sha1-" + want.SHA1 + ".json"}) {
+	if keys := e.keys(t, "maven/central/digests/"); !slices.Equal(keys, []string{e.src.digestsKey(mustPath(t, upJar), want.SHA1)}) {
 		t.Fatalf("digests objects = %v", keys)
 	}
 
@@ -524,6 +529,71 @@ func TestChangedIdenticalFiles(t *testing.T) {
 	}
 }
 
+// TestModifiedPerFile: files with the same bytes keep their own
+// Last-Modified on cache hits.
+func TestModifiedPerFile(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	a, b := "/com/matchory/lib/1.0/lib-1.0-sources.jar", "/com/matchory/lib/1.0/lib-1.0-javadoc.jar"
+	modA, modB := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	for f, mod := range map[string]time.Time{a: modA, b: modB} {
+		e.up.set(f, jarData)
+		e.up.set(f+".sha1", sha1Hex(jarData))
+		e.up.mu.Lock()
+		e.up.mods[f] = mod
+		e.up.mu.Unlock()
+	}
+	for _, f := range []string{a, b} {
+		if _, err := readFile(e.src.File(ctx, mustPath(t, f))); err != nil {
+			t.Fatal(err)
+		}
+		e.relay.Wait()
+	}
+	f, err := e.src.File(ctx, mustPath(t, a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Body.Close()
+	if !f.Modified.Equal(modA) {
+		t.Errorf("cache hit of %s: Modified %v, want %v", a, f.Modified, modA)
+	}
+}
+
+// TestSnapshotFilesFromRegistry: a timestamped SNAPSHOT file's checksum is
+// kept for good, as it is served immutable; a non-timestamped one that
+// changes upstream is refreshed and not reported as changed.
+func TestSnapshotFilesFromRegistry(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	stamped := "/com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-1.jar"
+	plain := "/com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar"
+	for _, f := range []string{stamped, plain} {
+		e.up.set(f, jarData)
+		e.up.set(f+".sha1", sha1Hex(jarData))
+		if _, err := readFile(e.src.File(ctx, mustPath(t, f))); err != nil {
+			t.Fatal(err)
+		}
+		e.relay.Wait()
+	}
+	rebuilt := jarData + " rebuilt"
+	e.up.set(plain, rebuilt)
+	e.up.set(plain+".sha1", sha1Hex(rebuilt))
+	e.clock = e.clock.Add(2 * time.Minute)
+	if _, err := readFile(e.src.File(ctx, mustPath(t, stamped))); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.up.count(stamped + ".sha1"); n != 1 {
+		t.Errorf("timestamped .sha1 fetched %d times, want 1", n)
+	}
+	if b, err := readFile(e.src.File(ctx, mustPath(t, plain))); err != nil || string(b) != rebuilt {
+		t.Fatalf("plain SNAPSHOT: %q, %v", b, err)
+	}
+	e.relay.Wait()
+	if got := e.src.Changed(); len(got) != 0 {
+		t.Errorf("changed = %+v, want none", got)
+	}
+}
+
 // TestUpstreamURLEscaped: every segment of an upstream request path is
 // escaped, so "?", "#" and "%" in a version stay part of the path.
 func TestUpstreamURLEscaped(t *testing.T) {
@@ -557,11 +627,11 @@ func TestUpstreamURLEscaped(t *testing.T) {
 }
 
 // TestReleaseChecksumPermanent: a release file's .sha1 is fetched once;
-// a SNAPSHOT file's is refreshed after the TTL.
+// a non-timestamped SNAPSHOT file's is refreshed after the TTL.
 func TestReleaseChecksumPermanent(t *testing.T) {
 	e := newRegEnv(t)
 	ctx := context.Background()
-	snapJar := "/com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-1.jar"
+	snapJar := "/com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar"
 	for _, path := range []string{upJar, snapJar} {
 		e.up.set(path, jarData)
 		e.up.set(path+".sha1", sha1Hex(jarData))

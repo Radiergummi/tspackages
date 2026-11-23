@@ -303,8 +303,9 @@ fail and the status page names it. The caps:
   and metadata alike. A `maven-metadata.xml` path names either an
   artifact (`com/acme/lib`: `com.acme:lib`) or a group (`com.acme.lib`);
   it counts as claimed when either reading matches a claim. Group-level
-  metadata lists a group's plugins, so reading it needs a rule without an
-  artifact (`maven:com.acme.lib`, `maven:com.acme.*`); when both readings
+  metadata lists a group's plugins, so reading it needs a rule for the
+  whole group (`maven:com.acme.lib`, `maven:com.acme.lib:*`,
+  `maven:com.acme.*`); when both readings
   are claimed, the group level's sources are asked only for a caller that
   may read the group too. Upstream URLs are built only from a parsed and
   re-serialized path.

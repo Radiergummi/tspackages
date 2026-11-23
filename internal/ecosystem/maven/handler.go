@@ -487,7 +487,8 @@ func (h *Maven) candidates(p Path, rules []authz.Rule, action authz.Action) (can
 }
 
 // groupRule is the matcher of rules for group-level metadata. Reading it
-// lists a group's plugins, so only a rule without an artifact grants it.
+// lists a group's plugins, so only a rule for the whole group ("<group>" or
+// "<group>:*") grants it.
 // Writing it accepts any rule whose group matches: a maven-plugin deploy
 // uploads it, and the upload is checked and discarded.
 func groupRule(action authz.Action) authz.Matcher {
@@ -495,7 +496,8 @@ func groupRule(action authz.Action) authz.Matcher {
 		return MatchGroup
 	}
 	return func(pattern, group string) bool {
-		return !strings.Contains(pattern, ":") && MatchGroup(pattern, group)
+		_, artifact, has := strings.Cut(pattern, ":")
+		return (!has || artifact == "*") && MatchGroup(pattern, group)
 	}
 }
 

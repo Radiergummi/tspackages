@@ -64,10 +64,10 @@ func (p Path) Snapshot() bool { return IsSnapshot(p.Coords.Version) }
 // Coords.Group + "." + Coords.Artifact.
 func (p Path) Group() string { return p.Coords.Group + "." + p.Coords.Artifact }
 
-// Immutable reports whether p's file never changes: a release file, or a
-// timestamped SNAPSHOT file.
+// Immutable reports whether p is a file that never changes: a release file,
+// or a timestamped SNAPSHOT file. Metadata is never immutable.
 func (p Path) Immutable() bool {
-	return !p.Snapshot() || !strings.HasPrefix(p.File, p.Coords.Artifact+"-"+p.Coords.Version)
+	return p.Kind == KindFile && (!p.Snapshot() || !strings.HasPrefix(p.File, p.Coords.Artifact+"-"+p.Coords.Version))
 }
 
 // ParsePath parses a URL-decoded repository path (what follows "/maven/").

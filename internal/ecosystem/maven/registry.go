@@ -117,8 +117,10 @@ func (s *RegistrySource) pathKey(dir string, p Path) string {
 	return "maven/" + s.name + "/" + dir + "/" + hex.EncodeToString(sum[:])
 }
 
-func (s *RegistrySource) digestsKey(sha1Hex string) string {
-	return "maven/" + s.name + "/digests/sha1-" + sha1Hex + ".json"
+// digestsKey is the key of the digests object of p's bytes with sha1Hex. It
+// is per file, as relay keys are: Modified is the file's own.
+func (s *RegistrySource) digestsKey(p Path, sha1Hex string) string {
+	return s.pathKey("digests", p) + "-sha1-" + sha1Hex + ".json"
 }
 
 // mapping is a file path's cached lookup: the SHA-1 its upstream declares
@@ -156,7 +158,7 @@ func (s *RegistrySource) Digests(ctx context.Context, p Path) (Digests, error) {
 		return Digests{}, err
 	}
 	if m.SHA1 != "" {
-		if d, ok := s.readDigests(ctx, m.SHA1); ok {
+		if d, ok := s.readDigests(ctx, p, m.SHA1); ok {
 			return d.Digests, nil
 		}
 	}
@@ -173,7 +175,7 @@ func (s *RegistrySource) Digests(ctx context.Context, p Path) (Digests, error) {
 	// Only bytes the relay verified are recorded; an unchecked signature's
 	// digests are answered and forgotten.
 	if f.Digests.SHA1 != "" {
-		if err := s.writeDigests(ctx, digestsObject{Digests: d, Modified: f.Modified}); err != nil {
+		if err := s.writeDigests(ctx, p, digestsObject{Digests: d, Modified: f.Modified}); err != nil {
 			s.log.Warn("cache maven digests", "source", s.name, "file", p.File, "error", err)
 		}
 	}
@@ -211,8 +213,11 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 			s.log.Warn("maven coordinates too long for a provenance record; not recorded", "source", s.name,
 				"package", pkg, "version", p.Coords.Version, "file", p.File)
 		} else {
-			if err := s.checkChanged(ctx, pkg, p.Coords.Version, p.File, res.SHA256); err != nil {
-				return err
+			// A non-timestamped SNAPSHOT file changes by design.
+			if p.Immutable() {
+				if err := s.checkChanged(ctx, pkg, p.Coords.Version, p.File, res.SHA256); err != nil {
+					return err
+				}
 			}
 			if err := s.rec.PutProvenance(ctx, records.Provenance{
 				Ecosystem: ecoName, Package: pkg, Version: p.Coords.Version, File: p.File, Source: s.name, SourceType: "registry",
@@ -221,7 +226,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 				return fmt.Errorf("record provenance: %w", err)
 			}
 		}
-		return s.writeDigests(ctx, digestsObject{
+		return s.writeDigests(ctx, p, digestsObject{
 			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: hex.EncodeToString(h512.Sum(nil)), MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
 		})
 	}
@@ -232,7 +237,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 	f := File{Body: body, Size: size, Digests: Digests{SHA1: m.SHA1}, Modified: modified, Immutable: p.Immutable()}
 	if hit {
 		metrics.ObserveCacheHit(ecoName, s.name)
-		if d, ok := s.readDigests(ctx, m.SHA1); ok {
+		if d, ok := s.readDigests(ctx, p, m.SHA1); ok {
 			f.Digests, f.Modified = d.Digests, d.Modified
 		}
 	}
@@ -276,7 +281,7 @@ func (s *RegistrySource) openUnchecked(ctx context.Context, p Path) (File, error
 func (s *RegistrySource) lookup(ctx context.Context, p Path) (mapping, error) {
 	key := s.pathKey("paths", p) + ".json"
 	cached, written, have := s.readMapping(ctx, key)
-	permanent := have && cached.SHA1 != "" && !p.Snapshot()
+	permanent := have && cached.SHA1 != "" && p.Immutable()
 	if !have || (!permanent && s.now().Sub(written) >= s.ttl) {
 		m, err := flight.Do(ctx, &s.mapFlight, key, func() (mapping, error) {
 			return s.refreshMapping(ctx, p, have)
@@ -356,8 +361,8 @@ func (s *RegistrySource) fetchMapping(ctx context.Context, p Path) (mapping, err
 	return m, s.writeMapping(ctx, p, m)
 }
 
-func (s *RegistrySource) readDigests(ctx context.Context, sha1Hex string) (digestsObject, bool) {
-	rc, _, err := s.cache.Get(ctx, s.digestsKey(sha1Hex))
+func (s *RegistrySource) readDigests(ctx context.Context, p Path, sha1Hex string) (digestsObject, bool) {
+	rc, _, err := s.cache.Get(ctx, s.digestsKey(p, sha1Hex))
 	if err != nil {
 		return digestsObject{}, false
 	}
@@ -369,9 +374,9 @@ func (s *RegistrySource) readDigests(ctx context.Context, sha1Hex string) (diges
 	return d, true
 }
 
-func (s *RegistrySource) writeDigests(ctx context.Context, d digestsObject) error {
+func (s *RegistrySource) writeDigests(ctx context.Context, p Path, d digestsObject) error {
 	b, _ := json.Marshal(d)
-	if err := s.cache.Put(ctx, s.digestsKey(d.SHA1), bytes.NewReader(b)); err != nil {
+	if err := s.cache.Put(ctx, s.digestsKey(p, d.SHA1), bytes.NewReader(b)); err != nil {
 		return fmt.Errorf("cache maven digests: %w", err)
 	}
 	return nil
