@@ -407,6 +407,11 @@ func TestClaimsBothReadings(t *testing.T) {
 	if w := do(h, "GET", plugins, nil); w.Code != 403 {
 		t.Fatalf("artifact rule on its own group: %d %s", w.Code, w.Body)
 	}
+	// Every artifact of the group ("g:*") covers its group-level metadata.
+	h = server(t, []Source{st, reg}, `{"read":["maven:com.matchory.plugins:*"]}`)
+	if w := do(h, "GET", plugins, nil); w.Code != 404 {
+		t.Fatalf("g:* rule on its group: %d %s", w.Code, w.Body)
+	}
 
 	// With both readings claimed, a caller allowed only the artifact level
 	// is answered by its sources alone; the group level's are not asked.

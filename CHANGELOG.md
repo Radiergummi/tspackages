@@ -22,8 +22,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `registry` for `registry.npmjs.org` pass-through. Clients need only `registry=` and a placeholder
   `_authToken` in `.npmrc`; lockfiles written against registry.npmjs.org
   install unchanged. Unpublish and deprecate answer `405`, and `npm audit`
-  gets `404` so private names never reach registry.npmjs.org. The status
-  page lists the `.npmrc` settings and upstream tarballs that changed.
+  gets `404` so private names never reach registry.npmjs.org. Each
+  dist-tag move is audited before it's written, with an `attempt` ID that
+  a `dist-tag-commit` record confirms once the write took effect. The
+  status page lists the `.npmrc` settings and upstream tarballs that
+  changed.
 - The relay verifies SHA-512 digests: npm tarballs from a `registry`
   source are checked against the declared `integrity` (SHA-512, or SHA-1
   for old versions that declare nothing else) before they are cached.
@@ -36,10 +39,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   files, and checks uploaded checksums and POM coordinates; and `registry`
   for Maven Central pass-through, whose files are checked against the
   upstream's `.sha1` before they are cached (a release file's `.sha1` is
-  fetched once). Clients need one mirror and
-  no `<server>` entry or `credentials`. The status page lists the
+  fetched once, as is a timestamped SNAPSHOT file's). Clients need one
+  mirror and no `<server>` entry or `credentials`. Reading group-level
+  `maven-metadata.xml` (a group's plugin list) needs a rule for the whole
+  group, `maven:<group>` or `maven:<group>:*`. The status page lists the
   `settings.xml`, `distributionManagement` and Gradle settings, and
-  upstream files that changed.
+  upstream release and timestamped files that changed.
 
 ### Changed
 
