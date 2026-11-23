@@ -82,7 +82,7 @@ func FuzzPackumentStream(f *testing.F) {
 	f.Add("x", []byte(`{"name":"x","versions":{"1.0.0":{"name":"x","version":"1.0.0","dist":{"shasum":"`+strings.Repeat("a", 40)+`","tarball":"https://registry.npmjs.org/x/-/x-1.0.0.tgz"}}},"dist-tags":{"latest":"1.0.0"},"time":{"1.0.0":"t"}}`))
 	f.Add("x", []byte(`{"name":"x","time":{"unpublished":{}}}`))
 	c := upstream.New(upstream.Options{FetchHosts: []string{"registry.npmjs.org"}})
-	s := NewRegistrySource("fuzz", nil, "https://registry.npmjs.org/", c, nil, nil, nil, time.Minute, 1<<20, nil, nil)
+	s := NewRegistrySource("fuzz", nil, "https://registry.npmjs.org/", c, nil, nil, nil, time.Minute, 1<<20, nil, f.TempDir(), nil)
 	f.Fuzz(func(t *testing.T, name string, body []byte) {
 		n, err := ParseName(name)
 		if err != nil {

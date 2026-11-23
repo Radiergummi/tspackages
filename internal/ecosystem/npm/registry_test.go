@@ -107,6 +107,16 @@ type npmEnv struct {
 	relay *relay.Relay
 	rec   *records.Store
 	clock time.Time
+	tmp   string // the source's tmpDir
+}
+
+// wantTmpEmpty fails t when a refresh left files in the source's tmpDir.
+func (e *npmEnv) wantTmpEmpty(t *testing.T) {
+	t.Helper()
+	ents, err := os.ReadDir(e.tmp)
+	if err != nil || len(ents) != 0 {
+		t.Fatalf("tmpDir holds %v (%v)", ents, err)
+	}
 }
 
 func newNPMEnv(t *testing.T) *npmEnv {
@@ -131,8 +141,9 @@ func newNPMEnv(t *testing.T) *npmEnv {
 	}
 	rec := records.New(sd)
 	c := upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1", "registry.npmjs.org"}, AllowPrivateForTesting: true})
-	e := &npmEnv{up: up, cache: cache, relay: rl, rec: rec, clock: time.Now()}
-	e.src = NewRegistrySource("npmjs", []string{"*"}, up.srv.URL+"/", c, cache, rl, rec, time.Minute, 1<<20, nil, slog.New(slog.DiscardHandler))
+	tmp := t.TempDir()
+	e := &npmEnv{up: up, cache: cache, relay: rl, rec: rec, clock: time.Now(), tmp: tmp}
+	e.src = NewRegistrySource("npmjs", []string{"*"}, up.srv.URL+"/", c, cache, rl, rec, time.Minute, 1<<20, nil, tmp, slog.New(slog.DiscardHandler))
 	e.src.now = func() time.Time { return e.clock }
 	return e
 }
@@ -707,4 +718,28 @@ func TestAttestationsRewritten(t *testing.T) {
 			t.Errorf("%s: %v", version, err)
 		}
 	}
+}
+
+func TestRefreshLeavesTmpDirEmpty(t *testing.T) {
+	e := newNPMEnv(t)
+	e.up.set("/left-pad", packument("left-pad", nil, nil, e.version("left-pad", "1.0.0", "left-pad-1.0.0.tgz", []byte("A"))))
+	readDoc(t)(e.src.Packument(context.Background(), mustName(t, "left-pad"), false))
+	e.wantTmpEmpty(t)
+
+	chunk := bytes.Repeat([]byte("x"), 1<<20)
+	e.up.handle("/huge", serveStream(func(w io.Writer) {
+		io.WriteString(w, `{"name":"huge","readme":"`)
+		for range maxPackumentBytes>>20 + 1 {
+			w.Write(chunk)
+		}
+		io.WriteString(w, `"}`)
+	}))
+	_, err := e.src.Packument(context.Background(), mustName(t, "huge"), false)
+	wantBadGateway(t, "oversized packument", err)
+	e.wantTmpEmpty(t)
+
+	e.up.set("/bad", []byte(`{"name":"bad","versions":{"1.0.0":`))
+	_, err = e.src.Packument(context.Background(), mustName(t, "bad"), false)
+	wantBadGateway(t, "truncated packument", err)
+	e.wantTmpEmpty(t)
 }
