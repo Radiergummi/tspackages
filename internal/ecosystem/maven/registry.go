@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/md5" //nolint:gosec // MD5 is one of the checksums Maven clients request, not a security digest
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -186,7 +187,8 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 		return s.openUnchecked(ctx, p)
 	}
 	rawURL := s.upstreamURL(p)
-	md := md5.New() //nolint:gosec // see the md5 import
+	// The relay hashes SHA-1 and SHA-256; MD5 and SHA-512 are hashed here.
+	md, h512 := md5.New(), sha512.New() //nolint:gosec // see the md5 import
 	var modified time.Time
 	fetch := func(ctx context.Context) (io.ReadCloser, int64, error) {
 		body, size, mod, err := s.get(ctx, rawURL, s.maxArtifact)
@@ -198,7 +200,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 			return nil, 0, err
 		}
 		modified = mod
-		return teeBody{io.TeeReader(body, md), body}, size, nil
+		return teeBody{io.TeeReader(body, io.MultiWriter(md, h512)), body}, size, nil
 	}
 	onCommit := func(ctx context.Context, res relay.Result) error {
 		pkg := p.Coords.Group + ":" + p.Coords.Artifact
@@ -220,7 +222,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 			}
 		}
 		return s.writeDigests(ctx, digestsObject{
-			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: res.SHA512, MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
+			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: hex.EncodeToString(h512.Sum(nil)), MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
 		})
 	}
 	body, size, hit, err := s.relay.Open(ctx, s.filesKey(p, m.SHA1), relay.Digest{SHA1: m.SHA1}, fetch, onCommit)

@@ -29,7 +29,8 @@ import (
 // checked.
 type Digest struct{ SHA1, SHA256, SHA512 string }
 
-// Result is what a completed download observed.
+// Result is what a completed download observed. SHA512 is computed only
+// when the download's Digest declares one.
 type Result struct {
 	SHA1, SHA256, SHA512 string
 	Size                 int64
@@ -295,7 +296,7 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	close(dl.ready)
 
 	path := dl.file.Name()
-	h1, h256, h512 := sha1.New(), sha256.New(), sha512.New()
+	h1, h256, h512 := sha1.New(), sha256.New(), sha512For(want)
 	var stalled atomic.Bool
 	timer := time.AfterFunc(r.idle, func() { stalled.Store(true); cancel() })
 	res, err := dl.copy(body, h1, h256, h512, func() { timer.Reset(r.idle) })
@@ -350,8 +351,25 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	}
 }
 
-// copy writes body to the temp file and the hashes, waking readers after
-// every chunk.
+// sha512For returns a SHA-512 hash when want declares one, else nil: no
+// other caller needs it, and it is the costliest of the three.
+func sha512For(want Digest) hash.Hash {
+	if want.SHA512 == "" {
+		return nil
+	}
+	return sha512.New()
+}
+
+// sumHex is h's sum as hex, or "" for a nil h.
+func sumHex(h hash.Hash) string {
+	if h == nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// copy writes body to the temp file and the hashes (h512 may be nil),
+// waking readers after every chunk.
 func (dl *download) copy(body io.Reader, h1, h256, h512 hash.Hash, progress func()) (Result, error) {
 	buf := make([]byte, 256<<10)
 	var total int64
@@ -364,7 +382,9 @@ func (dl *download) copy(body io.Reader, h1, h256, h512 hash.Hash, progress func
 			}
 			h1.Write(buf[:n])
 			h256.Write(buf[:n])
-			h512.Write(buf[:n])
+			if h512 != nil {
+				h512.Write(buf[:n])
+			}
 			total += int64(n)
 			dl.mu.Lock()
 			dl.written = total
@@ -372,7 +392,7 @@ func (dl *download) copy(body io.Reader, h1, h256, h512 hash.Hash, progress func
 			dl.mu.Unlock()
 		}
 		if errors.Is(rerr, io.EOF) {
-			return Result{SHA1: hex.EncodeToString(h1.Sum(nil)), SHA256: hex.EncodeToString(h256.Sum(nil)), SHA512: hex.EncodeToString(h512.Sum(nil)), Size: total}, nil
+			return Result{SHA1: hex.EncodeToString(h1.Sum(nil)), SHA256: hex.EncodeToString(h256.Sum(nil)), SHA512: sumHex(h512), Size: total}, nil
 		}
 		if rerr != nil {
 			return Result{}, rerr
@@ -507,7 +527,7 @@ func (r *Relay) verifying(rc io.ReadCloser, key string, want Digest, size int64)
 	if want == (Digest{}) {
 		return rc
 	}
-	v := &verifier{rc: rc, relay: r, key: key, want: want, size: size, h1: sha1.New(), h256: sha256.New(), h512: sha512.New(), on: true}
+	v := &verifier{rc: rc, relay: r, key: key, want: want, size: size, h1: sha1.New(), h256: sha256.New(), h512: sha512For(want), on: true}
 	if _, ok := rc.(io.Seeker); ok {
 		return &seekingVerifier{v}
 	}
@@ -538,7 +558,9 @@ func (v *verifier) Read(p []byte) (int, error) {
 	n, err := v.rc.Read(p)
 	v.h1.Write(p[:n])
 	v.h256.Write(p[:n])
-	v.h512.Write(p[:n])
+	if v.h512 != nil {
+		v.h512.Write(p[:n])
+	}
 	v.n += int64(n)
 	last := n > 0 && v.n == v.size
 	if last || errors.Is(err, io.EOF) {
@@ -554,7 +576,7 @@ func (v *verifier) Read(p []byte) (int, error) {
 
 // check compares what was read with want, dropping the entry on a mismatch.
 func (v *verifier) check() error {
-	got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), SHA512: hex.EncodeToString(v.h512.Sum(nil)), Size: v.n}
+	got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), SHA512: sumHex(v.h512), Size: v.n}
 	err := check(v.want, got)
 	if err != nil {
 		if derr := v.relay.cache.Delete(context.Background(), v.key); derr != nil {
