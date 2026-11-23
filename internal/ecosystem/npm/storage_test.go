@@ -13,7 +13,9 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -699,4 +701,122 @@ func TestSetTagAuditFailure(t *testing.T) {
 	if tags := e.tags(t, "pkg"); len(tags) != 1 || tags["latest"] != "1.1.0" {
 		t.Errorf("dist-tags %v", tags)
 	}
+}
+
+func TestPackumentOverCap(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	ctx := context.Background()
+	n := mustName(t, "pkg")
+	e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0")))
+	e.src.maxDoc = 64
+	for _, corgi := range []bool{false, true} {
+		_, err := e.src.Packument(ctx, n, corgi)
+		if err == nil || errors.Is(err, resolve.ErrNotFound) || resolve.HTTPStatus(err) != 500 {
+			t.Errorf("corgi=%v over the cap: %v (status %d)", corgi, err, resolve.HTTPStatus(err))
+		}
+	}
+	if _, err := e.src.Tarball(ctx, n, "pkg-1.0.0.tgz"); err == nil || errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("Tarball over the cap: %v", err)
+	}
+	e.src.mu.Lock()
+	cached := len(e.src.docs)
+	e.src.mu.Unlock()
+	if cached != 0 {
+		t.Errorf("%d documents cached over the cap", cached)
+	}
+	var rows []string
+	for _, h := range e.src.Health(ctx) {
+		if !h.OK {
+			if !h.Scoped || len(h.Packages) != 1 || h.Packages[0] != "pkg" || !strings.Contains(h.Detail, "64 bytes") {
+				t.Errorf("health row %+v", h)
+			}
+			rows = append(rows, h.Detail)
+		}
+	}
+	if len(rows) != 1 {
+		t.Errorf("failing health rows %q, want 1", rows)
+	}
+
+	e.src.maxDoc = maxStorageDocBytes
+	e.packument(t, "pkg", false)
+	for _, h := range e.src.Health(ctx) {
+		if !h.OK {
+			t.Errorf("health after a render under the cap: %+v", h)
+		}
+	}
+}
+
+func TestConcurrentReadsRenderOnce(t *testing.T) {
+	drivers(t, func(t *testing.T, d func(t *testing.T) storage.Driver) {
+		e := newStoreEnv(t, d(t))
+		e.mustPublish(t, "pkg", npmBody(t, withVersion("1.0.0")))
+		e.packument(t, "pkg", false)
+		e.mustPublish(t, "pkg", npmBody(t, withVersion("1.1.0")))
+		var renders atomic.Int32
+		release := make(chan struct{})
+		e.src.onRender = func() {
+			renders.Add(1)
+			<-release
+		}
+		const readers = 16
+		var wg sync.WaitGroup
+		var started sync.WaitGroup
+		started.Add(readers)
+		errs := make([]error, readers)
+		for i := range readers {
+			wg.Go(func() {
+				started.Done()
+				_, errs[i] = e.src.Packument(context.Background(), mustName(t, "pkg"), i%2 == 0)
+			})
+		}
+		started.Wait()
+		time.Sleep(100 * time.Millisecond) // let every reader reach the render
+		close(release)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("reader %d: %v", i, err)
+			}
+		}
+		if got := renders.Load(); got != 1 {
+			t.Errorf("%d renders for %d concurrent readers, want 1", got, readers)
+		}
+		if p := e.packument(t, "pkg", false); len(p.Versions) != 2 {
+			t.Errorf("versions %d after the shared render", len(p.Versions))
+		}
+	})
+}
+
+func TestMixedCaseMisses(t *testing.T) {
+	drivers(t, func(t *testing.T, d func(t *testing.T) storage.Driver) {
+		e := newStoreEnv(t, d(t))
+		ctx := context.Background()
+		e.mustPublish(t, "@s/x", npmBody(t, withName("@s/x")))
+		e.packument(t, "@s/x", false)
+		n := mustName(t, "@S/x")
+		if _, err := e.src.Packument(ctx, n, false); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("Packument(@S/x): %v", err)
+		}
+		if _, err := e.src.Packument(ctx, n, true); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("corgi Packument(@S/x): %v", err)
+		}
+		if _, err := e.src.Version(ctx, n, "1.0.0"); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("Version(@S/x): %v", err)
+		}
+		if _, err := e.src.DistTags(ctx, n); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("DistTags(@S/x): %v", err)
+		}
+		if _, err := e.src.Tarball(ctx, n, "x-1.0.0.tgz"); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("Tarball(@S/x): %v", err)
+		}
+		if err := e.src.SetTag(ctx, publisher, n, "beta", "1.0.0"); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("SetTag(@S/x): %v", err)
+		}
+		if err := e.src.RemoveTag(ctx, publisher, n, "beta"); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("RemoveTag(@S/x): %v", err)
+		}
+		if tags := e.tags(t, "@s/x"); len(tags) != 1 || tags["latest"] != "1.0.0" {
+			t.Errorf("dist-tags of @s/x: %v", tags)
+		}
+	})
 }

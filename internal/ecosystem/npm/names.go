@@ -73,7 +73,8 @@ func (n Name) TarballFile(version string) string { return n.Base + "-" + version
 
 // ValidPattern reports whether p is a claim or capability pattern: "*", or
 // "@scope/name" or "name" in lowercase [a-z0-9._*-]. internal/config keeps
-// the same grammar for claims (it can't import this package).
+// the same grammar for claims (it can't import this package); a test there
+// checks that the two agree.
 func ValidPattern(p string) bool { return patternRE.MatchString(p) }
 
 // Match reports whether a pattern matches a normalised name. "*" matches

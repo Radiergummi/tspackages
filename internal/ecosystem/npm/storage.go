@@ -19,11 +19,13 @@ import (
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/archive"
+	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -35,6 +37,8 @@ const (
 	maxIndexBytes   = 32 << 20
 	maxTagsBytes    = 1 << 20
 	maxSidecarBytes = 4 << 20
+	// maxStorageDocBytes caps each rendered packument, full and abbreviated.
+	maxStorageDocBytes = 64 << 20
 
 	// timeFormat is the layout of npm's time fields.
 	timeFormat = "2006-01-02T15:04:05.000Z"
@@ -67,10 +71,15 @@ type StorageSource struct {
 	maxUpload int64
 	tmpDir    string
 	log       *slog.Logger
+	maxDoc    int64  // maxStorageDocBytes; lowered in tests
+	onRender  func() // called at the start of every render; set in tests
+
+	renders singleflight.Group // by Norm
 
 	mu       sync.Mutex
 	docs     map[string]*rendered // by Norm
 	lostTags map[string]bool      // Norms whose dist-tags document was missing or corrupt at the last read
+	tooLarge map[string]bool      // Norms whose packument exceeded maxDoc at the last render
 }
 
 var _ Publisher = (*StorageSource)(nil)
@@ -82,8 +91,8 @@ func NewStorageSource(name string, claims []string, d storage.Driver, rec *recor
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StorageSource{name: name, claims: claims, d: d, rec: rec, limits: l, maxUpload: maxUpload, tmpDir: tmpDir, log: log,
-		docs: map[string]*rendered{}, lostTags: map[string]bool{}}
+	return &StorageSource{name: name, claims: claims, d: d, rec: rec, limits: l, maxUpload: maxUpload, tmpDir: tmpDir, log: log, maxDoc: maxStorageDocBytes,
+		docs: map[string]*rendered{}, lostTags: map[string]bool{}, tooLarge: map[string]bool{}}
 }
 
 func (s *StorageSource) Name() string     { return s.name }
@@ -553,8 +562,12 @@ func (s *StorageSource) tagPublish(ctx context.Context, c identity.Caller, n Nam
 	return notice, err
 }
 
-// SetTag points tag at an existing version.
+// SetTag points tag at an existing version. Like reads, it does not find a
+// name in other than its normalised case.
 func (s *StorageSource) SetTag(ctx context.Context, c identity.Caller, n Name, tag, version string) error {
+	if n.Exact != n.Norm {
+		return fmt.Errorf("%w: %s", resolve.ErrNotFound, n.Exact)
+	}
 	if !ValidTag(tag) {
 		return badRequest("invalid dist-tag %q", tag)
 	}
@@ -580,6 +593,9 @@ func (s *StorageSource) SetTag(ctx context.Context, c identity.Caller, n Name, t
 
 // RemoveTag removes a dist-tag other than latest.
 func (s *StorageSource) RemoveTag(ctx context.Context, c identity.Caller, n Name, tag string) error {
+	if n.Exact != n.Norm {
+		return fmt.Errorf("%w: %s", resolve.ErrNotFound, n.Exact)
+	}
 	if tag == "latest" {
 		return badRequest("the latest dist-tag cannot be removed")
 	}
@@ -604,11 +620,9 @@ func (s *StorageSource) noteTags(n Name, lost bool) {
 	}
 }
 
-// rendered holds the documents of one package, built for the name as
-// requested (exact) from the index and dist-tags documents with these
-// ETags.
+// rendered holds the documents of one package, built from the index and
+// dist-tags documents with these ETags.
 type rendered struct {
-	exact               string
 	indexETag, tagsETag string
 	tags                map[string]string
 	versions            map[string][]byte // full version objects
@@ -618,33 +632,64 @@ type rendered struct {
 }
 
 // load returns the rendered documents of n, from the cache while the index
-// and dist-tags ETags still match it.
+// and dist-tags ETags still match it. Concurrent loads of a package share
+// one render. A name read in other than its normalised case is not found.
 func (s *StorageSource) load(ctx context.Context, n Name) (*rendered, error) {
+	if n.Exact != n.Norm {
+		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, n.Exact)
+	}
 	iInfo, iErr := s.d.Stat(ctx, indexKey(n))
 	tInfo, tErr := s.d.Stat(ctx, tagsKey(n))
 	if iErr == nil && tErr == nil {
 		s.mu.Lock()
 		r := s.docs[n.Norm]
 		s.mu.Unlock()
-		if r != nil && r.exact == n.Exact && r.indexETag == iInfo.ETag && r.tagsETag == tInfo.ETag {
+		if r != nil && r.indexETag == iInfo.ETag && r.tagsETag == tInfo.ETag {
 			return r, nil
 		}
 	}
-	r, cacheable, err := s.render(ctx, n)
-	if err != nil {
-		return nil, err
-	}
-	if cacheable {
+	return flight.Do(ctx, &s.renders, n.Norm, func() (*rendered, error) {
+		r, cacheable, err := s.render(ctx, n)
 		s.mu.Lock()
-		s.docs[n.Norm] = r
-		s.mu.Unlock()
+		defer s.mu.Unlock()
+		if errors.Is(err, errDocTooLarge) {
+			s.tooLarge[n.Norm] = true
+			delete(s.docs, n.Norm)
+		} else if err == nil {
+			delete(s.tooLarge, n.Norm)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if cacheable {
+			s.docs[n.Norm] = r
+		}
+		return r, nil
+	})
+}
+
+// errDocTooLarge fails a render whose packument exceeds the source's cap.
+var errDocTooLarge = errors.New("npm: packument too large")
+
+// cappedBuffer is a bytes.Buffer that refuses to grow past max bytes.
+type cappedBuffer struct {
+	bytes.Buffer
+	max int64
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if int64(b.Len()+len(p)) > b.max {
+		return 0, fmt.Errorf("%w: exceeds %d bytes", errDocTooLarge, b.max)
 	}
-	return r, nil
+	return b.Buffer.Write(p)
 }
 
 // render builds the documents of n. They are cacheable when both the index
 // and the dist-tags document exist, so their ETags cover every input.
 func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, error) {
+	if s.onRender != nil {
+		s.onRender()
+	}
 	idx, indexETag, rebuilt, err := s.readIndex(ctx, n)
 	if err != nil {
 		return nil, false, err
@@ -660,14 +705,14 @@ func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, er
 	if lost {
 		tags = fallbackTags(idx)
 	}
-	r := &rendered{exact: n.Exact, indexETag: indexETag, tagsETag: tInfo.ETag, tags: map[string]string{}, versions: map[string][]byte{}}
+	r := &rendered{indexETag: indexETag, tagsETag: tInfo.ETag, tags: map[string]string{}, versions: map[string][]byte{}}
 	for t, v := range tags {
 		if _, ok := idx[v]; ok {
 			r.tags[t] = v
 		}
 	}
-	var full, corgi bytes.Buffer
-	dw := NewDocWriter(&full, &corgi)
+	full, corgi := &cappedBuffer{max: s.maxDoc}, &cappedBuffer{max: s.maxDoc}
+	dw := NewDocWriter(full, corgi)
 	times := map[string]string{}
 	var created, modified time.Time
 	var latest map[string]json.RawMessage
@@ -689,7 +734,7 @@ func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, er
 			return nil, false, err
 		}
 		if err := dw.Version(v, f, c); err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("npm: packument of %s: %w", n.Norm, err)
 		}
 		r.versions[v] = f
 		times[v] = sc.Published.UTC().Format(timeFormat)
@@ -714,7 +759,7 @@ func (s *StorageSource) render(ctx context.Context, n Name) (*rendered, bool, er
 	dw.Top("_id", encString(n.Exact))
 	dw.Top("name", encString(n.Exact))
 	if err := dw.Close(r.tags, times); err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("npm: packument of %s: %w", n.Norm, err)
 	}
 	r.full, r.corgi = full.Bytes(), corgi.Bytes()
 	r.sumFull, r.sumCorgi = sha256Hex(r.full), sha256Hex(r.corgi)
@@ -789,7 +834,8 @@ func (s *StorageSource) Tarball(ctx context.Context, n Name, file string) (Artif
 }
 
 // Health reports whether the store answers and, per package, a dist-tags
-// document found missing or corrupt by the last read.
+// document found missing or corrupt by the last read and a packument that
+// exceeded the cap at its last render.
 func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	h := []metrics.Health{{Name: s.name, Ecosystem: ecoName, OK: true, Detail: "store reachable"}}
 	if err := storage.Reachable(ctx, s.d); err != nil {
@@ -797,10 +843,15 @@ func (s *StorageSource) Health(ctx context.Context) []metrics.Health {
 	}
 	s.mu.Lock()
 	lost := slices.Sorted(maps.Keys(s.lostTags))
+	large := slices.Sorted(maps.Keys(s.tooLarge))
 	s.mu.Unlock()
 	for _, name := range lost {
 		h = append(h, metrics.Health{Name: s.name + " " + name, Ecosystem: ecoName, OK: false, Scoped: true, Packages: []string{name},
 			Detail: "dist-tags document missing or corrupt; latest falls back to the highest version"})
+	}
+	for _, name := range large {
+		h = append(h, metrics.Health{Name: s.name + " " + name, Ecosystem: ecoName, OK: false, Scoped: true, Packages: []string{name},
+			Detail: fmt.Sprintf("packument exceeds %d bytes; reads of the package fail", s.maxDoc)})
 	}
 	return h
 }
