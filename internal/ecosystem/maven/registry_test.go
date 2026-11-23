@@ -452,3 +452,41 @@ func TestDigestsOfUncachedFile(t *testing.T) {
 		t.Fatalf("digests objects = %v", e.keys(t, "maven/central/digests/"))
 	}
 }
+
+// TestChangedFileBackToFirst: bytes A, then B, then A again are not changed
+// on the third fetch, as they equal the first record.
+func TestChangedFileBackToFirst(t *testing.T) {
+	e := newRegEnv(t)
+	ctx := context.Background()
+	p := mustPath(t, upJar)
+	for i, body := range []string{jarData, jarData + " B", jarData} {
+		e.up.set(upJar, body)
+		e.up.set(upJar+".sha1", sha1Hex(body))
+		e.clock = e.clock.Add(2 * time.Minute)                // the cached .sha1 expires
+		for _, k := range e.keys(t, "maven/central/files/") { // fetched again, not a hit
+			if err := e.cache.Delete(ctx, k); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if b, err := readFile(e.src.File(ctx, p)); err != nil || string(b) != body {
+			t.Fatalf("fetch %d: %q, %v", i, b, err)
+		}
+		e.relay.Wait()
+		got := e.src.Changed()
+		switch i {
+		case 0:
+			if len(got) != 0 {
+				t.Fatalf("fetch 0: changed = %+v", got)
+			}
+		case 1:
+			if len(got) != 1 || got[0].FirstSHA256 != allDigests(jarData).SHA256 {
+				t.Fatalf("fetch 1: changed = %+v", got)
+			}
+		case 2:
+			// A again: equal to the first record, so not newly listed.
+			if len(got) != 1 || got[0].NowSHA256 != allDigests(jarData+" B").SHA256 {
+				t.Fatalf("fetch 2: changed = %+v", got)
+			}
+		}
+	}
+}

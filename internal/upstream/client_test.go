@@ -529,3 +529,37 @@ func TestAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenWithHeader(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/missing" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Last-Modified", "Fri, 20 Nov 2026 08:00:00 GMT")
+		io.WriteString(w, "0123456789")
+	}))
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	ctx := context.Background()
+	body, size, hdr, err := c.OpenWithHeader(ctx, s.URL+"/f", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(body)
+	body.Close()
+	if err != nil || string(b) != "0123456789" || size != 10 || hdr.Get("Last-Modified") != "Fri, 20 Nov 2026 08:00:00 GMT" {
+		t.Fatalf("%q %d %v %v", b, size, hdr, err)
+	}
+	if _, _, _, err := c.OpenWithHeader(ctx, s.URL+"/f", 9); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("over cap: %v", err)
+	}
+	if _, _, _, err := c.OpenWithHeader(ctx, s.URL+"/f", 0); err == nil {
+		t.Fatal("maxBytes 0 accepted")
+	}
+	_, _, _, err = c.OpenWithHeader(ctx, s.URL+"/missing?X-Amz-Signature=secret", 10)
+	var se *StatusError
+	if !errors.Is(err, resolve.ErrNotFound) || !errors.As(err, &se) || strings.Contains(se.URL, "secret") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v", err)
+	}
+}
