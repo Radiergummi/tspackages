@@ -47,6 +47,13 @@ var ecosystems = map[string]ecosystemRules{
 		overlap:    goClaimsOverlap,
 		source:     goSource,
 	},
+	"npm": {
+		types:      []string{"registry", "storage"},
+		validClaim: func(c string) bool { return validClaim("npm", c) },
+		hint:       `use "*", "@<scope>/<name>" or "<name>" in lowercase [a-z0-9._*-]`,
+		overlap:    func(a, b string) bool { return claimsOverlap("npm", a, b) },
+		source:     npmSource,
+	},
 }
 
 // SupportedEcosystems returns the ecosystems with validation rules, sorted.
@@ -90,6 +97,24 @@ func pypiSource(s Source, _ []Source, opts ValidateOptions, add func(string, ...
 			!strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/simple") {
 			add("url %q must point at a simple index (ending in /simple/)", s.URL)
 		}
+	}
+}
+
+func npmSource(s Source, _ []Source, _ ValidateOptions, add func(string, ...any)) {
+	if s.Type == "registry" && s.URL != "" && !strings.HasSuffix(s.URL, "/") {
+		add("url %q must end in a trailing /", s.URL)
+	}
+	if len(s.Remotes) > 0 {
+		add("remotes is not supported for npm")
+	}
+	if len(s.Branches) > 0 {
+		add("branches is not supported for npm")
+	}
+	if len(s.Tags) > 0 {
+		add("tags is not supported for npm")
+	}
+	if len(s.Modules) > 0 {
+		add("modules is not supported for npm")
 	}
 }
 
