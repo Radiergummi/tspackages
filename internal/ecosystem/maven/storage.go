@@ -84,21 +84,10 @@ func (s *StorageSource) Claims() []string { return s.claims }
 // SNAPSHOT overwrite between its file and sidecar writes).
 type sidecar struct {
 	Size     int64            `json:"size"`
-	Digests  sidecarDigests   `json:"digests"`
+	Digests  Digests          `json:"digests"`
 	Uploaded time.Time        `json:"uploaded"`
 	Uploader records.Uploader `json:"uploader"`
 	ETag     string           `json:"etag"`
-}
-
-type sidecarDigests struct {
-	SHA1   string `json:"sha1"`
-	SHA256 string `json:"sha256"`
-	SHA512 string `json:"sha512"`
-	MD5    string `json:"md5"`
-}
-
-func (d sidecarDigests) digests() Digests {
-	return Digests(d)
 }
 
 // indexEntry is a version with a stored POM: when its newest POM was
@@ -269,8 +258,7 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 	if err != nil {
 		return sidecar{}, "", err
 	}
-	d := h.Digests()
-	sc := sidecar{Size: size, Digests: sidecarDigests(d),
+	sc := sidecar{Size: size, Digests: h.Digests(),
 		Uploaded: time.Now().UTC(), Uploader: records.UploaderFrom(c)}
 	wctx := context.WithoutCancel(ctx)
 	fk, sk := fileKey(p.Coords, p.File), sidecarKey(p.Coords, p.File)
@@ -340,7 +328,7 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 			}
 			return sc, "", err
 		}
-		if !p.Snapshot {
+		if !p.Snapshot() {
 			return sidecar{}, "", fmt.Errorf("%s %w", p.File, ErrExists)
 		}
 		if err := rewind(); err != nil {
@@ -482,7 +470,7 @@ func (s *StorageSource) rebuildEntry(ctx context.Context, c Coords, claimed time
 		return indexEntry{}, fmt.Errorf("maven: POM %s of %s:%s: %w", newest, c.Group, c.Artifact, err)
 	}
 	defer rc.Close()
-	info, err := InspectPOM(rc, Path{Kind: KindFile, Coords: c, File: newest, Snapshot: IsSnapshot(c.Version)})
+	info, err := InspectPOM(rc, Path{Kind: KindFile, Coords: c, File: newest})
 	if err != nil {
 		s.log.Warn("maven: stored POM no longer inspects", "source", s.name, "file", newest, "error", err)
 	}
@@ -569,8 +557,7 @@ func (s *StorageSource) File(ctx context.Context, p Path) (File, error) {
 	}
 	f := File{Body: rc, Size: info.Size, Modified: sc.Uploaded}
 	if sc.ETag == info.ETag {
-		value, _, _ := fileParts(p.Coords, p.File)
-		f.Digests, f.Immutable = sc.Digests.digests(), !p.Snapshot || value != p.Coords.Version
+		f.Digests, f.Immutable = sc.Digests, p.Immutable()
 	}
 	return f, nil
 }
@@ -597,7 +584,7 @@ func (s *StorageSource) Digests(ctx context.Context, p Path) (Digests, error) {
 		return Digests{}, err
 	}
 	if sc.ETag == info.ETag {
-		return sc.Digests.digests(), nil
+		return sc.Digests, nil
 	}
 	d, _, err := s.hashStored(ctx, key)
 	if errors.Is(err, storage.ErrNotFound) {

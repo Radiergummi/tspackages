@@ -18,7 +18,12 @@ import (
 const maxChecksumFile = 1 << 10
 
 // Digests are a file's checksums as lowercase hex; "" is unknown.
-type Digests struct{ SHA1, SHA256, SHA512, MD5 string }
+type Digests struct {
+	SHA1   string `json:"sha1"`
+	SHA256 string `json:"sha256"`
+	SHA512 string `json:"sha512"`
+	MD5    string `json:"md5"`
+}
 
 // Get returns the digest for alg ("sha1", "sha256", "sha512" or "md5"), or ""
 // for any other alg.

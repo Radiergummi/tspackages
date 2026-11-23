@@ -365,23 +365,16 @@ func validClaim(eco, c string) bool {
 	if eco == "npm" {
 		return npmClaimRe.MatchString(c)
 	}
-	if eco == "maven" {
-		return mavenClaimRe.MatchString(c)
-	}
 	return claimRe.MatchString(c)
 }
 
 // claimsOverlap reports whether some package name matches both valid claims.
 // "*" matches every name; otherwise only "*" is special within a segment (it
 // matches any run of characters). Composer claims have two segments, pypi
-// claims one, npm claims one or, with a "@scope/" prefix, two, Maven claims a
-// group and optionally an artifact.
+// claims one, npm claims one or, with a "@scope/" prefix, two.
 func claimsOverlap(eco, a, b string) bool {
 	if a == "*" || b == "*" {
 		return true
-	}
-	if eco == "maven" {
-		return mavenOverlap(a, b)
 	}
 	if eco == "pypi" {
 		return globsOverlap(a, b)

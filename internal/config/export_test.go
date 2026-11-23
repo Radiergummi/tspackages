@@ -1,4 +1,4 @@
 package config
 
-// ValidClaim exposes validClaim to the external tests.
-var ValidClaim = validClaim
+// ValidClaim exposes an ecosystem's claim grammar to the external tests.
+func ValidClaim(eco, c string) bool { return ecosystems[eco].validClaim(c) }

@@ -21,7 +21,7 @@ type XMLLimits struct {
 
 var (
 	// UploadXML caps uploaded POMs and maven-metadata.xml.
-	UploadXML = XMLLimits{MaxBytes: 1 << 20, MaxDepth: 32, MaxElements: 10000}
+	UploadXML = XMLLimits{MaxBytes: maxDescriptor, MaxDepth: 32, MaxElements: 10000}
 	// UpstreamXML caps maven-metadata.xml read from upstreams.
 	UpstreamXML = XMLLimits{MaxBytes: 4 << 20, MaxDepth: 32, MaxElements: 10000, ASCIILabels: true}
 )
