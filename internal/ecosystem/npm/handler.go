@@ -459,7 +459,7 @@ func (h *NPM) publish(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		return
 	}
 	if notice != "" {
-		w.Header().Set("npm-notice", notice)
+		w.Header().Set("Npm-Notice", notice)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
