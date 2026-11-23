@@ -51,19 +51,44 @@ func readUpload(r io.Reader, limit int64, what, size string) ([]byte, error) {
 	return b, nil
 }
 
-// decodeUploadXML decodes an uploaded XML document into v with UploadXML.
-func decodeUploadXML(r io.Reader, what string, v any) error {
+// decodeUploadXML decodes an uploaded XML document into v with UploadXML
+// and returns its bytes.
+func decodeUploadXML(r io.Reader, what string, v any) ([]byte, error) {
 	b, err := readUpload(r, UploadXML.MaxBytes, what, "1 MiB")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := DecodeXML(bytes.NewReader(b), UploadXML, v); err != nil {
 		if xe, ok := errors.AsType[*XMLError](err); ok {
-			return badRequest("invalid %s: %s", what, xe.Reason)
+			return nil, badRequest("invalid %s: %s", what, xe.Reason)
 		}
-		return badRequest("invalid %s: %v", what, err)
+		return nil, badRequest("invalid %s: %v", what, err)
 	}
-	return nil
+	return b, nil
+}
+
+// pomNamespace is the namespace of Maven 4.0.0 POMs.
+const pomNamespace = "http://maven.apache.org/POM/4.0.0"
+
+// checkPOMNamespaces refuses any element of doc, a document DecodeXML
+// accepted, in a namespace other than none or pomNamespace. Maven reads POMs
+// without namespace processing, so a prefixed element such as
+// <x:groupId xmlns:x="urn:x"> is not the groupId Maven uses, while
+// encoding/xml would match it. Attributes are not checked.
+func checkPOMNamespaces(doc []byte) error {
+	d := newXMLDecoder(bytes.TrimPrefix(doc, utf8BOM))
+	for {
+		tok, err := d.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return badRequest("invalid POM: %v", err)
+		}
+		if t, ok := tok.(xml.StartElement); ok && t.Name.Space != "" && t.Name.Space != pomNamespace {
+			return badRequest("element <%s> is in namespace %q; POMs use only %s", t.Name.Local, t.Name.Space, pomNamespace)
+		}
+	}
 }
 
 // single returns the trimmed text of an element that occurs at most once
@@ -104,12 +129,17 @@ type pomDoc struct {
 // InspectPOM checks that a deployed POM names p's coordinates in their exact
 // case: groupId (or parent/groupId), artifactId, and version (or
 // parent/version), which for a SNAPSHOT path is the "-SNAPSHOT" version of
-// the directory. A coordinate with an unresolved "${" property is refused.
+// the directory. A coordinate with an unresolved "${" property, and any
+// element outside the POM namespace, are refused.
 // Errors are *RequestError.
 func InspectPOM(r io.Reader, p Path) (POMInfo, error) {
 	const what = "POM"
 	var doc pomDoc
-	if err := decodeUploadXML(r, what, &doc); err != nil {
+	b, err := decodeUploadXML(r, what, &doc)
+	if err != nil {
+		return POMInfo{}, err
+	}
+	if err := checkPOMNamespaces(b); err != nil {
 		return POMInfo{}, err
 	}
 	if doc.XMLName.Local != "project" {
@@ -272,7 +302,7 @@ type metadataDoc struct {
 func InspectMetadataUpload(r io.Reader, p Path) (MetadataLevel, error) {
 	const what = "maven-metadata.xml"
 	var doc metadataDoc
-	if err := decodeUploadXML(r, what, &doc); err != nil {
+	if _, err := decodeUploadXML(r, what, &doc); err != nil {
 		return 0, err
 	}
 	if doc.XMLName.Local != "metadata" {
