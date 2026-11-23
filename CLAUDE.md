@@ -65,6 +65,8 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
 - `internal/relay` — one upstream fetch per artifact, streamed to every
   waiting client from a temp file, cached only after its digest matched.
 - `internal/flight` — per-key single-flight shared by the ecosystems.
+- `internal/lru` — in-memory cache bounded by total value size (rendered
+  npm packuments, Maven metadata).
 - `internal/ecosystem/composer` — names, Composer version parsing (port of
   composer/semver), the three sources, the HTTP handler.
 - `internal/ecosystem/pypi` — PEP 503 names, PEP 440 versions, filenames,

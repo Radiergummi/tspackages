@@ -24,6 +24,7 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/lru"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -771,11 +772,8 @@ func TestPackumentOverCap(t *testing.T) {
 	if _, err := e.src.Tarball(ctx, n, "pkg-1.0.0.tgz"); err == nil || errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("Tarball over the cap: %v", err)
 	}
-	e.src.mu.Lock()
-	cached := len(e.src.docs)
-	e.src.mu.Unlock()
-	if cached != 0 {
-		t.Errorf("%d documents cached over the cap", cached)
+	if _, ok := e.src.docs.Get("pkg"); ok {
+		t.Error("document cached over the cap")
 	}
 	var rows []string
 	for _, h := range e.src.Health(ctx) {
@@ -872,4 +870,33 @@ func TestMixedCaseMisses(t *testing.T) {
 			t.Errorf("dist-tags of @s/x: %v", tags)
 		}
 	})
+}
+
+// TestRenderedDocsBounded: rendered packuments are kept within the cache's
+// byte cap; an evicted package is rendered again on its next read.
+func TestRenderedDocsBounded(t *testing.T) {
+	e := newStoreEnv(t, fsDriver(t))
+	e.mustPublish(t, "a", npmBody(t, withName("a"), withVersion("1.0.0")))
+	e.mustPublish(t, "b", npmBody(t, withName("b"), withVersion("1.0.0")))
+	var renders int
+	e.src.onRender = func() { renders++ }
+	e.packument(t, "a", false)
+	one := renderedSize(e.src.docs, "a")
+	if one == 0 {
+		t.Fatal("a not cached")
+	}
+	e.src.docs = lru.New(one+one/2, (*rendered).size) // room for one package
+	for _, name := range []string{"a", "a", "b", "b", "a"} {
+		e.packument(t, name, false)
+	}
+	if renders != 4 { // the first read, then a, b and a again
+		t.Errorf("%d renders, want 4", renders)
+	}
+}
+
+func renderedSize(c *lru.Cache[*rendered], key string) int64 {
+	if r, ok := c.Get(key); ok {
+		return r.size()
+	}
+	return 0
 }

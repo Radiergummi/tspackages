@@ -11,10 +11,10 @@ import (
 	"math/rand/v2"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/lru"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -27,6 +27,10 @@ const (
 
 	maxIndexBytes   = 32 << 20
 	maxSidecarBytes = 64 << 10
+	// maxRenderedBytes caps the artifact-level metadata a storage source
+	// keeps in memory; the least recently read is rendered again when
+	// needed.
+	maxRenderedBytes = 32 << 20
 
 	sidecarSuffix = ".json"
 	// maxFileName is the longest stored file name in bytes: its escaped
@@ -55,8 +59,7 @@ type StorageSource struct {
 	maxUpload int64
 	log       *slog.Logger
 
-	mu   sync.Mutex
-	meta map[string]renderedMeta // artifact-level metadata by "<g>:<a>"
+	meta *lru.Cache[renderedMeta] // artifact-level metadata by "<g>:<a>", at most maxRenderedBytes
 }
 
 // renderedMeta is artifact-level metadata rendered from the index with
@@ -74,7 +77,8 @@ func NewStorageSource(name string, claims []string, d storage.Driver, rec *recor
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StorageSource{name: name, claims: claims, d: d, rec: rec, maxUpload: maxUpload, log: log, meta: map[string]renderedMeta{}}
+	return &StorageSource{name: name, claims: claims, d: d, rec: rec, maxUpload: maxUpload, log: log,
+		meta: lru.New(maxRenderedBytes, func(m renderedMeta) int64 { return int64(len(m.body)) })}
 }
 
 func (s *StorageSource) Name() string     { return s.name }
@@ -611,10 +615,7 @@ func (s *StorageSource) artifactMetadata(ctx context.Context, p Path) ([]byte, e
 	c := p.Coords
 	id := c.Group + ":" + c.Artifact
 	if info, err := s.d.Stat(ctx, indexKey(c)); err == nil {
-		s.mu.Lock()
-		m, ok := s.meta[id]
-		s.mu.Unlock()
-		if ok && m.etag == info.ETag {
+		if m, ok := s.meta.Get(id); ok && m.etag == info.ETag {
 			return m.body, nil
 		}
 	}
@@ -631,9 +632,7 @@ func (s *StorageSource) artifactMetadata(ctx context.Context, p Path) ([]byte, e
 	}
 	b := RenderArtifactMetadata(c.Group, c.Artifact, vs)
 	if !rebuilt {
-		s.mu.Lock()
-		s.meta[id] = renderedMeta{etag: etag, body: b}
-		s.mu.Unlock()
+		s.meta.Put(id, renderedMeta{etag: etag, body: b})
 	}
 	return b, nil
 }

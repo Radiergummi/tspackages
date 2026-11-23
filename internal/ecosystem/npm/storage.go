@@ -22,6 +22,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/lru"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
@@ -41,6 +42,9 @@ const (
 	maxSidecarBytes = 4 << 20
 	// maxStorageDocBytes caps each rendered packument, full and abbreviated.
 	maxStorageDocBytes = 64 << 20
+	// maxRenderedBytes caps the rendered packuments a storage source keeps
+	// in memory; the least recently read are rendered again when needed.
+	maxRenderedBytes = 256 << 20
 
 	// sidecarBatch is how many sidecars a render reads concurrently.
 	sidecarBatch = 16
@@ -81,10 +85,11 @@ type StorageSource struct {
 
 	renders singleflight.Group // by Norm
 
+	docs *lru.Cache[*rendered] // by Norm, at most maxRenderedBytes
+
 	mu       sync.Mutex
-	docs     map[string]*rendered // by Norm
-	lostTags map[string]bool      // Norms whose dist-tags document was missing or corrupt at the last read
-	tooLarge map[string]bool      // Norms whose packument exceeded maxDoc at the last render
+	lostTags map[string]bool // Norms whose dist-tags document was missing or corrupt at the last read
+	tooLarge map[string]bool // Norms whose packument exceeded maxDoc at the last render
 }
 
 var _ Publisher = (*StorageSource)(nil)
@@ -97,7 +102,7 @@ func NewStorageSource(name string, claims []string, d storage.Driver, rec *recor
 		log = slog.Default()
 	}
 	return &StorageSource{name: name, claims: claims, d: d, rec: rec, limits: l, maxUpload: maxUpload, tmpDir: tmpDir, log: log, maxDoc: maxStorageDocBytes,
-		docs: map[string]*rendered{}, lostTags: map[string]bool{}, tooLarge: map[string]bool{}}
+		docs: lru.New(maxRenderedBytes, (*rendered).size), lostTags: map[string]bool{}, tooLarge: map[string]bool{}}
 }
 
 func (s *StorageSource) Name() string     { return s.name }
@@ -660,10 +665,7 @@ func (s *StorageSource) load(ctx context.Context, n Name) (*rendered, error) {
 	iInfo, iErr := s.d.Stat(ctx, indexKey(n))
 	tInfo, tErr := s.d.Stat(ctx, tagsKey(n))
 	if iErr == nil && tErr == nil {
-		s.mu.Lock()
-		r := s.docs[n.Norm]
-		s.mu.Unlock()
-		if r != nil && r.indexETag == iInfo.ETag && r.tagsETag == tInfo.ETag {
+		if r, ok := s.docs.Get(n.Norm); ok && r.indexETag == iInfo.ETag && r.tagsETag == tInfo.ETag {
 			return r, nil
 		}
 	}
@@ -673,7 +675,7 @@ func (s *StorageSource) load(ctx context.Context, n Name) (*rendered, error) {
 		defer s.mu.Unlock()
 		if errors.Is(err, errDocTooLarge) {
 			s.tooLarge[n.Norm] = true
-			delete(s.docs, n.Norm)
+			s.docs.Delete(n.Norm)
 		} else if err == nil {
 			delete(s.tooLarge, n.Norm)
 		}
@@ -681,11 +683,14 @@ func (s *StorageSource) load(ctx context.Context, n Name) (*rendered, error) {
 			return nil, err
 		}
 		if cacheable {
-			s.docs[n.Norm] = r
+			s.docs.Put(n.Norm, r)
 		}
 		return r, nil
 	})
 }
+
+// size is what r holds in memory, near enough: its two documents.
+func (r *rendered) size() int64 { return int64(len(r.full) + len(r.corgi)) }
 
 // errDocTooLarge fails a render whose packument exceeds the source's cap.
 var errDocTooLarge = errors.New("npm: packument too large")

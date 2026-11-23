@@ -105,7 +105,10 @@ their digest matches, so memory use doesn't grow with artifact size; size the
 cache's `max_size` for the largest artifacts you expect. Composer git-built
 archives and PyPI git-built sdists are built in memory and capped at 512MiB
 (or `max_artifact_bytes`, if lower); a larger PyPI package is refused and
-reported. `max_decompressed_bytes` applies to upload inspection.
+reported. `max_decompressed_bytes` applies to upload inspection. Each npm
+`storage` source keeps at most 256MiB of rendered packuments in memory, and
+each Maven `storage` source at most 32MiB of generated metadata; the least
+recently read are rendered again when needed.
 
 ## PyPI sources
 
