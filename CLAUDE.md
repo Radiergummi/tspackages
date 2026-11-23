@@ -155,7 +155,8 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   `storage.EscapeSegment`, so names and versions are at most 156 raw bytes
   (`MaxSegment`). A storage version's metadata is built from the tarball's
   `package/package.json` through `npm.PublishableFields`, never from the
-  publish body. A version is claimed with its sha256 (`~claim`) and its
+  publish body, except the informational `gitHead`, `_nodeVersion` and
+  `_npmVersion` (strings of at most 256 bytes). A version is claimed with its sha256 (`~claim`) and its
   precedence without build metadata (`~precedence`), so other bytes, or
   `1.0.0+a` next to `1.0.0+b`, are `409`. Registry tarballs are verified
   by SHA-512 (or SHA-1 when that is all a version declares) before
