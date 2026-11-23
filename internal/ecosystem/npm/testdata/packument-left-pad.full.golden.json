@@ -83,7 +83,7 @@
       "directories": {},
       "dist": {
         "attestations": {
-          "url": "https://tsp.example/npm/left-pad/-/attestations/1.2.0",
+          "url": "https://tsp.example/npm/-/npm/v1/attestations/left-pad@1.2.0",
           "provenance": {
             "predicateType": "https://slsa.dev/provenance/v1"
           }
