@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -49,9 +50,11 @@ type ChangedFile struct {
 }
 
 // RegistrySource passes through a Maven repository. A file is verified
-// against the upstream's <file>.sha1 by the relay before it is cached;
-// maven-metadata.xml is checked and passed through byte-for-byte, refreshed
-// after ttl and served stale when the upstream fails.
+// against the upstream's <file>.sha1 by the relay before it is cached; a
+// release file's .sha1 is fetched once, a SNAPSHOT file's (and a miss)
+// again after ttl. maven-metadata.xml is checked and passed through
+// byte-for-byte, refreshed after ttl and served stale when the upstream
+// fails.
 type RegistrySource struct {
 	name        string
 	claims      []string
@@ -63,7 +66,6 @@ type RegistrySource struct {
 	ttl         time.Duration
 	maxArtifact int64
 	wait        func(context.Context) error
-	tmpDir      string
 	log         *slog.Logger
 	now         func() time.Time // replaced in tests
 
@@ -82,7 +84,7 @@ var _ Source = (*RegistrySource)(nil)
 // NewRegistrySource builds a pass-through source for the repository at
 // baseURL (ending in "/"). wait, if non-nil, is called before every upstream
 // request; log nil means slog.Default().
-func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rl *relay.Relay, rec *records.Store, ttl time.Duration, maxArtifact int64, wait func(context.Context) error, tmpDir string, log *slog.Logger) *RegistrySource {
+func NewRegistrySource(name string, claims []string, baseURL string, c *upstream.Client, cache *storage.Cache, rl *relay.Relay, rec *records.Store, ttl time.Duration, maxArtifact int64, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -91,12 +93,22 @@ func NewRegistrySource(name string, claims []string, baseURL string, c *upstream
 	}
 	return &RegistrySource{
 		name: name, claims: claims, base: strings.TrimRight(baseURL, "/") + "/", c: c, cache: cache, relay: rl, rec: rec,
-		ttl: ttl, maxArtifact: maxArtifact, wait: wait, tmpDir: tmpDir, log: log, now: time.Now,
+		ttl: ttl, maxArtifact: maxArtifact, wait: wait, log: log, now: time.Now,
 	}
 }
 
 func (s *RegistrySource) Name() string     { return s.name }
 func (s *RegistrySource) Claims() []string { return s.claims }
+
+// upstreamURL is p's URL at the upstream: the base and p's canonical path
+// with every segment escaped, so no byte of a request leaves the path.
+func (s *RegistrySource) upstreamURL(p Path) string {
+	segs := strings.Split(p.String(), "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return s.base + strings.Join(segs, "/")
+}
 
 // pathKey is the cache key of one of p's objects under dir.
 func (s *RegistrySource) pathKey(dir string, p Path) string {
@@ -180,7 +192,7 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 	if m.SHA1 == "" {
 		return s.openUnchecked(ctx, p)
 	}
-	rawURL := s.base + p.String()
+	rawURL := s.upstreamURL(p)
 	immutable := !p.Snapshot || !strings.HasPrefix(p.File, p.Coords.Artifact+"-"+p.Coords.Version)
 	md := md5.New() //nolint:gosec // see the md5 import
 	var modified time.Time
@@ -198,14 +210,22 @@ func (s *RegistrySource) open(ctx context.Context, p Path, m mapping) (File, err
 	}
 	onCommit := func(ctx context.Context, res relay.Result) error {
 		pkg := p.Coords.Group + ":" + p.Coords.Artifact
-		if err := s.checkChanged(ctx, pkg, p.Coords.Version, p.File, res.SHA256); err != nil {
-			return err
-		}
-		if err := s.rec.PutProvenance(ctx, records.Provenance{
-			Ecosystem: ecoName, Package: pkg, Version: p.Coords.Version, File: p.File, Source: s.name, SourceType: "registry",
-			UpstreamURL: rawURL, DeclaredDigest: "sha1:" + m.SHA1, SHA1: res.SHA1, SHA256: res.SHA256,
-		}); err != nil {
-			return fmt.Errorf("record provenance: %w", err)
+		if len(pkg) > MaxPart {
+			// "<g>:<a>" is one key segment of the records: too long for
+			// one, the file is served and cached without a provenance
+			// record or a changed-file check.
+			s.log.Warn("maven coordinates too long for a provenance record; not recorded", "source", s.name,
+				"package", pkg, "version", p.Coords.Version, "file", p.File)
+		} else {
+			if err := s.checkChanged(ctx, pkg, p.Coords.Version, p.File, res.SHA256); err != nil {
+				return err
+			}
+			if err := s.rec.PutProvenance(ctx, records.Provenance{
+				Ecosystem: ecoName, Package: pkg, Version: p.Coords.Version, File: p.File, Source: s.name, SourceType: "registry",
+				UpstreamURL: rawURL, DeclaredDigest: "sha1:" + m.SHA1, SHA1: res.SHA1, SHA256: res.SHA256,
+			}); err != nil {
+				return fmt.Errorf("record provenance: %w", err)
+			}
 		}
 		return s.writeDigests(ctx, digestsObject{
 			SHA1: res.SHA1, SHA256: res.SHA256, SHA512: res.SHA512, MD5: hex.EncodeToString(md.Sum(nil)), Modified: modified,
@@ -234,7 +254,7 @@ type teeBody struct {
 // openUnchecked asks the upstream for a file that has no .sha1: a 404 is a
 // miss (cached), a signature is streamed uncached, anything else is a fault.
 func (s *RegistrySource) openUnchecked(ctx context.Context, p Path) (File, error) {
-	body, size, mod, err := s.get(ctx, s.base+p.String(), maxSignature)
+	body, size, mod, err := s.get(ctx, s.upstreamURL(p), maxSignature)
 	isSig := slices.ContainsFunc(signatureSuffixes, func(sfx string) bool { return strings.HasSuffix(p.File, sfx) })
 	switch {
 	case errors.Is(err, resolve.ErrNotFound):
@@ -256,11 +276,14 @@ func (s *RegistrySource) openUnchecked(ctx context.Context, p Path) (File, error
 
 // lookup returns p's mapping, fetching its .sha1 when the cached one is
 // absent or older than the ttl, and keeping the cached one when that fails.
-// A mapping without a SHA-1 (no .sha1 upstream) is never cached.
+// A release file's SHA-1, once found, is kept for good: only SNAPSHOT
+// files and misses expire. A mapping without a SHA-1 (no .sha1 upstream)
+// is never cached.
 func (s *RegistrySource) lookup(ctx context.Context, p Path) (mapping, error) {
 	key := s.pathKey("paths", p) + ".json"
 	cached, written, have := s.readMapping(ctx, key)
-	if !have || s.now().Sub(written) >= s.ttl {
+	permanent := have && cached.SHA1 != "" && !p.Snapshot
+	if !have || (!permanent && s.now().Sub(written) >= s.ttl) {
 		m, err := flight.Do(ctx, &s.mapFlight, key, func() (mapping, error) {
 			return s.refreshMapping(ctx, p, have)
 		})
@@ -318,7 +341,9 @@ func (s *RegistrySource) refreshMapping(ctx context.Context, p Path, haveCache b
 }
 
 func (s *RegistrySource) fetchMapping(ctx context.Context, p Path) (mapping, error) {
-	body, _, _, err := s.get(ctx, s.base+p.String()+".sha1", maxChecksumFile)
+	sum := p
+	sum.Checksum = "sha1"
+	body, _, _, err := s.get(ctx, s.upstreamURL(sum), maxChecksumFile)
 	if errors.Is(err, resolve.ErrNotFound) {
 		return mapping{}, nil
 	}
@@ -326,11 +351,11 @@ func (s *RegistrySource) fetchMapping(ctx context.Context, p Path) (mapping, err
 		return mapping{}, err
 	}
 	defer body.Close()
-	sum, err := ParseChecksumFile(body, "sha1")
+	sha1Hex, err := ParseChecksumFile(body, "sha1")
 	if err != nil {
 		return mapping{}, fmt.Errorf("upstream checksum of %s: %w", p.File, err)
 	}
-	m := mapping{SHA1: sum, Key: s.filesKey(sum)}
+	m := mapping{SHA1: sha1Hex, Key: s.filesKey(sha1Hex)}
 	return m, s.writeMapping(ctx, p, m)
 }
 
@@ -412,7 +437,7 @@ func (s *RegistrySource) refreshMetadata(ctx context.Context, p Path, key string
 }
 
 func (s *RegistrySource) fetchMetadata(ctx context.Context, p Path) ([]byte, error) {
-	body, _, _, err := s.get(ctx, s.base+p.String(), UpstreamXML.MaxBytes)
+	body, _, _, err := s.get(ctx, s.upstreamURL(p), UpstreamXML.MaxBytes)
 	if errors.Is(err, resolve.ErrNotFound) {
 		return missMarker, nil
 	}

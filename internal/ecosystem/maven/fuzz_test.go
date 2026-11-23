@@ -14,6 +14,7 @@ func FuzzParsePath(f *testing.F) {
 		"com/matchory/lib/1.0/lib-1.0.jar", "com/matchory/lib/1.0/lib-1.0-sources.jar.sha1",
 		"com/matchory/lib/1.0-SNAPSHOT/lib-1.0-20261123.101010-3.jar", "com/matchory/lib/maven-metadata.xml",
 		"com/matchory/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1", ".meta/prefixes.txt", "a/b/c/d", "lib/1.0-SNAPSHOT/maven-metadata.xml",
+		strings.Repeat("0.", 61) + "0/lib/1/lib-1.0", // 65 segments once canonical
 	} {
 		f.Add(s)
 	}
@@ -110,6 +111,27 @@ func FuzzInspectModule(f *testing.F) {
 		}
 		if _, ok := errors.AsType[*RequestError](err); !ok {
 			t.Fatalf("err = %v (%T), want *RequestError", err, err)
+		}
+	})
+}
+
+func FuzzCompareVersions(f *testing.F) {
+	for _, s := range [][2]string{
+		{"1.0", "1.0.0"}, {"1-alpha", "1-beta"}, {"1.0-SNAPSHOT", "1.0"}, {"1-sp", "1-ga"}, {"1.0.1", "1.0-1"},
+		{"2.0.RC1", "2.0-rc-1"}, {"1-x", "1.x"}, {"", "0"}, {"1..1", "1-1"},
+	} {
+		f.Add(s[0], s[1])
+	}
+	f.Fuzz(func(t *testing.T, a, b string) {
+		// ParsePath caps a version at MaxPart bytes.
+		if len(a) > MaxPart || len(b) > MaxPart {
+			return
+		}
+		if c := CompareVersions(a, a); c != 0 {
+			t.Fatalf("CompareVersions(%q, %q) = %d, want 0", a, a, c)
+		}
+		if ab, ba := CompareVersions(a, b), CompareVersions(b, a); ab != -ba {
+			t.Fatalf("CompareVersions(%q, %q) = %d but CompareVersions(%q, %q) = %d", a, b, ab, b, a, ba)
 		}
 	})
 }

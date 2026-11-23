@@ -85,30 +85,36 @@ type stEnv struct {
 	src  *StorageSource
 	d    storage.Driver
 	recD storage.Driver
+	tmp  string // spooled deploy bodies
 }
 
 func newStEnv(t *testing.T, d storage.Driver) *stEnv {
 	t.Helper()
 	recD := fsDriver(t)
 	src := NewStorageSource("hosted", []string{"com.matchory:*"}, d, records.New(recD), 16<<20, slog.New(slog.DiscardHandler))
-	return &stEnv{src: src, d: d, recD: recD}
+	return &stEnv{src: src, d: d, recD: recD, tmp: t.TempDir()}
 }
 
-// deploy spools body and deploys it at path.
+// deploy spools body and deploys it at path. Every failure is returned,
+// so it may run on another goroutine than the test.
 func (e *stEnv) deploy(t *testing.T, path, body string) error {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "body-*")
+	p, err := ParsePath(strings.TrimPrefix(path, "/"))
 	if err != nil {
-		t.Fatal(err)
+		return err
+	}
+	f, err := os.CreateTemp(e.tmp, "body-*")
+	if err != nil {
+		return err
 	}
 	defer f.Close()
 	if _, err := io.WriteString(f, body); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		t.Fatal(err)
+		return err
 	}
-	return e.src.Deploy(context.Background(), deployCaller, mustPath(t, path), f, int64(len(body)))
+	return e.src.Deploy(context.Background(), deployCaller, p, f, int64(len(body)))
 }
 
 func (e *stEnv) mustDeploy(t *testing.T, path, body string) {
@@ -522,4 +528,32 @@ func TestLongNames(t *testing.T) {
 	group := strings.Repeat("g", 16)
 	wantRequestError(t, "157-byte g:a", e.deploy(t, group+"/"+art+"/1/"+art+"-1.jar", "jar"), 400, "longer than 156 bytes")
 	e.mustDeploy(t, group[1:]+"/"+art+"/1/"+art+"-1.jar", "jar")
+}
+
+// TestSidecarOfOtherBytes: a stored file whose sidecar was recorded for
+// other bytes (a SNAPSHOT overwrite between its file and sidecar writes) is
+// served without digests and not immutable; Digests hashes the bytes.
+func TestSidecarOfOtherBytes(t *testing.T) {
+	drivers(t, func(t *testing.T, d func(t *testing.T) storage.Driver) {
+		e := newStEnv(t, d(t))
+		ctx := context.Background()
+		path := snapDir + "lib-1.0-20261123.101010-1.jar"
+		e.mustDeploy(t, path, "jar 1")
+		p := mustPath(t, path)
+		fk := fileKey(p.Coords, p.File)
+		info, err := e.d.Stat(ctx, fk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.d.PutIfMatch(ctx, fk, strings.NewReader("jar 2"), info.ETag); err != nil {
+			t.Fatal(err)
+		}
+		body, f := e.file(t, path)
+		if body != "jar 2" || f.Digests != (Digests{}) || f.Immutable {
+			t.Errorf("served %q, digests %+v, immutable %v", body, f.Digests, f.Immutable)
+		}
+		if got, err := e.src.Digests(ctx, p); err != nil || got != allDigests("jar 2") {
+			t.Errorf("Digests = %+v, %v; want %+v", got, err, allDigests("jar 2"))
+		}
+	})
 }

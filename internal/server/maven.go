@@ -28,7 +28,7 @@ func buildMaven(sh *shared, e config.Ecosystem) (built, error) {
 				return built{}, fmt.Errorf("maven source %q: %w", s.Name, err)
 			}
 			src := maven.NewRegistrySource(s.Name, s.Claims, s.URL, client, sh.cache, sh.relay, sh.records,
-				s.MetadataTTL, int64(sh.cfg.Limits.MaxArtifactBytes), limits.UpstreamWait, sh.uploadDir, sh.log)
+				s.MetadataTTL, int64(sh.cfg.Limits.MaxArtifactBytes), limits.UpstreamWait, sh.log)
 			sources, status = append(sources, src), append(status, src)
 			regs = append(regs, src)
 		}

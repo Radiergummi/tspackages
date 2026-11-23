@@ -81,7 +81,7 @@ const (
 // encoding/xml would match it. Attributes are not checked.
 func checkElementNames(doc []byte, what, ns string) error {
 	doc = bytes.TrimPrefix(doc, utf8BOM)
-	raw := newXMLDecoder(doc)
+	raw := newXMLDecoder(doc, UploadXML)
 	for {
 		tok, err := raw.RawToken()
 		if errors.Is(err, io.EOF) {
@@ -94,7 +94,7 @@ func checkElementNames(doc []byte, what, ns string) error {
 			return badRequest("element <%s:%s> has a namespace prefix; %s elements are unprefixed", t.Name.Space, t.Name.Local, what)
 		}
 	}
-	d := newXMLDecoder(doc)
+	d := newXMLDecoder(doc, UploadXML)
 	for {
 		tok, err := d.Token()
 		if errors.Is(err, io.EOF) {

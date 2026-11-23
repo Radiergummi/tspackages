@@ -328,6 +328,9 @@ func TestMetadataConditional(t *testing.T) {
 	if w.Header().Get("Content-Type") != "application/xml" || w.Header().Get("Cache-Control") != "no-cache" {
 		t.Fatalf("headers %v", w.Header())
 	}
+	if w.Header().Get("X-Checksum-Sha1") != sha1Hex(metaBody) || w.Header().Get("X-Checksum-Md5") != md5Hex(metaBody) {
+		t.Fatalf("checksum headers %v", w.Header())
+	}
 	if w := do(h, "GET", metaPath, nil, "If-None-Match", etag); w.Code != 304 || w.Body.Len() != 0 || w.Header().Get("ETag") != etag {
 		t.Fatalf("revalidation: %d %q %s", w.Code, w.Header().Get("ETag"), w.Body)
 	}

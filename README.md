@@ -291,7 +291,7 @@ ecosystems:
 | Type | Keys | Does |
 |------|------|------|
 | `storage` | `store`, `claims` | Hosts artifacts deployed with `mvn deploy` or Gradle's `maven-publish`, and generates their `maven-metadata.xml`. |
-| `registry` | `url` (`https://`, ending in `/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to Maven Central or another Maven repository. Files are checked against the upstream's `.sha1` before they are cached. |
+| `registry` | `url` (`https://`, ending in `/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to Maven Central or another Maven repository. Files are checked against the upstream's `.sha1` before they are cached. A release file's `.sha1` is fetched once; a SNAPSHOT file's and `maven-metadata.xml` again after `metadata_ttl`. |
 
 A claim is `*`, `<group>` or `<group>:<artifact>`. The group is dotted
 segments of `[a-z0-9_-]` whose last segment may be `*`, matching one or

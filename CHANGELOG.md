@@ -34,7 +34,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `maven-metadata.xml` and the `.sha1`, `.md5`, `.sha256` and `.sha512`
   files, and checks uploaded checksums and POM coordinates; and `registry`
   for Maven Central pass-through, whose files are checked against the
-  upstream's `.sha1` before they are cached. Clients need one mirror and
+  upstream's `.sha1` before they are cached (a release file's `.sha1` is
+  fetched once). Clients need one mirror and
   no `<server>` entry or `credentials`. The status page lists the
   `settings.xml`, `distributionManagement` and Gradle settings, and
   upstream files that changed.

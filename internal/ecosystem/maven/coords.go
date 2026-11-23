@@ -15,6 +15,9 @@ import (
 const MaxPart = 156
 
 const (
+	// maxSegments is the most segments of a path, as requested and in its
+	// canonical form (a dotted group segment counts once per part).
+	maxSegments   = 64
 	maxClassifier = 64
 	maxExtension  = 32
 	metadataFile  = "maven-metadata.xml"
@@ -59,6 +62,18 @@ type Path struct {
 // ParsePath parses a URL-decoded repository path (what follows "/maven/").
 // Any error means the path names nothing: the caller answers 404.
 func ParsePath(p string) (Path, error) {
+	tooMany := fmt.Errorf("more than %d path segments", maxSegments)
+	if strings.Count(p, "/") >= maxSegments {
+		return Path{}, tooMany
+	}
+	out, err := parsePath(p)
+	if err == nil && strings.Count(out.String(), "/") >= maxSegments {
+		return Path{}, tooMany
+	}
+	return out, err
+}
+
+func parsePath(p string) (Path, error) {
 	segs := strings.Split(p, "/")
 	var out Path
 	last := segs[len(segs)-1]

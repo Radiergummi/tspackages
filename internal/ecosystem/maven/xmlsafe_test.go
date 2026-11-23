@@ -133,3 +133,15 @@ func TestXMLDecodeErrorIsXMLError(t *testing.T) {
 	}
 	wantXMLError(t, "type mismatch", DecodeXML(strings.NewReader("<p><n>x</n></p>"), UploadXML, &v))
 }
+
+// TestXMLASCIIEncodingLabel: UpstreamXML accepts another declared encoding
+// when every byte is ASCII; UploadXML never does.
+func TestXMLASCIIEncodingLabel(t *testing.T) {
+	ascii := `<?xml version="1.0" encoding="ISO-8859-1"?><metadata><groupId>com.matchory</groupId></metadata>`
+	if err := CheckXML(strings.NewReader(ascii), UpstreamXML, "metadata"); err != nil {
+		t.Errorf("upstream ASCII: %v", err)
+	}
+	wantXMLError(t, "upload ASCII", CheckXML(strings.NewReader(ascii), UploadXML, "metadata"))
+	latin := `<?xml version="1.0" encoding="ISO-8859-1"?><metadata><groupId>caf` + "\xe9" + `</groupId></metadata>`
+	wantXMLError(t, "upstream non-ASCII", CheckXML(strings.NewReader(latin), UpstreamXML, "metadata"))
+}

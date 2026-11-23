@@ -42,6 +42,9 @@ jobs:
     env:
       TSP_TEST_S3_ENDPOINT: http://localhost:9000
       TSP_TEST_MAVEN_SEED: ${{ github.workspace }}/.maven-seed
+      # The pinned mvn (see the install step); it fetches the seed, so it
+      # is part of the seed's cache key.
+      MAVEN_VERSION: 3.10.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,7 +77,6 @@ jobs:
       # Bump deliberately. The published builds, pinned by digest; they go
       # first on PATH, ahead of the runner's own.
       - env:
-          MAVEN_VERSION: 3.10.2
           MAVEN_SHA256: 8ba13121794243e604dbca50439f6ae649ce602675a167129556fd502947b249
           GRADLE_VERSION: 9.9.2
           GRADLE_SHA256: 971fcd7150ca4ba04852c0b2ca0d2d0ab9468e14b03473eab19528809914c76b
@@ -95,11 +97,12 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .maven-seed
-          key: maven-seed-${{ hashFiles('integration/testdata/maven/seed/**/pom.xml') }}
+          key: maven-seed-${{ env.MAVEN_VERSION }}-${{ hashFiles('integration/testdata/maven/seed/**/pom.xml') }}
       - if: steps.maven-seed.outputs.cache-hit != 'true'
         run: make maven-seed
       - uses: ./.github/actions/minio
-      - run: go test -timeout 30m -tags integration ./integration/...
+      # Below the job's timeout, so a hang prints its goroutine dump.
+      - run: go test -timeout 25m -tags integration ./integration/...
 
   lint-go:
     runs-on: ubuntu-latest
