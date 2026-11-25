@@ -157,7 +157,6 @@ func (h *APT) route(w http.ResponseWriter, r *http.Request, caller identity.Call
 		problem(w, http.StatusNotFound, "")
 		return
 	}
-	e.source = p.Source
 	if put {
 		h.upload(w, r, caller, e, p)
 		return
@@ -180,6 +179,7 @@ func (h *APT) route(w http.ResponseWriter, r *http.Request, caller identity.Call
 		problem(w, http.StatusNotFound, "")
 		return
 	}
+	e.source = src.Name()
 	ctx := r.Context()
 	var b Blob
 	ctype, cache := textType, "no-cache"
@@ -339,6 +339,7 @@ func (h *APT) upload(w http.ResponseWriter, r *http.Request, caller identity.Cal
 		problem(w, http.StatusNotFound, "")
 		return
 	}
+	e.source = src.Name()
 	up, ok := src.(Uploader)
 	if !ok {
 		w.Header().Set("Allow", "GET, HEAD")

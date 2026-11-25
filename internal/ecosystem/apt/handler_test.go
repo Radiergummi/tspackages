@@ -1,7 +1,9 @@
 package apt
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -9,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +43,7 @@ type fakeSource struct {
 	uploaded map[string]string // file name -> bytes
 	exists   bool
 	uploads  int
+	lastCtl  Control
 }
 
 func (f *fakeSource) Name() string     { return f.name }
@@ -75,6 +79,7 @@ func (f *fakeSource) Upload(_ context.Context, _ identity.Caller, _, _ string, c
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploads++
+	f.lastCtl = ctl
 	if f.exists {
 		return false, ErrExists
 	}
@@ -256,10 +261,54 @@ func TestKeyAndPreferences(t *testing.T) {
 
 func TestUnknownSource(t *testing.T) {
 	h := server(t, []Source{hosted()}, readAll, writeAcm)
-	for _, c := range [][2]string{{"GET", "/apt/other/dists/bookworm/Release"}, {"PUT", "/apt/other/bookworm/main/acme_1.0-1_amd64.deb"}} {
-		if w := do(h, c[0], c[1], strings.NewReader("x")); w.Code != 404 {
-			t.Errorf("%v: %d", c, w.Code)
+	if w := do(h, "GET", "/apt/other/dists/bookworm/Release", nil); w.Code != 404 {
+		t.Errorf("GET: %d", w.Code)
+	}
+	r := httptest.NewRequest("PUT", "/apt/other/bookworm/main/acme_1.0-1_amd64.deb", failBody{t})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 404 {
+		t.Errorf("PUT: %d", w.Code)
+	}
+}
+
+// TestSourceLabelOnlyForConfiguredSources: a name taken from the URL never
+// reaches the log or metrics label, which only a configured source does.
+func TestSourceLabelOnlyForConfiguredSources(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	mux := http.NewServeMux()
+	New([]Source{hosted()}, nil, 1<<20, t.TempDir(), log).Mount(mux)
+	h := identity.Middleware(testutil.Who{Cap: hCap, Rules: []string{readAll, writeAcm}}, hCap, nil)(mux)
+	for _, c := range [][2]string{{"GET", "/apt/random/dists/bookworm/Release"}, {"PUT", "/apt/random/bookworm/main/acme_1.0-1_amd64.deb"}} {
+		do(h, c[0], c[1], nil)
+	}
+	do(h, "GET", releaseURL, nil)
+	var sources []string
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatal(err)
 		}
+		sources = append(sources, m["source"].(string))
+	}
+	if want := []string{"", "", "hosted"}; !slices.Equal(sources, want) {
+		t.Fatalf("sources = %q, want %q", sources, want)
+	}
+}
+
+func TestUploadReceivesInspectedControl(t *testing.T) {
+	src := hosted()
+	h := server(t, []Source{src}, writeAcm)
+	b := testutil.Deb(t, "Package: acme\nVersion: 2:1.0-1\nArchitecture: amd64\nMaintainer: A <a@example.com>\nDescription: x\n", testutil.DebOptions{})
+	if w := do(h, "PUT", debPath, strings.NewReader(string(b))); w.Code != 201 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if src.lastCtl.Deb.Version != "2:1.0-1" {
+		t.Fatalf("Version = %q", src.lastCtl.Deb.Version)
+	}
+	if m, ok := src.lastCtl.Fields.Get("Maintainer"); !ok || m != "A <a@example.com>" {
+		t.Fatalf("Maintainer = %q, %v", m, ok)
 	}
 }
 
