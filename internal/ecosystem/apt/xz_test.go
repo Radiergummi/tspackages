@@ -73,9 +73,10 @@ func TestXZGuardPasses(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			want := data
-			if name == "two streams, padding" {
+			switch name {
+			case "two streams, padding":
 				want = append(bytes.Clone(data), data...)
-			} else if name == "empty" {
+			case "empty":
 				want = nil
 			}
 			r, err := newXZReader(bytes.NewReader(in), maxControlDict)
