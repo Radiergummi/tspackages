@@ -412,22 +412,25 @@ func TestIndexNoInjection(t *testing.T) {
 	}
 }
 
-func TestByHashKeepsRecentRenderings(t *testing.T) {
+func TestByHashKeptAcrossRenderings(t *testing.T) {
 	e := newStEnv(t, fsDriver(t))
-	acc := accFor("*")
-	ctx := context.Background()
-	type ref struct{ rel, sum string }
-	var refs []ref
-	for i := range byHashKeep + 2 {
-		e.uploadArch("bookworm", fmt.Sprintf("acme-%d", i), "amd64")
-		doc, _ := e.release(t, acc, "bookworm")
-		rel, sum := byHash(t, doc, "main/binary-amd64/Packages")
-		refs = append(refs, ref{rel, sum})
+	for _, n := range []string{"acme-a", "other"} {
+		e.uploadArch("bookworm", n, "amd64")
 	}
-	for i, r := range refs {
-		_, err := e.src.ByHash(ctx, acc, "bookworm", r.rel, r.sum)
-		if kept := i >= len(refs)-byHashKeep; kept != (err == nil) {
-			t.Errorf("rendering %d: %v, kept %v", i, err, kept)
-		}
+	ctx := context.Background()
+	all := accFor("*")
+	doc, _ := e.release(t, all, "bookworm")
+	rel, sum := byHash(t, doc, "main/binary-amd64/Packages")
+	// 20 other visible sets, each its own rendering.
+	for i := range 20 {
+		e.uploadArch("bookworm", fmt.Sprintf("acme-x%d", i), "amd64")
+		e.release(t, accFor(fmt.Sprintf("acme-x%d", i)), "bookworm")
+	}
+	b, err := e.src.ByHash(ctx, all, "bookworm", rel, sum)
+	if got := blobBytes(t, b, err); hexSHA256(got) != sum {
+		t.Error("by-hash bytes differ from their hash")
+	}
+	if _, err := e.src.ByHash(ctx, accFor("acme-*"), "bookworm", rel, sum); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("caller without other: %v, want ErrNotFound", err)
 	}
 }

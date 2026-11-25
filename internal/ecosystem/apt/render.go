@@ -25,8 +25,6 @@ import (
 const (
 	// maxRenderedBytes caps the renderings held in memory.
 	maxRenderedBytes = 64 << 20
-	// byHashKeep is how many renderings of a suite keep their by-hash files.
-	byHashKeep = 8
 	// maxSignedBytes caps a stored signature document.
 	maxSignedBytes = 3 * MaxRelease
 	// maxByHashHeader caps the first line of a by-hash object.
@@ -43,13 +41,13 @@ const (
 //
 //	apt/<src>/rendered/<identity>/signed       the Release's sha256, InRelease and Release.gpg
 //	apt/<src>/byhash/<suite>/<sha256>           {"suite", "members"} line, then an index file's bytes
-//	apt/<src>/byhash-recent/<suite>             the last byHashKeep renderings and their index hashes
 //
 // Indexes are deterministic for a visible set and rendered again after an
 // eviction; signatures are not, so a stored one is served while it signs
-// the same Release. An index stays reachable by hash while its rendering is
-// among the byHashKeep most recently served ones of its suite, so a client
-// that read an InRelease can still fetch its indexes after an upload.
+// the same Release. By-hash files are written with each rendering and kept
+// until the cache evicts them, so a client that read an InRelease can still
+// fetch its indexes after an upload; each request checks the caller may
+// read every package in the file.
 type rendering struct {
 	date       time.Time
 	release    []byte
@@ -70,17 +68,6 @@ func (r *rendering) size() int64 {
 	return n
 }
 
-// hashes returns the sha256 of every index, sorted.
-func (r *rendering) hashes() []string {
-	var out []string
-	for _, b := range r.indexes {
-		sum := sha256.Sum256(b)
-		out = append(out, hex.EncodeToString(sum[:]))
-	}
-	slices.Sort(out)
-	return slices.Compact(out)
-}
-
 // signedDoc is a stored signature of a rendering's Release.
 type signedDoc struct {
 	ReleaseSHA256 string `json:"release_sha256"`
@@ -94,22 +81,12 @@ type byHashHeader struct {
 	Members []string `json:"members"`
 }
 
-// recentRendering is an entry of a suite's by-hash list.
-type recentRendering struct {
-	ID     string   `json:"id"`
-	Hashes []string `json:"hashes"`
-}
-
 func (s *StorageSource) renderedKey(id string) string {
 	return "apt/" + s.name + "/rendered/" + id + "/signed"
 }
 
 func (s *StorageSource) byHashKey(suite, sum string) string {
 	return "apt/" + s.name + "/byhash/" + storage.EscapeSegment(suite) + "/" + sum
-}
-
-func (s *StorageSource) recentKey(suite string) string {
-	return "apt/" + s.name + "/byhash-recent/" + storage.EscapeSegment(suite)
 }
 
 func hexSHA256(b []byte) string {
@@ -154,7 +131,7 @@ func (s *StorageSource) Dist(ctx context.Context, acc ReadAccess, suite, rel str
 }
 
 // ByHash serves rel, "<component>/binary-<arch>/by-hash/SHA256/<sum>", when
-// a recent rendering of suite listed an index with that hash and acc may
+// a rendering of suite stored an index with that hash and acc may
 // read every package in it.
 func (s *StorageSource) ByHash(ctx context.Context, acc ReadAccess, suite, rel, sum string) (Blob, error) {
 	miss := fmt.Errorf("%w: %s", resolve.ErrNotFound, rel)
@@ -207,7 +184,7 @@ func memberName(id string) string {
 }
 
 // current returns the rendering of suite for what acc sees, rendering and
-// signing it when no copy is kept, and keeps its indexes reachable by hash.
+// signing it and storing its indexes by hash when no copy is kept.
 // A suite without members is a miss.
 func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite string) (*rendering, error) {
 	ms, etag, err := s.suite(ctx, suite)
@@ -234,15 +211,15 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 			if err != nil {
 				return nil, err
 			}
+			if err := s.storeByHash(context.WithoutCancel(ctx), suite, r); err != nil {
+				return nil, err
+			}
 			s.rendered.Put(id, r)
 			return r, nil
 		})
 		if err != nil {
 			return nil, err
 		}
-	}
-	if err := s.keepByHash(context.WithoutCancel(ctx), suite, id, r); err != nil {
-		return nil, err
 	}
 	return r, nil
 }
@@ -410,28 +387,8 @@ func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error
 	return nil
 }
 
-// keepByHash makes rendering id the most recently served one of suite,
-// storing its indexes by hash when the suite's list does not hold it, and
-// drops the by-hash files only renderings beyond the last byHashKeep use.
-func (s *StorageSource) keepByHash(ctx context.Context, suite, id string, r *rendering) error {
-	s.recentMu.Lock()
-	defer s.recentMu.Unlock()
-	list, ok := s.recent[suite]
-	if !ok {
-		list = s.loadRecent(ctx, suite)
-	}
-	if len(list) > 0 && list[0].ID == id {
-		s.recent[suite] = list
-		return nil
-	}
-	if i := slices.IndexFunc(list, func(e recentRendering) bool { return e.ID == id }); i >= 0 {
-		// Reordered in memory only: the stored list is only for trimming
-		// after a restart.
-		e := list[i]
-		s.recent[suite] = append([]recentRendering{e}, slices.Delete(list, i, i+1)...)
-		return nil
-	}
-
+// storeByHash stores each of r's indexes by its hash.
+func (s *StorageSource) storeByHash(ctx context.Context, suite string, r *rendering) error {
 	for path, b := range r.indexes {
 		hdr, err := json.Marshal(byHashHeader{Suite: suite, Members: r.members[path]})
 		if err != nil {
@@ -442,49 +399,5 @@ func (s *StorageSource) keepByHash(ctx context.Context, suite, id string, r *ren
 			return err
 		}
 	}
-	list = append([]recentRendering{{ID: id, Hashes: r.hashes()}}, list...)
-	var dropped []recentRendering
-	if len(list) > byHashKeep {
-		list, dropped = list[:byHashKeep], list[byHashKeep:]
-	}
-	s.recent[suite] = list
-	kept := map[string]bool{}
-	for _, e := range list {
-		for _, h := range e.Hashes {
-			kept[h] = true
-		}
-	}
-	for _, e := range dropped {
-		for _, h := range e.Hashes {
-			if !kept[h] {
-				if err := s.cache.Delete(ctx, s.byHashKey(suite, h)); err != nil {
-					s.log.Warn("apt: dropping a by-hash file failed", "source", s.name, "suite", suite, "error", err)
-				}
-				kept[h] = true
-			}
-		}
-	}
-	b, err := json.Marshal(list)
-	if err != nil {
-		return err
-	}
-	if err := s.cache.Put(ctx, s.recentKey(suite), bytes.NewReader(b)); err != nil {
-		s.log.Warn("apt: storing the by-hash list failed", "source", s.name, "suite", suite, "error", err)
-	}
 	return nil
-}
-
-// loadRecent reads suite's stored by-hash list; a missing or unreadable one
-// is empty.
-func (s *StorageSource) loadRecent(ctx context.Context, suite string) []recentRendering {
-	rc, _, err := s.cache.Get(ctx, s.recentKey(suite))
-	if err != nil {
-		return nil
-	}
-	defer rc.Close()
-	var list []recentRendering
-	if err := json.NewDecoder(io.LimitReader(rc, maxSignedBytes)).Decode(&list); err != nil {
-		return nil
-	}
-	return list
 }

@@ -14,7 +14,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/identity"
@@ -60,9 +59,6 @@ type StorageSource struct {
 
 	rendered *lru.Cache[*rendering]
 	renders  singleflight.Group
-
-	recentMu sync.Mutex
-	recent   map[string][]recentRendering // by suite, newest first
 }
 
 var _ Uploader = (*StorageSource)(nil)
@@ -74,7 +70,7 @@ func NewStorageSource(name string, claims []string, d storage.Driver, cache *sto
 		log = slog.Default()
 	}
 	return &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log,
-		rendered: lru.New(maxRenderedBytes, (*rendering).size), recent: map[string][]recentRendering{}}
+		rendered: lru.New(maxRenderedBytes, (*rendering).size)}
 }
 
 func (s *StorageSource) Name() string     { return s.name }
