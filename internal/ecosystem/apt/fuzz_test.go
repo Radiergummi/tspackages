@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/radiergummi/tspackages/internal/testutil"
@@ -88,6 +89,50 @@ func FuzzInspect(f *testing.F) {
 			if !slices.Contains(PublishableFields, fl.Name) {
 				t.Fatalf("field %s not publishable", fl.Name)
 			}
+		}
+	})
+}
+
+func FuzzParseRelease(f *testing.F) {
+	const h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	for _, s := range []string{
+		"Origin: x\nDate: Mon, 09 Nov 2026 10:12:43 UTC\nAcquire-By-Hash: yes\nSHA256:\n " + h + " 1 main/a\n " + h + " 0 b\n",
+		"Date: Mon, 9 Nov 2026 10:12:43 GMT\nValid-Until: Mon, 16 Nov 2026 10:12:43 +0000\nMD5Sum:\n x 1 a\n",
+		"Date: x\n", "", "\n\n", "A: b\n\nC: d\n",
+	} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		d, err := ParseRelease(b)
+		if err != nil {
+			return
+		}
+		for _, fh := range d.SHA256 {
+			if got, ok := d.Lookup(fh.Path); !ok || got != fh || len(fh.SHA256) != 64 || fh.Size < 0 {
+				t.Fatalf("Lookup(%q) = %+v, %v", fh.Path, got, ok)
+			}
+		}
+		out := d.Render()
+		d2, err := ParseRelease(out)
+		if err != nil {
+			t.Fatalf("Render of %q = %q does not parse: %v", b, out, err)
+		}
+		if !d2.Date.Equal(d.Date) || !d2.ValidUntil.Equal(d.ValidUntil) || d2.ByHash != d.ByHash || len(d2.SHA256) != len(d.SHA256) {
+			t.Fatalf("round trip of %q: %+v, want %+v", b, d2, d)
+		}
+		for _, fh := range d.SHA256 {
+			if got, ok := d2.Lookup(fh.Path); !ok || got != fh {
+				t.Fatalf("round trip lost %+v", fh)
+			}
+		}
+		if !bytes.Equal(d2.Render(), out) {
+			t.Fatalf("Render not stable for %q", b)
+		}
+		typed := func(f Field) bool {
+			return strings.EqualFold(f.Name, "Date") || strings.EqualFold(f.Name, "Valid-Until") || strings.EqualFold(f.Name, "Acquire-By-Hash")
+		}
+		if !slices.Equal(slices.DeleteFunc(slices.Clone(d.Fields), typed), slices.DeleteFunc(slices.Clone(d2.Fields), typed)) {
+			t.Fatalf("fields changed in round trip of %q: %+v -> %+v", b, d.Fields, d2.Fields)
 		}
 	})
 }

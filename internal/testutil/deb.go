@@ -5,8 +5,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
@@ -110,3 +115,34 @@ func compress(t testing.TB, kind string, in []byte) []byte {
 
 // Gzip compresses in; exported so tests can build bombs and odd members.
 func Gzip(t testing.TB, in []byte) []byte { return compress(t, "gz", in) }
+
+// PGPKey generates an Ed25519 OpenPGP key without a passphrase for the user ID
+// "name <name@example.com>" and returns its armored private and public keys.
+func PGPKey(t testing.TB, name string) (armoredPrivate, armoredPublic string) {
+	t.Helper()
+	e, err := openpgp.NewEntity(name, "", name+"@example.com", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ArmorPGP(t, openpgp.PrivateKeyType, func(w io.Writer) error { return e.SerializePrivate(w, nil) }),
+		ArmorPGP(t, openpgp.PublicKeyType, e.Serialize)
+}
+
+// ArmorPGP armors what write produces as an OpenPGP block of the given type,
+// ending in a newline.
+func ArmorPGP(t testing.TB, blockType string, write func(io.Writer) error) string {
+	t.Helper()
+	var b strings.Builder
+	w, err := armor.Encode(&b, blockType, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := write(w); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
