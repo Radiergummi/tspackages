@@ -242,7 +242,10 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 				return nil, err
 			}
 			if err := s.storeByHash(context.WithoutCancel(ctx), suite, r); err != nil {
-				return nil, err
+				// Served anyway: apt falls back to the canonical path after a
+				// by-hash miss, and ByHash stores an entry of the current
+				// rendering again when asked for it.
+				s.log.Warn("apt: storing by-hash files failed", "source", s.name, "suite", suite, "error", err)
 			}
 			s.rendered.Put(id, r)
 			return r, nil

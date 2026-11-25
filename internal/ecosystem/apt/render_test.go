@@ -485,3 +485,35 @@ func TestSignatureBoundToKey(t *testing.T) {
 		t.Errorf("signed %v times, want 2", got)
 	}
 }
+
+// failPuts fails every Put of a key that contains part.
+type failPuts struct {
+	storage.Driver
+	part string
+}
+
+func (d failPuts) Put(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if strings.Contains(key, d.part) {
+		return storage.Info{}, errors.New("disk full")
+	}
+	return d.Driver.Put(ctx, key, r)
+}
+
+func TestByHashWriteFailureServes(t *testing.T) {
+	var logs bytes.Buffer
+	e := newStEnvLog(t, fsDriver(t), slog.New(slog.NewTextHandler(&logs, nil)))
+	e.uploadArch("bookworm", "acme-a", "amd64")
+	cache, err := storage.NewCache(context.Background(), failPuts{e.cacheD, "/byhash/"}, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+	acc := accFor("*")
+	doc, _ := e.release(t, acc, "bookworm")
+	if got := e.checkIndexes(t, acc, "bookworm", doc)["main/binary-amd64/Packages"]; !slices.Equal(got, []string{"acme-a"}) {
+		t.Errorf("Packages lists %v", got)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "by-hash") {
+		t.Errorf("no warning logged:\n%s", logs.String())
+	}
+}
