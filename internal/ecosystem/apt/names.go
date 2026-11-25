@@ -10,7 +10,8 @@ import (
 	"strings"
 )
 
-const ecoName = "apt" //nolint:unused // the handler and sources name the ecosystem with it in the next tasks
+// ecoName is the ecosystem name in config, capability rules and metrics.
+const ecoName = "apt"
 
 // MaxName is the longest package name or version in bytes: the storage key
 // rule (storage.EscapeSegment must fit storage.MaxSegment).
