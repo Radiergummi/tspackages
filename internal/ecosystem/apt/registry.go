@@ -97,6 +97,9 @@ type RegistrySource struct {
 
 	cmu     sync.Mutex
 	changed map[string]ChangedFile // by pool path
+
+	pmu        sync.Mutex
+	prevFailed map[string]bool // previous Releases whose lookup failed to build, by sum
 }
 
 var _ Source = (*RegistrySource)(nil)
@@ -113,7 +116,7 @@ func NewRegistrySource(cfg RegistryConfig, c *upstream.Client, cache *storage.Ca
 	}
 	cfg.URL = strings.TrimRight(cfg.URL, "/") + "/"
 	s := &RegistrySource{cfg: cfg, suites: map[string]bool{}, c: c, cache: cache, state: state, relay: rl, rec: rec, wait: wait, log: log,
-		now: time.Now, states: map[string]*relState{}}
+		now: time.Now, states: map[string]*relState{}, prevFailed: map[string]bool{}}
 	for _, suite := range cfg.Suites {
 		s.suites[suite] = true
 	}
@@ -341,7 +344,8 @@ func (s *RegistrySource) Pool(ctx context.Context, _ ReadAccess, p Path) (Blob, 
 // in order, then in the lookups of the Releases they replaced: a client
 // that listed the previous Release still downloads what it lists. A suite
 // whose Release or lookup fails is skipped; its error is returned when no
-// other lookup lists rel.
+// other lookup lists rel. A previous Release whose lookup fails to build
+// (its indexes may be gone upstream) is a miss, and is not tried again.
 func (s *RegistrySource) findPool(ctx context.Context, rel string) (lookupEntry, error) {
 	var firstErr error
 	note := func(err error) {
@@ -367,11 +371,29 @@ func (s *RegistrySource) findPool(ctx context.Context, rel string) (lookupEntry,
 		}
 	}
 	for i, st := range prevs {
-		e, found, err := s.find(ctx, prevSuites[i], st, rel)
-		if err == nil && found {
-			return e, nil
+		s.pmu.Lock()
+		failed := s.prevFailed[st.sum]
+		s.pmu.Unlock()
+		if failed {
+			continue
 		}
-		note(err)
+		e, found, err := s.find(ctx, prevSuites[i], st, rel)
+		var be *lookupBuildError
+		switch {
+		case err == nil && found:
+			return e, nil
+		case errors.As(err, &be):
+			s.pmu.Lock()
+			first := !s.prevFailed[st.sum]
+			s.prevFailed[st.sum] = true
+			s.pmu.Unlock()
+			if first {
+				s.log.Warn("apt: the previous upstream Release's pool lookup failed to build; its pool files are misses",
+					"source", s.cfg.Name, "suite", prevSuites[i], "release_sha256", st.sum, "error", err)
+			}
+		default:
+			note(err)
+		}
 	}
 	if firstErr != nil {
 		return lookupEntry{}, firstErr

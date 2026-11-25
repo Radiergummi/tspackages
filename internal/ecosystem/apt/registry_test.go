@@ -1,6 +1,7 @@
 package apt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -179,6 +180,7 @@ type pubOpts struct {
 	date, validUntil time.Time
 	signer           *openpgp.Entity // nil: e.key
 	noInRelease      bool
+	noByHash         bool   // no Acquire-By-Hash, no by-hash files
 	suite            string // the Suite and Codename fields; "": regSuite
 }
 
@@ -206,7 +208,11 @@ func (e *regEnv) publish(t *testing.T, o pubOpts) []byte {
 	if !o.validUntil.IsZero() {
 		fmt.Fprintf(&rel, "Valid-Until: %s\n", o.validUntil.Format(releaseDate))
 	}
-	rel.WriteString("Architectures: amd64\nComponents: main\nAcquire-By-Hash: yes\nSHA256:\n")
+	rel.WriteString("Architectures: amd64\nComponents: main\n")
+	if !o.noByHash {
+		rel.WriteString("Acquire-By-Hash: yes\n")
+	}
+	rel.WriteString("SHA256:\n")
 	for _, f := range []struct {
 		p string
 		b []byte
@@ -214,7 +220,9 @@ func (e *regEnv) publish(t *testing.T, o pubOpts) []byte {
 		sum := hexSHA256(f.b)
 		fmt.Fprintf(&rel, " %s %d %s\n", sum, len(f.b), f.p)
 		e.up.set("dists/"+regSuite+"/"+f.p, f.b)
-		e.up.set("dists/"+regSuite+"/"+path.Dir(f.p)+"/by-hash/SHA256/"+sum, f.b)
+		if !o.noByHash {
+			e.up.set("dists/"+regSuite+"/"+path.Dir(f.p)+"/by-hash/SHA256/"+sum, f.b)
+		}
 	}
 	s := signer(t, o.signer)
 	text := []byte(rel.String())
@@ -661,5 +669,49 @@ func TestRegistryPoolFromPreviousRelease(t *testing.T) {
 	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
 	if _, err := e.src.Pool(ctx, anyAcc, poolPath(t, old)); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("two Releases back: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestRegistryPreviousLookupFailureIsAMiss: without Acquire-By-Hash the
+// upstream serves only the current indexes, so the previous Release's
+// lookup cannot be built. Its files are then misses, the failure is logged
+// once and not retried per request, and the current lookup still serves.
+func TestRegistryPreviousLookupFailureIsAMiss(t *testing.T) {
+	e := newRegEnv(t)
+	var logs bytes.Buffer
+	e.src.log = slog.New(slog.NewTextHandler(&logs, nil))
+	old := "pool/main/o/old/old_1.0_amd64.deb"
+	e.debs[old] = []byte("old deb bytes")
+	e.publish(t, pubOpts{noByHash: true})
+	ctx := context.Background()
+	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+	delete(e.debs, old)
+	e.publish(t, pubOpts{date: e.clock, noByHash: true})
+	e.clock = e.clock.Add(2 * time.Hour)
+	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+
+	if got := body(t)(e.src.Pool(ctx, anyAcc, poolPath(t, curlPool))); string(got) != "curl deb bytes" {
+		t.Fatalf("Pool of the current Release = %q", got)
+	}
+	e.relay.Wait()
+	indexFetches := func() int {
+		return e.up.count("dists/"+regSuite+"/"+pkgsPath) + e.up.count("dists/"+regSuite+"/"+pkgsGz)
+	}
+	var after []int
+	for range 3 {
+		if _, err := e.src.Pool(ctx, anyAcc, poolPath(t, old)); !errors.Is(err, resolve.ErrNotFound) {
+			t.Errorf("file of the previous Release: err = %v, want ErrNotFound", err)
+		}
+		e.relay.Wait()
+		after = append(after, indexFetches())
+	}
+	if after[1] != after[0] || after[2] != after[0] {
+		t.Errorf("canonical index fetched again per request: %v", after)
+	}
+	if n := strings.Count(logs.String(), "previous upstream Release"); n != 1 {
+		t.Errorf("logged %d times, want once:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("no warning:\n%s", logs.String())
 	}
 }

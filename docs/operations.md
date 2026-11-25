@@ -888,7 +888,10 @@ needs its config changed. Files are served only when the verified
 `Release` or `Packages` lists them, and are checked against that hash
 before they are cached. A pool file the previous `Release` listed stays
 served after the upstream drops it, so a client that updated just before
-can still download it.
+can still download it. That needs the previous `Packages` index, which an
+upstream without `Acquire-By-Hash` has replaced: its previous `Release`'s
+pool files are then misses, logged once as `apt: the previous upstream
+Release's pool lookup failed to build`.
 
 The high-water mark for a suite, `apt/<source>/release-mark/E(suite)` in
 the state store, only rises (`E()` is the `esc` function under [Removing a

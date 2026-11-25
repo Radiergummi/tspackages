@@ -79,7 +79,10 @@ func (s *RegistrySource) find(ctx context.Context, suite string, st *relState, r
 	es, err := s.readShard(ctx, key)
 	if errors.Is(err, storage.ErrNotFound) {
 		if _, err := flight.Do(ctx, &s.lookupFlight, suite+"\x00"+st.sum, func() (struct{}, error) {
-			return struct{}{}, s.build(ctx, suite, st)
+			if err := s.build(ctx, suite, st); err != nil {
+				return struct{}{}, &lookupBuildError{err}
+			}
+			return struct{}{}, nil
 		}); err != nil {
 			return lookupEntry{}, false, err
 		}
@@ -97,6 +100,12 @@ func (s *RegistrySource) find(ctx context.Context, suite string, st *relState, r
 	}
 	return es[i], true, nil
 }
+
+// lookupBuildError is a failure to build a Release's pool lookup.
+type lookupBuildError struct{ err error }
+
+func (e *lookupBuildError) Error() string { return e.err.Error() }
+func (e *lookupBuildError) Unwrap() error { return e.err }
 
 func (s *RegistrySource) readShard(ctx context.Context, key string) ([]lookupEntry, error) {
 	rc, _, err := s.cache.Get(ctx, key)
