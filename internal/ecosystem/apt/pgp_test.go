@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -583,5 +584,49 @@ func TestVerifyDuplicateKeyCopies(t *testing.T) {
 	}
 	if _, err := both.VerifyInRelease(in, now); err != nil {
 		t.Fatalf("expired copy then refreshed copy: %v", err)
+	}
+}
+
+// TestDebianInRelease verifies a real InRelease, signed by Debian with gpg,
+// against the keyring of the debian-archive-keyring package (see
+// testdata/README).
+func TestDebianInRelease(t *testing.T) {
+	kb, err := os.ReadFile("testdata/debian-archive-keyring.pgp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := LoadKeyring(kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := os.ReadFile("testdata/debian-bookworm-InRelease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	text, err := k.VerifyInRelease(in, now)
+	if err != nil {
+		t.Fatalf("VerifyInRelease: %v", err)
+	}
+	d, err := ParseRelease(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := d.Fields.Get("Codename"); c != "bookworm" {
+		t.Errorf("Codename = %q, want bookworm", c)
+	}
+	if s, _ := d.Fields.Get("Suite"); s != "oldstable" {
+		t.Errorf("Suite = %q, want oldstable", s)
+	}
+	if want := time.Date(2026, 7, 11, 10, 16, 37, 0, time.UTC); !d.Date.Equal(want) {
+		t.Errorf("Date = %v, want %v", d.Date, want)
+	}
+	if _, ok := d.Lookup("main/binary-amd64/Packages.xz"); !ok {
+		t.Error("main/binary-amd64/Packages.xz not listed")
+	}
+	// One changed byte of the signed text fails.
+	bad := bytes.Replace(in, []byte("Codename: bookworm"), []byte("Codename: bookwork"), 1)
+	if _, err := k.VerifyInRelease(bad, now); err == nil {
+		t.Error("a changed InRelease verifies")
 	}
 }

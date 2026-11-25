@@ -1,0 +1,2 @@
+debian-bookworm-InRelease: https://deb.debian.org/debian/dists/bookworm/InRelease, fetched 2026-11-25 (Debian 12.15, Date 2026-07-11).
+debian-archive-keyring.pgp: usr/share/keyrings/debian-archive-keyring.pgp from https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb (sha256 9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac), fetched 2026-11-25.
