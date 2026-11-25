@@ -41,7 +41,7 @@ const (
 //	apt/<src>/pool/<name>/<version>/<arch>/deb        the file
 //	apt/<src>/pool/<name>/<version>/<arch>/deb.json   its sidecar
 //	apt/<src>/pool/<name>/<version>/<arch>/~claim     the sha256 of the first upload
-//	apt/<src>/dists/<suite>/<component>/members/<name>_<version>_<arch>   empty: the file is in the suite
+//	apt/<src>/dists/<suite>/<component>/members/<name>/<version>/<arch>   empty: the file is in the suite
 //	apt/<src>/dists/<suite>/index.json                {"members": [...]}
 type StorageSource struct {
 	name   string
@@ -129,8 +129,8 @@ func poolPrefix(src string, d Deb) string {
 		"/" + storage.EscapeSegment(d.Arch) + "/"
 }
 
-func memberSegment(d Deb) string {
-	return storage.EscapeSegment(d.Name) + "_" + storage.EscapeSegment(StripEpoch(d.Version)) + "_" + storage.EscapeSegment(d.Arch)
+func memberSegments(d Deb) string {
+	return storage.EscapeSegment(d.Name) + "/" + storage.EscapeSegment(StripEpoch(d.Version)) + "/" + storage.EscapeSegment(d.Arch)
 }
 
 func suitePrefix(src, suite string) string {
@@ -138,18 +138,15 @@ func suitePrefix(src, suite string) string {
 }
 
 func memberKey(src, suite, component string, d Deb) string {
-	return suitePrefix(src, suite) + storage.EscapeSegment(component) + "/members/" + memberSegment(d)
+	return suitePrefix(src, suite) + storage.EscapeSegment(component) + "/members/" + memberSegments(d)
 }
 
 // Upload stores body, a file ctl describes, and lists it in suite/component.
 // The same bytes again are a success (created false) that completes whatever
 // an earlier attempt left undone; other bytes are ErrExists. The writes run
 // to their end when the client leaves.
-func (s *StorageSource) Upload(ctx context.Context, c identity.Caller, suite, component string, ctl Control, body *os.File, size int64) (bool, error) {
+func (s *StorageSource) Upload(ctx context.Context, c identity.Caller, suite, component string, ctl Control, body *os.File, _ int64) (bool, error) {
 	d := ctl.Deb
-	if len(memberSegment(d)) > storage.MaxSegment {
-		return false, &RequestError{Status: 400, Detail: fmt.Sprintf("%s: name, version and architecture are too long", d.FileName())}
-	}
 	if _, err := body.Seek(0, io.SeekStart); err != nil {
 		return false, err
 	}
@@ -322,14 +319,14 @@ func (s *StorageSource) scan(ctx context.Context, suite string) ([]indexMember, 
 			return nil, err
 		}
 		compSeg, seg, ok := strings.Cut(strings.TrimPrefix(info.Key, prefix), "/members/")
-		if !ok || strings.Contains(compSeg, "/") || strings.Contains(seg, "/") {
+		if !ok || strings.Contains(compSeg, "/") {
 			continue
 		}
 		component, err := storage.UnescapeSegment(compSeg)
 		if err != nil {
 			continue
 		}
-		parts := strings.Split(seg, "_")
+		parts := strings.Split(seg, "/")
 		if len(parts) != 3 {
 			continue
 		}

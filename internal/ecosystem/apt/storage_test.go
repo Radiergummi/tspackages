@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -331,3 +332,25 @@ func TestPoolHidden(t *testing.T) {
 }
 
 func sha256sum(b []byte) [32]byte { return sha256.Sum256(b) }
+
+func TestUploadLongNames(t *testing.T) {
+	drivers(t, func(t *testing.T, newDriver func(*testing.T) storage.Driver) {
+		e := newStEnv(t, newDriver(t))
+		name := "acme" + strings.Repeat("x", 152)
+		version := "1:" + strings.Repeat("1", 150) + "-1"
+		d, _, err := e.upload("bookworm", "main", name, version, "long")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ms := e.members(t, "bookworm")
+		if len(ms) != 1 || ms[0].Deb != d || len(d.Name) != 156 {
+			t.Fatalf("members = %+v", ms)
+		}
+		if err := e.d.Delete(context.Background(), suitePrefix("hosted", "bookworm")+"index.json"); err != nil {
+			t.Fatal(err)
+		}
+		if ms := e.members(t, "bookworm"); len(ms) != 1 || ms[0].Deb != d {
+			t.Fatalf("rebuilt = %+v", ms)
+		}
+	})
+}
