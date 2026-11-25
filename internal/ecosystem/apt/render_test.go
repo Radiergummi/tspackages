@@ -729,3 +729,44 @@ func TestRenderFollowerGetsOwnView(t *testing.T) {
 		}
 	})
 }
+
+// failPutsWhile fails every Put of a key that contains part while fail is
+// set.
+type failPutsWhile struct {
+	storage.Driver
+	part string
+	fail *bool
+}
+
+func (d failPutsWhile) Put(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	if *d.fail && strings.Contains(key, d.part) {
+		return storage.Info{}, errors.New("disk full")
+	}
+	return d.Driver.Put(ctx, key, r)
+}
+
+// TestDateRisesPastUnstoredRendering: a rendering whose signature could
+// not be stored still counts: returning to the stored, older identity gets
+// a Date after it.
+func TestDateRisesPastUnstoredRendering(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	for _, n := range []string{"acme-a", "other"} {
+		e.uploadArch("bookworm", n, "amd64")
+	}
+	var fail bool
+	cache, err := storage.NewCache(context.Background(), failPutsWhile{e.cacheD, "/rendered/", &fail}, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+	c := newClock(e)
+	e.release(t, viewerAcc("*", "n1"), "bookworm")
+	c.tick(time.Minute)
+	fail = true
+	unstored, _ := e.release(t, viewerAcc("acme-*", "n1"), "bookworm")
+	fail = false
+	back, _ := e.release(t, viewerAcc("*", "n1"), "bookworm")
+	if !back.Date.After(unstored.Date) {
+		t.Errorf("Date %v back at the stored view, after %v", back.Date, unstored.Date)
+	}
+}

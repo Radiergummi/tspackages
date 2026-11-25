@@ -405,9 +405,9 @@ func gzipBytes(b []byte) ([]byte, error) {
 }
 
 // sign dates doc, sets it as r's Release and signs it: with the viewer's
-// stored Date and signatures when they are for r's identity, otherwise
-// with the next Date after the stored one and last, storing the new
-// signatures.
+// stored Date and signatures when they are for r's identity and last is
+// not after them, otherwise with the next Date after the stored one and
+// last, storing the new signatures.
 func (s *StorageSource) sign(ctx context.Context, viewer string, last time.Time, r *rendering, doc ReleaseDoc) error {
 	key := s.renderedKey(viewer)
 	var prev signedDoc
@@ -425,7 +425,7 @@ func (s *StorageSource) sign(ctx context.Context, viewer string, last time.Time,
 	case !errors.Is(err, storage.ErrNotFound):
 		return err
 	}
-	if prev.ID == r.id {
+	if prev.ID == r.id && !last.After(prev.Date) {
 		doc.Date = prev.Date
 		if rel := doc.Render(); hexSHA256(rel) == prev.ReleaseSHA256 {
 			r.date, r.release, r.inRelease, r.releaseGPG = prev.Date, rel, prev.InRelease, prev.ReleaseGPG
