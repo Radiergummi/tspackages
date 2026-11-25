@@ -193,47 +193,42 @@ func (s *StorageSource) Upload(ctx context.Context, c identity.Caller, suite, co
 	}); err != nil {
 		return false, err
 	}
+	// The sidecar marks a completed file, so its records are written first:
+	// a retry after a records failure writes them again.
+	scKey := pk + "deb.json"
 	sc := sidecar{Fields: pairs(ctl.Fields), Size: n, SHA256: sum, Uploaded: time.Now().UTC(), Uploader: records.UploaderFrom(c)}
-	scBytes, err := json.Marshal(sc)
+	missing, err := s.missing(ctx, scKey, created)
 	if err != nil {
 		return false, err
 	}
-	wrote, err := s.putIfMissingNew(wctx, pk+"deb.json", created, scBytes)
-	if err != nil {
-		return false, err
-	}
-	if wrote {
-		up := sc.Uploader
-		if err := s.rec.PutProvenance(wctx, records.Provenance{
-			Ecosystem: ecoName, Package: d.Name, Version: d.Version, File: d.FileName(), Source: s.name, SourceType: "storage",
-			SHA256: sum, Uploader: &up,
-		}); err != nil {
-			return false, fmt.Errorf("record provenance: %w", err)
-		}
-		if err := s.rec.PutAudit(wctx, records.Audit{Time: sc.Uploaded, Action: "upload", Ecosystem: ecoName, Package: d.Name,
-			Version: d.Version, File: d.FileName(), SHA256: sum, Uploader: up}); err != nil {
-			return false, fmt.Errorf("record audit: %w", err)
+	wrote := false
+	if missing {
+		if wrote, err = s.putSidecar(wctx, d, scKey, sc); err != nil {
+			return false, err
 		}
 	}
-
-	// A completed upload may have been listed by an earlier attempt with the
-	// stored time; the index entry carries the sidecar's.
+	// The index entry carries the stored sidecar's time, which may be an
+	// earlier attempt's.
 	if !wrote {
-		stored, _, err := s.readSidecar(ctx, pk+"deb.json")
+		stored, _, err := s.readSidecar(ctx, scKey)
 		if err != nil {
 			return false, err
 		}
 		sc = stored
 	}
-	_, err = s.d.PutIfAbsent(wctx, memberKey(s.name, suite, component, d), bytes.NewReader(nil))
-	switch {
-	case err == nil:
+	mk := memberKey(s.name, suite, component, d)
+	missing, err = s.missing(ctx, mk, created)
+	if err != nil {
+		return false, err
+	}
+	if missing {
 		if err := s.rec.PutAudit(wctx, records.Audit{Time: time.Now().UTC(), Action: "suite-add", Ecosystem: ecoName, Package: d.Name,
 			Version: d.Version, File: suite + "/" + component, SHA256: sum, Uploader: records.UploaderFrom(c)}); err != nil {
 			return false, fmt.Errorf("record audit: %w", err)
 		}
-	case !errors.Is(err, storage.ErrExists):
-		return false, err
+		if _, err := s.d.PutIfAbsent(wctx, mk, bytes.NewReader(nil)); err != nil && !errors.Is(err, storage.ErrExists) {
+			return false, err
+		}
 	}
 	im := indexMember{Component: component, Name: d.Name, Version: d.Version, Arch: d.Arch,
 		Fields: sc.Fields, Size: sc.Size, SHA256: sc.SHA256, Uploaded: sc.Uploaded}
@@ -263,17 +258,38 @@ func (s *StorageSource) putIfMissing(ctx context.Context, key string, fresh bool
 	return nil
 }
 
-// putIfMissingNew is putIfMissing for a small body; it reports whether this
-// call wrote it.
-func (s *StorageSource) putIfMissingNew(ctx context.Context, key string, fresh bool, body []byte) (bool, error) {
-	if !fresh {
-		if _, err := s.d.Stat(ctx, key); err == nil {
-			return false, nil
-		} else if !errors.Is(err, storage.ErrNotFound) {
-			return false, err
-		}
+// missing reports whether key is absent; fresh says no earlier attempt can
+// have written it.
+func (s *StorageSource) missing(ctx context.Context, key string, fresh bool) (bool, error) {
+	if fresh {
+		return true, nil
 	}
-	_, err := s.d.PutIfAbsent(ctx, key, bytes.NewReader(body))
+	_, err := s.d.Stat(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return true, nil
+	}
+	return false, err
+}
+
+// putSidecar records sc's provenance and upload, then writes it at key. It
+// reports whether it wrote it: one another attempt wrote meanwhile is kept.
+func (s *StorageSource) putSidecar(ctx context.Context, d Deb, key string, sc sidecar) (bool, error) {
+	up := sc.Uploader
+	if err := s.rec.PutProvenance(ctx, records.Provenance{
+		Ecosystem: ecoName, Package: d.Name, Version: d.Version, File: d.FileName(), Source: s.name, SourceType: "storage",
+		SHA256: sc.SHA256, Uploader: &up,
+	}); err != nil {
+		return false, fmt.Errorf("record provenance: %w", err)
+	}
+	if err := s.rec.PutAudit(ctx, records.Audit{Time: sc.Uploaded, Action: "upload", Ecosystem: ecoName, Package: d.Name,
+		Version: d.Version, File: d.FileName(), SHA256: sc.SHA256, Uploader: up}); err != nil {
+		return false, fmt.Errorf("record audit: %w", err)
+	}
+	b, err := json.Marshal(sc)
+	if err != nil {
+		return false, err
+	}
+	_, err = s.d.PutIfAbsent(ctx, key, bytes.NewReader(b))
 	if errors.Is(err, storage.ErrExists) {
 		return false, nil
 	}

@@ -367,3 +367,85 @@ func TestUploadLongNames(t *testing.T) {
 		}
 	})
 }
+
+// failRecords fails the first PutIfAbsent of a key with prefix, then works.
+type failRecords struct {
+	storage.Driver
+	mu     sync.Mutex
+	prefix string
+	failed bool
+}
+
+func (d *failRecords) PutIfAbsent(ctx context.Context, key string, r io.Reader) (storage.Info, error) {
+	d.mu.Lock()
+	fail := !d.failed && strings.HasPrefix(key, d.prefix)
+	d.failed = d.failed || fail
+	d.mu.Unlock()
+	if fail {
+		return storage.Info{}, errors.New("records store down")
+	}
+	return d.Driver.PutIfAbsent(ctx, key, r)
+}
+
+// auditActions lists the actions of the audit records in rec, sorted.
+func auditActions(t *testing.T, rec storage.Driver) []string {
+	t.Helper()
+	var actions []string
+	for info, err := range rec.List(context.Background(), "audit/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, _, err := rec.Get(context.Background(), info.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		for _, a := range []string{"upload", "suite-add"} {
+			if bytes.Contains(b, []byte(`"action":"`+a+`"`)) {
+				actions = append(actions, a)
+			}
+		}
+	}
+	slices.Sort(actions)
+	return actions
+}
+
+func TestUploadRecordsSurviveRetry(t *testing.T) {
+	for _, prefix := range []string{"provenance/", "audit/"} {
+		t.Run(prefix, func(t *testing.T) {
+			e := newStEnv(t, fsDriver(t))
+			fr := &failRecords{Driver: e.rec, prefix: prefix}
+			e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, e.src.cache, records.New(fr), e.src.signer, e.src.log)
+			if _, _, err := e.upload("bookworm", "main", "acme", "1.0", "one"); err == nil {
+				t.Fatal("first upload succeeded although the records store failed")
+			}
+			if _, _, err := e.upload("bookworm", "main", "acme", "1.0", "one"); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			recs, err := records.New(e.rec).FileProvenance(context.Background(), ecoName, "acme", "1.0", "acme_1.0_all.deb")
+			if err != nil || len(recs) == 0 {
+				t.Errorf("provenance = %+v, %v", recs, err)
+			}
+			if got := auditActions(t, e.rec); !slices.Contains(got, "upload") || !slices.Contains(got, "suite-add") {
+				t.Errorf("audit actions = %v", got)
+			}
+		})
+	}
+	// A suite-add audit that fails is written by the retry too.
+	e := newStEnv(t, fsDriver(t))
+	if _, _, err := e.upload("bookworm", "main", "acme", "1.0", "one"); err != nil {
+		t.Fatal(err)
+	}
+	fr := &failRecords{Driver: e.rec, prefix: "audit/"}
+	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, e.src.cache, records.New(fr), e.src.signer, e.src.log)
+	if _, _, err := e.upload("trixie", "main", "acme", "1.0", "one"); err == nil {
+		t.Fatal("suite add succeeded although the records store failed")
+	}
+	if _, _, err := e.upload("trixie", "main", "acme", "1.0", "one"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got := auditActions(t, e.rec); !slices.Equal(got, []string{"suite-add", "suite-add", "upload"}) {
+		t.Errorf("audit actions = %v", got)
+	}
+}
