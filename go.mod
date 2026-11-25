@@ -9,7 +9,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.16
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.9
 	github.com/aws/smithy-go v1.28.8
+	github.com/klauspost/compress v1.20.2
 	github.com/prometheus/client_golang v1.25.0
+	github.com/ulikunitz/xz v0.5.16
 	golang.org/x/mod v0.41.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0
@@ -71,7 +73,6 @@ require (
 	github.com/jellydator/ttlcache/v3 v3.4.1 // indirect
 	github.com/jsimonetti/rtnetlink v1.4.2 // indirect
 	github.com/kamstrup/intmap v0.5.2 // indirect
-	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/mdlayher/genetlink v1.4.0 // indirect

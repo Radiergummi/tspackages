@@ -3,7 +3,10 @@ package apt
 import (
 	"bytes"
 	"reflect"
+	"slices"
 	"testing"
+
+	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
 func FuzzParsePath(f *testing.F) {
@@ -64,6 +67,27 @@ func FuzzParseStanza(f *testing.F) {
 		s2, err := ParseStanza(buf.Bytes(), 1<<10)
 		if err != nil || !reflect.DeepEqual(s, s2) {
 			t.Fatalf("round trip of %q: %+v, %v (wrote %q)", b, s2, err, buf.Bytes())
+		}
+	})
+}
+
+func FuzzInspect(f *testing.F) {
+	for _, c := range []string{"gz", "xz", "zst", "none"} {
+		f.Add(testutil.Deb(f, "Package: acme\nVersion: 1:2.0-1\nArchitecture: amd64\nDepends: libc6\n", testutil.DebOptions{Compression: c}))
+	}
+	f.Add([]byte("!<arch>\n"))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		c, err := Inspect(bytes.NewReader(b), int64(len(b)))
+		if err != nil {
+			return
+		}
+		if !ValidName(c.Deb.Name) || !ValidVersion(c.Deb.Version) || !ValidArch(c.Deb.Arch) {
+			t.Fatalf("Inspect accepted %+v", c.Deb)
+		}
+		for _, fl := range c.Fields {
+			if !slices.Contains(PublishableFields, fl.Name) {
+				t.Fatalf("field %s not publishable", fl.Name)
+			}
 		}
 	})
 }
