@@ -14,13 +14,16 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/identity"
+	"github.com/radiergummi/tspackages/internal/lru"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -43,21 +46,35 @@ const (
 //	apt/<src>/pool/<name>/<version>/<arch>/~claim     the sha256 of the first upload
 //	apt/<src>/dists/<suite>/<component>/members/<name>/<version>/<arch>   empty: the file is in the suite
 //	apt/<src>/dists/<suite>/index.json                {"members": [...]}
+//
+// What a caller sees of a suite is rendered and signed per visible set; see
+// render.go for the renderings and by-hash files kept in cache.
 type StorageSource struct {
 	name   string
 	claims []string
 	d      storage.Driver
+	cache  *storage.Cache
 	rec    *records.Store
+	signer *Signer
 	log    *slog.Logger
+
+	rendered *lru.Cache[*rendering]
+	renders  singleflight.Group
+
+	recentMu sync.Mutex
+	recent   map[string][]recentRendering // by suite, newest first
 }
 
-// NewStorageSource returns a storage source over d. log nil means
-// slog.Default().
-func NewStorageSource(name string, claims []string, d storage.Driver, rec *records.Store, log *slog.Logger) *StorageSource {
+var _ Uploader = (*StorageSource)(nil)
+
+// NewStorageSource returns a storage source over d that keeps its signed
+// renderings and by-hash files in cache. log nil means slog.Default().
+func NewStorageSource(name string, claims []string, d storage.Driver, cache *storage.Cache, rec *records.Store, signer *Signer, log *slog.Logger) *StorageSource {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StorageSource{name: name, claims: claims, d: d, rec: rec, log: log}
+	return &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log,
+		rendered: lru.New(maxRenderedBytes, (*rendering).size), recent: map[string][]recentRendering{}}
 }
 
 func (s *StorageSource) Name() string     { return s.name }

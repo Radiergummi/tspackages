@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -82,17 +83,29 @@ func drivers(t *testing.T, f func(t *testing.T, d func(t *testing.T) storage.Dri
 }
 
 type stEnv struct {
-	t   *testing.T
-	src *StorageSource
-	d   storage.Driver
-	rec storage.Driver
+	t      *testing.T
+	src    *StorageSource
+	d      storage.Driver
+	rec    storage.Driver
+	cacheD storage.Driver
+	entity *openpgp.Entity
 }
 
 func newStEnv(t *testing.T, d storage.Driver) *stEnv {
 	t.Helper()
-	recD := fsDriver(t)
-	src := NewStorageSource("hosted", []string{"acme*"}, d, records.New(recD), slog.New(slog.DiscardHandler))
-	return &stEnv{t: t, src: src, d: d, rec: recD}
+	return newStEnvLog(t, d, slog.New(slog.DiscardHandler))
+}
+
+func newStEnvLog(t *testing.T, d storage.Driver, log *slog.Logger) *stEnv {
+	t.Helper()
+	recD, cacheD := fsDriver(t), fsDriver(t)
+	cache, err := storage.NewCache(context.Background(), cacheD, 1<<30, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEntity(t, "repo", nil)
+	src := NewStorageSource("hosted", []string{"acme*"}, d, cache, records.New(recD), signer(t, e), log)
+	return &stEnv{t: t, src: src, d: d, rec: recD, cacheD: cacheD, entity: e}
 }
 
 // upload builds a .deb whose control is control (plus a description line
