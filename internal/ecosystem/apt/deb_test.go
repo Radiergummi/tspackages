@@ -102,3 +102,24 @@ func TestInspectBombMessage(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// GNU ar ends member names with "/"; dpkg strips one.
+func TestInspectGNUMemberNames(t *testing.T) {
+	ctl := string(testutil.Gzip(t, testutil.Tar(t, map[string]string{"./control": "Package: acme\nVersion: 1.0\nArchitecture: amd64\n"})))
+	data := string(testutil.Gzip(t, testutil.Tar(t, map[string]string{"./x": "x"})))
+	b := testutil.Ar(t, [][2]string{{"debian-binary/", "2.0\n"}, {"control.tar.gz/", ctl}, {"data.tar.gz/", data}})
+	got, err := inspect(t, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (Deb{"acme", "1.0", "amd64"}); got.Deb != want {
+		t.Fatalf("Deb = %+v, want %+v", got.Deb, want)
+	}
+	for _, name := range []string{"debian-binary//", "/", "a/b/"} {
+		b := testutil.Ar(t, [][2]string{{name, "2.0\n"}, {"control.tar.gz", ctl}, {"data.tar.gz", data}})
+		var re *RequestError
+		if _, err := inspect(t, b); !errors.As(err, &re) || re.Status != 400 {
+			t.Errorf("%q: err = %v, want 400 RequestError", name, err)
+		}
+	}
+}

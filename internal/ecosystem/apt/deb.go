@@ -129,7 +129,8 @@ func arMembers(r io.ReaderAt, size int64) ([]arMember, error) {
 		if _, err := r.ReadAt(hdr, off); err != nil || string(hdr[58:]) != "`\n" {
 			return nil, badDeb("bad ar member header")
 		}
-		name := strings.TrimRight(string(hdr[:16]), " ")
+		// GNU ar ends names with "/"; dpkg strips one.
+		name := strings.TrimSuffix(strings.TrimRight(string(hdr[:16]), " "), "/")
 		if name == "" || strings.Contains(name, "/") {
 			return nil, badDeb("bad ar member name %q", name)
 		}
