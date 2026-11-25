@@ -16,7 +16,8 @@ Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
 uploads with `twine`/`uv publish`), Go (`git` + `registry` + sumdb
 proxy) and npm (`storage` + `registry`; npm and pnpm, CI publishes with a
 dummy `_authToken`) and Maven (`storage` + `registry`; mvn and Gradle,
-no `<server>` or `credentials` entry) ship; OCI is next.
+no `<server>` or `credentials` entry) and apt (`storage` + `registry`;
+signed per-source repositories, client pinning) ship; OCI is next.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -90,6 +91,13 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   source (files verified by the upstream's `.sha1`, metadata passed
   through), the HTTP handler. Must not import `composer`, `pypi`,
   `goproxy` or `npm` (nor the reverse).
+- `internal/ecosystem/apt` — package, suite and architecture names and
+  claims, layout paths, deb822 reading and the hygiene check, `.deb`
+  inspection, the `storage` source (write-once pool files, suite members,
+  per-caller indexes signed with the signing key), the `registry` source
+  (Release verified against the keyring, pool lookup), the preferences
+  file, the HTTP handler. Must not import `composer`, `pypi`, `goproxy`,
+  `npm` or `maven` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
 - `integration/` — end-to-end tests with real Composer, pip, uv, twine,
   the go command, npm, pnpm, mvn, Gradle and apt (`-tags integration`).
@@ -184,6 +192,43 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   signature is streamed uncached and anything else is `502`. A `404` has a
   plain-text body (Maven reads a problem+json `404` as a transfer error);
   other errors are problem+json. Never answer `401`; deny is `403`.
+- apt: claims and `apt:` rules are `*` or patterns of `[a-z0-9+.-]` and
+  `*`, matched against the package name; a `storage` claim can't be a bare
+  `*` (its pin would block every package of every other repository), and
+  none may overlap another's. Each source is its own repository, so
+  `registry` sources take no claims and "at most one unclaimed source"
+  doesn't apply; apt merges versions across repositories on the client, so
+  the protection is the generated preferences file (`/apt/preferences`,
+  pins on `o=tspackages,l=<source>`), and a client without it isn't
+  protected. A package name claimed by any `storage` source is `404` on
+  every `registry` source and is never fetched upstream. Claims are public.
+  Reads: a `storage` source's indexes need any `apt:` read rule and list
+  only the packages the caller may read; the signed `Release` is rendered
+  once per visible set and cached keyed by the set and bound to the
+  signing key's fingerprint; a download needs a rule for its package (else
+  `404`, so names stay hidden). On `registry` sources any `apt:` read rule
+  covers indexes and downloads. Uploads need a write rule for the name,
+  checked before the body is read; files are keyed by name, version
+  without epoch and architecture, written once (same bytes `201`, other
+  bytes `409`), and the control fields kept are the
+  `apt.PublishableFields` allowlist after the deb822 hygiene check (no
+  blank line, CR, NUL or malformed field name, so no field can inject
+  another entry into a generated index). The signing key is
+  armored private-key text (`${file:}`/`${env:}`), a legacy v4 Ed25519 or RSA of
+  3072 bits or more; RFC 9580 (v6) keys are refused because apt's gpgv
+  can't verify them. Never logged or served. A registry `keyring` is a
+  file path read at startup. The upstream's `Release` (or `InRelease`) is
+  verified against it (any one valid signature), served byte for byte,
+  and rejected, with the previous copy served, when `Valid-Until` has
+  passed, its `Suite` or `Codename` isn't the configured suite, or its
+  `Date` is older than the newest accepted, which is kept in the state
+  store (`apt/<src>/release-mark/<suite>`) so a lost cache doesn't allow a
+  rollback. Index and pool files are served only when the verified
+  `Release` or `Packages` lists them, and are verified by SHA-256 before
+  caching; only configured suites, components and architectures are
+  served. Every key segment goes through `storage.EscapeSegment`, so
+  names and versions are at most 156 bytes. Never answer `401`; deny is
+  `403`, errors have plain-text bodies.
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

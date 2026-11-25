@@ -47,3 +47,6 @@ uid
 uv
 WhoIs
 zizmor
+apt(?:'s)?
+ETag
+(?i)keyrings?

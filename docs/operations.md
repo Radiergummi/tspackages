@@ -168,10 +168,10 @@ The state store and the hosted stores hold private packages; protect their
 backups as you protect the stores.
 
 The state store's keys are `pins/`, `composer-git/`, `pypi-git/`,
-`go-git/`, `go-pseudo/`, `go-sumdb/`, `provenance/` and `audit/`.
+`go-git/`, `go-pseudo/`, `go-sumdb/`, `apt/`, `provenance/` and `audit/`.
 tspackages only ever creates objects there and never deletes one. The one
 object it overwrites is `go-sumdb/sum.golang.org/latest`, the latest
-verified checksum database tree head, rewritten whenever the tree grows. A hosted store holds `composer/` and `pypi/`;
+verified checksum database tree head, rewritten whenever the tree grows. `apt/<source>/release-mark/<suite>` holds the date of the newest upstream apt `Release` accepted and is rewritten when a newer one arrives. A hosted store holds `composer/` and `pypi/`;
 its objects never change either, except each package's `index.json`, which is
 rewritten on every upload and can be rebuilt from the other objects.
 
@@ -758,6 +758,140 @@ fresh `~/.m2`. SNAPSHOT files' `.sha1`, files the upstream lacks and
 `maven-metadata.xml` carry `X-Checksum-Sha1` and `X-Checksum-Md5`, so
 Maven doesn't request the checksum files.
 
+## apt
+
+### The signing key
+
+Storage sources sign their `InRelease` and `Release.gpg` with one key from
+`apt.signing_key`. It must be a legacy (v4) Ed25519 (EdDSA) or an RSA key
+of 3072 bits or more. RFC 9580 keys (v6, algorithm 27) are refused at
+startup, because apt's `gpgv` can't verify them. To generate one and
+export it armored:
+
+```sh
+gpg --quick-generate-key 'tspackages apt' ed25519 sign never
+gpg --armor --export-secret-keys 'tspackages apt' > /etc/tspackages/apt-signing.asc
+chmod 600 /etc/tspackages/apt-signing.asc
+```
+
+Set `signing_key: ${file:/etc/tspackages/apt-signing.asc}`. A key with a
+passphrase needs `signing_key_passphrase` (`${env:}` or `${file:}`).
+Verified with apt 3.0.4 (`sqv`) and apt 2.8.4 (`gpgv`). The status page
+shows the key's fingerprint.
+
+Back the private key up like the tsnet state dir: it is a secret, and
+tspackages never logs or serves it. Clients trust the public key at
+`/apt/key.asc`; if you lose the private key, generate a new one, and every
+client needs the new public key. There is no rotation tooling yet, so a
+change of key means installing the new `key.asc` on every client at the
+same time as the restart.
+
+A registry source's `keyring` is the path of the upstream's public
+keyring, armored or binary, read at startup (for Debian,
+`/usr/share/keyrings/debian-archive-keyring.gpg`). It isn't a `${file:}`
+reference.
+
+### Client setup
+
+A client needs three things per tailnet: the key, the preferences file
+and one deb822 stanza per source. The status page shows them with the
+host filled in.
+
+```sh
+curl -fsSL https://<hostname>.<tailnet>.ts.net/apt/key.asc -o /etc/apt/keyrings/tspackages.asc
+curl -fsSL https://<hostname>.<tailnet>.ts.net/apt/preferences -o /etc/apt/preferences.d/tspackages.pref
+```
+
+```
+# /etc/apt/sources.list.d/tspackages.sources
+Types: deb
+URIs: https://<hostname>.<tailnet>.ts.net/apt/hosted/
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/tspackages.asc
+```
+
+Use any tool that writes these three files and keeps them current. As
+a shell script, the `curl` lines above run as they are. As a
+configuration-management file resource, the preferences file is a file
+whose content is fetched from `https://<hostname>.<tailnet>.ts.net/apt/preferences`
+and refreshed regularly, because it changes when claims change.
+
+For a `registry` source, the stanza lists the configured suites and
+components, with `Signed-By` set to the upstream's keyring, not the
+tspackages key: tspackages passes the upstream's own signed `Release`
+through, and apt verifies it again.
+
+**A client without the preferences file isn't protected.** apt merges the
+versions of every repository it knows, so a claimed name that another
+configured repository offers at a higher version would be installed from
+there. The file pins each claimed name to `o=tspackages,l=<source>` at
+priority 1001 and blocks it (priority -1) everywhere else. It lists
+every claim of every `storage` source to any caller with an `apt:` read
+rule. **Claims are public:** don't put a secret product name into a
+claim. What stays hidden is which packages exist. `Origin` is
+self-declared by a repository, so the pin doesn't defend against a
+malicious repository the client already trusts with root.
+
+As a second line, a name claimed by a `storage` source is `404` on every
+`registry` source and is never fetched upstream, for clients that use the
+mirror without the pins.
+
+### Uploading from CI
+
+```sh
+curl -fT acme-tool_1.0-1_amd64.deb https://<hostname>.<tailnet>.ts.net/apt/hosted/stable/main/
+```
+
+`curl` appends the file name. Give the CI node's tag a write rule for the
+package name, and no `Authorization` header or credentials:
+
+```hujson
+"app": {"github.com/radiergummi/tspackages": [
+  {"read": ["apt:acme-*"], "write": ["apt:acme-tool"]}
+]}
+```
+
+- The suite and component come from the URL and are free-form
+  (`[a-z0-9][a-z0-9._-]*`, at most 64 bytes). A suite exists once it has a
+  package. Write rules match package names only: a writer may upload to
+  any suite. Suite-scoped write rules aren't there yet.
+- The file name is `<name>_<version>_<arch>.deb`, with the version
+  without its epoch. The name, version and architecture must match the
+  package's `control` file, or the upload is `400`.
+- The same bytes again are `201` and add the file to that suite too, so a
+  package can be published to several suites. Other bytes for the same
+  name, version and architecture are `409`, whatever the suite. Files are
+  identified by name, version without epoch and architecture, so `1:2.0`
+  and `2.0` are one file.
+- `Expect: 100-continue` uploads send no body when the write rule is
+  missing.
+- Every version stays listed; apt installs the highest version its pins
+  allow. Deleting answers `405` (see [Removing a bad
+  publish](#removing-a-bad-publish)).
+
+Readers see only the packages their `apt:` read rules match. Indexes of
+a suite are generated and signed per caller, so a caller with no matching
+rule gets valid, empty indexes for an existing suite.
+
+### Upstream repositories
+
+`registry` sources verify the upstream's `Release` against `keyring` (any
+one valid signature is enough) before anything else is fetched. They
+reject it, and serve the previous copy meanwhile, when its `Valid-Until`
+has passed, when its `Suite` or `Codename` isn't the configured suite,
+or when its `Date` is older than the newest accepted one. That date is
+kept in the state store, so a lost cache doesn't allow a rollback. A
+suite that the upstream renames or retires therefore stops updating and
+needs its config changed. Files are served only when the verified
+`Release` or `Packages` lists them, and are checked against that hash
+before they are cached.
+
+Any `apt:` read rule allows reading from a registry source, indexes and
+downloads alike. The first `apt-get update` of a large suite fetches the
+`Packages` index and builds a pool lookup from it; later ones fetch only
+what changed.
+
 ## Removing a bad publish
 
 tspackages has no delete or yank: published bytes never change, so lock files
@@ -787,7 +921,7 @@ Before you do:
 Names in keys are normalised: Composer's `<vendor>/<name>` is in lowercase;
 a PyPI name is normalised as PEP 503 says (lowercase; runs of `-`, `_` and
 `.` become `-`, so `Acme_Utils` is `acme-utils`); an npm name is in
-lowercase, scope included (`@Acme/X` is `@acme/x`). Some segments are then
+lowercase, scope included (`@Acme/X` is `@acme/x`); an apt package name is lowercase. Some segments are then
 encoded as lowercase base32hex without padding. This computes one (Python
 3.10 or later):
 
@@ -909,6 +1043,26 @@ between the two writes) isn't served, but blocks a deploy of other bytes
 under its name with `409`. To unblock it, delete the orphan file under
 `<dir>/files/`, then deploy again. The same bytes again complete the
 interrupted deploy without that.
+
+### An upload to an apt storage source
+
+apt keys encode every segment of the package name, version without epoch
+and architecture, suite and component (the `esc` function from earlier; `E()` below). With
+`<pool>` for `apt/<src>/pool/E(name)/E(version)/E(arch)`:
+
+1. Delete the suite member objects
+   `apt/<src>/dists/E(suite)/E(component)/members/E(name)/E(version)/E(arch)`,
+   one for each suite and component that lists the file.
+2. Delete `<pool>/deb`, `<pool>/deb.json` and `<pool>/~claim`.
+3. Delete `apt/<src>/dists/E(suite)/index.json` of each suite you
+   changed. It is rebuilt from the members that remain.
+
+Rendered indexes in the cache are keyed by the suite index's ETag, so
+the next read replaces them, and no restart is needed. Check that
+`apt-cache policy <name>` no longer shows the version and that the file's
+download URL answers `404`. After step 2, nothing stops the same version
+from being uploaded again; machines that installed it keep it, so publish
+the fix as a new version.
 
 ### A Composer version from a git tag
 
