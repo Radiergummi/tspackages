@@ -44,6 +44,7 @@ type fakeSource struct {
 	exists   bool
 	uploads  int
 	lastCtl  Control
+	viewer   string // of the last Release request
 }
 
 func (f *fakeSource) Name() string     { return f.name }
@@ -56,7 +57,10 @@ func (f *fakeSource) blob(s string) (Blob, error) {
 	return Blob{Body: io.NopCloser(strings.NewReader(s)), Size: int64(len(s)), ETag: `"e1"`, Modified: modified, Immutable: true}, nil
 }
 
-func (f *fakeSource) Release(_ context.Context, _ ReadAccess, suite, which string) (Blob, error) {
+func (f *fakeSource) Release(_ context.Context, acc ReadAccess, suite, which string) (Blob, error) {
+	f.mu.Lock()
+	f.viewer = acc.Viewer
+	f.mu.Unlock()
 	return f.blob(which + " of " + suite)
 }
 
@@ -524,5 +528,16 @@ func TestPutOversize(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
 		t.Fatalf("spool left behind: %v", ents)
+	}
+}
+
+func TestViewerIsTheNode(t *testing.T) {
+	src := hosted()
+	h := server(t, []Source{src}, readAcme)
+	if w := do(h, "GET", releaseURL, nil); w.Code != 200 {
+		t.Fatalf("GET = %d", w.Code)
+	}
+	if src.viewer != "nid" {
+		t.Errorf("Viewer = %q, want the node's stable ID", src.viewer)
 	}
 }

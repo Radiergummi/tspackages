@@ -1070,8 +1070,9 @@ and architecture, suite and component (the `esc` function from earlier; `E()` be
 3. Delete `apt/<src>/dists/E(suite)/index.json` of each suite you
    changed. It is rebuilt from the members that remain.
 
-Rendered indexes in the cache are keyed by the suite index's ETag, so
-the next read replaces them, and no restart is needed. Check that
+The rebuilt index is a change like an upload: each client's next
+`apt-get update` gets a newer `Release` without the version, and no
+restart is needed. Check that
 `apt-cache policy <name>` no longer shows the version and that the file's
 download URL answers `404`. After step 2, nothing stops the same version
 from being uploaded again; machines that installed it keep it, so publish

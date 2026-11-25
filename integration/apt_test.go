@@ -30,6 +30,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/ecosystem/apt"
 	"github.com/radiergummi/tspackages/internal/server"
+	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/testutil"
 )
 
@@ -187,8 +188,10 @@ type aptRegistry struct {
 	ca   string // PEM file of the server's certificate
 	up   *fakeAptRepo
 	http *http.Client
-	mu   sync.Mutex
-	reqs []string // "<status> METHOD /path" of every request tspackages answered
+	// hosted is the store of the storage source.
+	hosted config.StoreConfig
+	mu     sync.Mutex
+	reqs   []string // "<status> METHOD /path" of every request tspackages answered
 }
 
 type aptOptions struct {
@@ -216,6 +219,7 @@ func startAptRegistry(t *testing.T, o aptOptions) *aptRegistry {
 	}
 	signingKey, _ := testutil.PGPKey(t, "tspackages")
 	state, hosted := o.stores(t, root)
+	r.hosted = hosted
 	cfg := &config.Config{
 		Tailscale: config.Tailscale{Hostname: "registry", Capability: capName, StateDir: filepath.Join(root, "ts")},
 		Storage: config.Storage{
@@ -673,5 +677,54 @@ func TestAptTildePlusVersion(t *testing.T) {
 	c.update()
 	if got := c.download("acme-x", file); !bytes.Equal(got, deb) {
 		t.Fatal("apt-get download acme-x: other bytes than uploaded")
+	}
+}
+
+// TestAptPromoteAndRemove: a client that updated sees a file added to its
+// suite after a newer one was, and a file removed by the procedure in
+// docs/operations.md ("Removing a bad publish").
+func TestAptPromoteAndRemove(t *testing.T) {
+	r := startAptRegistry(t, aptOptions{})
+	b := aptDeb(t, "acme-b", "1.0", "amd64", "b")
+	r.mustPut("testing", "acme-b_1.0_amd64.deb", b)
+	time.Sleep(1100 * time.Millisecond) // acme-a is uploaded a second later
+	r.mustPut("stable", "acme-a_1.0_amd64.deb", aptDeb(t, "acme-a", "1.0", "amd64", "a"))
+
+	c := r.client("amd64")
+	c.sources(c.hosted("stable", "tspackages.asc"))
+	c.update()
+	if got := c.candidate("acme-b"); got != "" {
+		t.Fatalf("candidate for acme-b before the promotion = %q, want none", got)
+	}
+	r.mustPut("stable", "acme-b_1.0_amd64.deb", b)
+	c.update()
+	if got := c.candidate("acme-b"); got != "1.0" {
+		t.Fatalf("candidate for acme-b after the promotion = %q, want 1.0", got)
+	}
+
+	// The removal: member objects, the file's objects, the suites' indexes.
+	ctx := context.Background()
+	d, err := storage.Open(ctx, r.hosted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	E := storage.EscapeSegment
+	pool := "apt/hosted/pool/" + E("acme-b") + "/" + E("1.0") + "/" + E("amd64") + "/"
+	keys := []string{pool + "deb", pool + "deb.json", pool + "~claim"}
+	for _, suite := range []string{"testing", "stable"} {
+		keys = append(keys, "apt/hosted/dists/"+E(suite)+"/"+E("main")+"/members/"+E("acme-b")+"/"+E("1.0")+"/"+E("amd64"),
+			"apt/hosted/dists/"+E(suite)+"/index.json")
+	}
+	for _, k := range keys {
+		if err := d.Delete(ctx, k); err != nil {
+			t.Fatalf("delete %s: %v", k, err)
+		}
+	}
+	c.update()
+	if got := c.candidate("acme-b"); got != "" {
+		t.Fatalf("candidate for acme-b after the removal = %q, want none", got)
+	}
+	if got := c.candidate("acme-a"); got != "1.0" {
+		t.Fatalf("candidate for acme-a after the removal = %q, want 1.0", got)
 	}
 }

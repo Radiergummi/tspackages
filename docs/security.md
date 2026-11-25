@@ -413,9 +413,10 @@ whole only up to their caps. The caps:
   3072 bits or more; a v6 key is refused. The key is the root of trust for
   every `storage` source of every client that installed it: keep the
   private key out of the repository and back it up as a secret. A signed
-  `Release` is rendered once per visible set and cached, keyed by the set
-  and bound to the key's fingerprint, so a changed key is never answered
-  with an old signature.
+  `Release` is rendered and cached per client node, and rendered again
+  when what the node may see changes or the key does, so a changed key is
+  never answered with an old signature. Its `Date` only rises for a node,
+  because apt ignores an older `Release`.
 - **Verification chain for `registry` sources.** The upstream's `Release`
   (or `InRelease` and the detached signature) is checked against the
   configured `keyring`, and any one valid signature is enough. It is

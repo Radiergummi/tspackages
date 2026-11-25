@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -196,9 +198,6 @@ func TestRenderPerCaller(t *testing.T) {
 		if v, _ := doc.Fields.Get("Architectures"); v != "all" {
 			t.Errorf("Architectures = %q", v)
 		}
-		if !doc.Date.Equal(time.Unix(0, 0)) {
-			t.Errorf("Date = %v, want the epoch", doc.Date)
-		}
 		idx := e.checkIndexes(t, none, "bookworm", doc)
 		if pkgs, ok := idx["main/binary-all/Packages"]; !ok || len(pkgs) != 0 || len(idx) != 1 {
 			t.Errorf("empty indexes = %v", idx)
@@ -230,6 +229,7 @@ func TestRenderStable(t *testing.T) {
 		e.uploadArch("bookworm", n, "amd64")
 	}
 	acc := accFor("acme-*")
+	c := newClock(e)
 	before := signatures(t)
 	doc, first := e.release(t, acc, "bookworm")
 	_, second := e.release(t, acc, "bookworm")
@@ -239,14 +239,8 @@ func TestRenderStable(t *testing.T) {
 	if got := signatures(t) - before; got != 1 {
 		t.Errorf("signed %v times, want 1", got)
 	}
-	var newest time.Time
-	for _, m := range e.members(t, "bookworm") {
-		if strings.HasPrefix(m.Deb.Name, "acme-") && m.Uploaded.After(newest) {
-			newest = m.Uploaded
-		}
-	}
-	if !doc.Date.Equal(newest.Truncate(time.Second)) {
-		t.Errorf("Date = %v, want %v", doc.Date, newest)
+	if !doc.Date.Equal(c.t) {
+		t.Errorf("Date = %v, want the time of the first rendering, %v", doc.Date, c.t)
 	}
 
 	// A source that has not rendered the set yet serves the stored signature.
@@ -255,6 +249,8 @@ func TestRenderStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+	c.tick(time.Hour)
+	e.src.now = c.now
 	if _, third := e.release(t, acc, "bookworm"); !bytes.Equal(first, third) {
 		t.Error("a fresh source signed again instead of serving the stored InRelease")
 	}
@@ -395,8 +391,6 @@ func TestIndexNoInjection(t *testing.T) {
 			sc.Fields[i][1] = "x\n\nPackage: evil"
 		}
 	}
-	future := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	sc.Uploaded = future
 	b, _ := json.Marshal(sc)
 	if _, err := d.Put(ctx, key, bytes.NewReader(b)); err != nil {
 		t.Fatal(err)
@@ -409,12 +403,9 @@ func TestIndexNoInjection(t *testing.T) {
 	if got := e.checkIndexes(t, acc, "bookworm", doc)["main/binary-amd64/Packages"]; !slices.Equal(got, []string{"acme-a"}) {
 		t.Errorf("Packages lists %v", got)
 	}
-	// The skipped member adds neither its architecture nor its date.
+	// The skipped member adds no architecture.
 	if v, _ := doc.Fields.Get("Architectures"); v != "all amd64" {
 		t.Errorf("Architectures = %q", v)
-	}
-	if doc.Date.Equal(future) {
-		t.Error("Date is the skipped member's upload time")
 	}
 	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "acme-b") {
 		t.Errorf("no error logged for the skipped member:\n%s", logs.String())
@@ -516,4 +507,157 @@ func TestByHashWriteFailureServes(t *testing.T) {
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "by-hash") {
 		t.Errorf("no warning logged:\n%s", logs.String())
 	}
+}
+
+// clock is a settable time for a StorageSource.
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time       { return c.t }
+func (c *clock) tick(d time.Duration) { c.t = c.t.Add(d) }
+
+func newClock(e *stEnv) *clock {
+	c := &clock{time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)}
+	e.src.now = c.now
+	return c
+}
+
+// viewerAcc is accFor(pattern) for the client viewer.
+func viewerAcc(pattern, viewer string) ReadAccess {
+	a := accFor(pattern)
+	a.Viewer = viewer
+	return a
+}
+
+// notModifiedSince reports whether the handler answers 304 to a client
+// that sends If-Modified-Since: since for b.
+func notModifiedSince(b Blob, since time.Time) bool {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("If-Modified-Since", since.UTC().Format(http.TimeFormat))
+	return notModified(r, b)
+}
+
+// TestDatePromotedOlderFile: a file uploaded earlier and added to a suite
+// later is a change the client sees.
+func TestDatePromotedOlderFile(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	c := newClock(e)
+	acc := viewerAcc("*", "n1")
+	if _, _, err := e.upload("testing", "main", "acme-b", "1.0", "b"); err != nil {
+		t.Fatal(err)
+	}
+	c.tick(10 * time.Second)
+	e.uploadArch("stable", "acme-a", "amd64")
+	doc, _ := e.release(t, acc, "stable")
+	blob, err := e.src.Release(context.Background(), acc, "stable", "InRelease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !notModifiedSince(blob, blob.Modified) {
+		t.Fatal("the same rendering is not 304 for its own Last-Modified")
+	}
+
+	c.tick(10 * time.Second)
+	if _, _, err := e.upload("stable", "main", "acme-b", "1.0", "b"); err != nil {
+		t.Fatal(err)
+	}
+	newDoc, _ := e.release(t, acc, "stable")
+	if !newDoc.Date.After(doc.Date) {
+		t.Errorf("Date %v after the promotion, was %v", newDoc.Date, doc.Date)
+	}
+	for _, which := range []string{"InRelease", "Release", "Release.gpg"} {
+		blob, err := e.src.Release(context.Background(), acc, "stable", which)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if notModifiedSince(blob, doc.Date) {
+			t.Errorf("%s: 304 for the Last-Modified before the promotion", which)
+		}
+	}
+	idx, err := e.src.Dist(context.Background(), acc, "stable", "main/binary-amd64/Packages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notModifiedSince(idx, doc.Date) {
+		t.Error("Packages: 304 for the Last-Modified before the promotion")
+	}
+}
+
+// TestDateOnlyRises: whatever changes what a viewer sees, its Release Date
+// rises: rules revoked and granted again, a view another viewer rendered
+// earlier, an index rebuilt to an earlier state, two changes within a
+// second, a new signing key. The same view keeps its Date.
+func TestDateOnlyRises(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	c := newClock(e)
+	ctx := context.Background()
+	e.uploadArch("bookworm", "acme-a", "amd64")
+	e.uploadArch("bookworm", "other", "amd64")
+
+	// Another viewer renders the full view first.
+	e.release(t, viewerAcc("*", "n0"), "bookworm")
+	c.tick(time.Minute)
+
+	var last time.Time
+	step := func(name string, acc ReadAccess) {
+		t.Helper()
+		doc, _ := e.release(t, acc, "bookworm")
+		if !doc.Date.After(last) {
+			t.Errorf("%s: Date %v, previous %v", name, doc.Date, last)
+		}
+		last = doc.Date
+		// The same view again keeps its Date.
+		if again, _ := e.release(t, acc, "bookworm"); !again.Date.Equal(doc.Date) {
+			t.Errorf("%s: Date changed from %v to %v without a change", name, doc.Date, again.Date)
+		}
+	}
+	step("first view", viewerAcc("acme-*", "n1"))
+	c.tick(time.Second)
+	step("rule granted, the view n0 rendered earlier", viewerAcc("*", "n1"))
+	c.tick(time.Second)
+	step("rule revoked", viewerAcc("acme-*", "n1"))
+	c.tick(time.Second)
+	step("rule granted again", viewerAcc("*", "n1"))
+
+	// Two changes within one second.
+	e.uploadArch("bookworm", "acme-b", "amd64")
+	step("upload", viewerAcc("*", "n1"))
+	e.uploadArch("bookworm", "acme-c", "amd64")
+	step("upload in the same second", viewerAcc("*", "n1"))
+
+	// The documented removal: the index is rebuilt to an earlier state.
+	c.tick(time.Second)
+	for _, n := range []string{"acme-b", "acme-c"} {
+		d := Deb{n, "1.0", "amd64"}
+		pk := poolPrefix("hosted", d)
+		for _, k := range []string{memberKey("hosted", "bookworm", "main", d), pk + "deb", pk + "deb.json", pk + "~claim"} {
+			if err := e.d.Delete(ctx, k); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := e.d.Delete(ctx, suitePrefix("hosted", "bookworm")+"index.json"); err != nil {
+		t.Fatal(err)
+	}
+	step("removal", viewerAcc("*", "n1"))
+	if got := e.checkIndexes(t, viewerAcc("*", "n1"), "bookworm", releaseDocOf(t, e, viewerAcc("*", "n1")))["main/binary-amd64/Packages"]; !slices.Equal(got, []string{"acme-a", "other"}) {
+		t.Errorf("after the removal Packages lists %v", got)
+	}
+
+	// A new signing key.
+	c.tick(time.Second)
+	cache, err := storage.NewCache(ctx, e.cacheD, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.entity = newEntity(t, "rotated", nil)
+	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, signer(t, e.entity), e.src.log)
+	e.src.now = c.now
+	step("new key", viewerAcc("*", "n1"))
+}
+
+// releaseDocOf returns the parsed Release acc sees of bookworm.
+func releaseDocOf(t *testing.T, e *stEnv, acc ReadAccess) ReleaseDoc {
+	t.Helper()
+	doc, _ := e.release(t, acc, "bookworm")
+	return doc
 }

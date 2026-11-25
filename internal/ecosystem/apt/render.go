@@ -31,25 +31,36 @@ const (
 	maxByHashHeader = 16 << 20
 )
 
-// A rendering is a suite as one visible set sees it: its indexes and the
-// Release with its signatures. A visible set is the suite's members a
-// caller may read; its identity is the sha256 of the suite, the index ETag
-// and the sorted member IDs, so a rendering is shared by every caller who
-// sees the same set and never by one who sees another.
+// A rendering is a suite as one viewer sees it: its indexes and the
+// Release with its signatures. A viewer is a caller's node, one apt client
+// state; what it sees is a visible set, the suite's members it may read.
+// The rendering's identity is the sha256 of the suite, the index ETag, the
+// sorted member IDs and the signing key's fingerprint.
+//
+// apt ignores a Release older than the one it has, and sends the Date it
+// was served as If-Modified-Since, so a viewer's Date only rises. A
+// viewer's rendering keeps its Date while its identity stays the same; any
+// other identity gets the next Date: now, or a second after the viewer's
+// previous Date when now is not later. Dates belong to the viewer, not to
+// the identity: a viewer that returns to an identity it saw before (a rule
+// revoked and granted again, an index rebuilt to an earlier state), or
+// reaches one another viewer saw first, gets the next Date too.
 //
 // Renderings live in memory and, in the cache store,
 //
-//	apt/<src>/rendered/<identity>/signed       the key's fingerprint, the Release's sha256, InRelease and Release.gpg
+//	apt/<src>/rendered/<viewer>/signed          the identity, Date, the Release's sha256, InRelease and Release.gpg
 //	apt/<src>/byhash/<suite>/<sha256>           {"suite", "members"} line, then an index file's bytes
 //
-// Indexes are deterministic for a visible set and rendered again after an
-// eviction; signatures are not, so a stored one is served while it signs
-// the same Release. By-hash files are written with each rendering and kept
+// where <viewer> is the sha256 of the viewer and the suite. Indexes are
+// deterministic for a visible set and rendered again after an eviction;
+// signatures are not, so a stored one is served while the viewer's
+// identity is the same. By-hash files are written with each rendering and kept
 // until the cache evicts them, so a client that read an InRelease can still
 // fetch its indexes after an upload; each request checks the caller may
 // read every package in the file. One evicted while its rendering is still
 // served is stored again from that rendering when a caller asks for it.
 type rendering struct {
+	id         string
 	date       time.Time
 	release    []byte
 	inRelease  []byte
@@ -69,13 +80,14 @@ func (r *rendering) size() int64 {
 	return n
 }
 
-// signedDoc is a stored signature of a rendering's Release by the key with
-// fingerprint Signer.
+// signedDoc is a viewer's latest rendering of a suite: its identity, Date
+// and signed Release.
 type signedDoc struct {
-	Signer        string `json:"signer"`
-	ReleaseSHA256 string `json:"release_sha256"`
-	InRelease     []byte `json:"inrelease"`
-	ReleaseGPG    []byte `json:"release_gpg"`
+	ID            string    `json:"id"`
+	Date          time.Time `json:"date"`
+	ReleaseSHA256 string    `json:"release_sha256"`
+	InRelease     []byte    `json:"inrelease"`
+	ReleaseGPG    []byte    `json:"release_gpg"`
 }
 
 // byHashHeader is the first line of a by-hash object.
@@ -84,8 +96,8 @@ type byHashHeader struct {
 	Members []string `json:"members"`
 }
 
-func (s *StorageSource) renderedKey(id string) string {
-	return "apt/" + s.name + "/rendered/" + id + "/signed"
+func (s *StorageSource) renderedKey(viewer string) string {
+	return "apt/" + s.name + "/rendered/" + viewer + "/signed"
 }
 
 func (s *StorageSource) byHashKey(suite, sum string) string {
@@ -213,7 +225,7 @@ func memberName(id string) string {
 	return name
 }
 
-// current returns the rendering of suite for what acc sees, rendering and
+// current returns the rendering of suite for acc's viewer, rendering and
 // signing it and storing its indexes by hash when no copy is kept.
 // A suite without members is a miss.
 func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite string) (*rendering, error) {
@@ -230,14 +242,21 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 			visible = append(visible, m)
 		}
 	}
-	id := visibleSetID(suite, etag, visible)
-	r, ok := s.rendered.Get(id)
-	if !ok {
-		r, err = flight.Do(ctx, &s.renders, id, func() (*rendering, error) {
-			if r, ok := s.rendered.Get(id); ok {
-				return r, nil
+	id := renderingID(suite, etag, visible, s.signer.Fingerprint())
+	viewer := hexSHA256([]byte(acc.Viewer + "\n" + suite))
+	r, ok := s.rendered.Get(viewer)
+	if !ok || r.id != id {
+		// One rendering at a time per viewer, so its Dates rise in order; a
+		// request that waits on another's gets that one.
+		r, err = flight.Do(ctx, &s.renders, viewer, func() (*rendering, error) {
+			var last time.Time
+			if r, ok := s.rendered.Get(viewer); ok {
+				if r.id == id {
+					return r, nil
+				}
+				last = r.date
 			}
-			r, err := s.render(context.WithoutCancel(ctx), suite, id, ms, visible)
+			r, err := s.render(context.WithoutCancel(ctx), suite, id, viewer, last, ms, visible)
 			if err != nil {
 				return nil, err
 			}
@@ -247,7 +266,7 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 				// rendering again when asked for it.
 				s.log.Warn("apt: storing by-hash files failed", "source", s.name, "suite", suite, "error", err)
 			}
-			s.rendered.Put(id, r)
+			s.rendered.Put(viewer, r)
 			return r, nil
 		})
 		if err != nil {
@@ -261,26 +280,26 @@ func memberID(m member) string {
 	return indexMember{Component: m.Component, Name: m.Deb.Name, Version: m.Deb.Version, Arch: m.Deb.Arch}.id()
 }
 
-func visibleSetID(suite, etag string, visible []member) string {
+func renderingID(suite, etag string, visible []member, fingerprint string) string {
 	ids := make([]string, len(visible))
 	for i, m := range visible {
 		ids[i] = memberID(m)
 	}
 	slices.Sort(ids)
 	h := sha256.New()
-	h.Write([]byte(suite + "\n" + etag + "\n" + strings.Join(ids, "\n")))
+	h.Write([]byte(suite + "\n" + etag + "\n" + fingerprint + "\n" + strings.Join(ids, "\n")))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// render builds the rendering of visible, a subset of the suite's members
-// ms in suite order, and signs its Release unless a stored signature signs
-// the same Release.
-func (s *StorageSource) render(ctx context.Context, suite, id string, ms, visible []member) (*rendering, error) {
+// render builds the rendering id of visible, a subset of the suite's
+// members ms in suite order, for viewer, and dates and signs its Release;
+// last is the Date of the viewer's rendering in memory, if any.
+func (s *StorageSource) render(ctx context.Context, suite, id, viewer string, last time.Time, ms, visible []member) (*rendering, error) {
 	var comps, archs []string
 	for _, m := range ms {
 		comps = append(comps, m.Component)
 	}
-	r := &rendering{date: time.Unix(0, 0).UTC(), indexes: map[string][]byte{}, members: map[string][]string{}}
+	r := &rendering{id: id, indexes: map[string][]byte{}, members: map[string][]string{}}
 	stanzas := make([][]byte, len(visible))
 	for i, m := range visible {
 		var b bytes.Buffer
@@ -293,12 +312,7 @@ func (s *StorageSource) render(ctx context.Context, suite, id string, ms, visibl
 		if m.Deb.Arch != "all" {
 			archs = append(archs, m.Deb.Arch)
 		}
-		if m.Uploaded.After(r.date) {
-			r.date = m.Uploaded.UTC()
-		}
 	}
-	// The Release states the date in seconds; Last-Modified agrees with it.
-	r.date = r.date.Truncate(time.Second)
 	slices.Sort(comps)
 	comps = slices.Compact(comps)
 	slices.Sort(archs)
@@ -341,10 +355,9 @@ func (s *StorageSource) render(ctx context.Context, suite, id string, ms, visibl
 			{"Architectures", strings.Join(append([]string{"all"}, archs...), " ")},
 			{"Components", strings.Join(comps, " ")}, {"Acquire-By-Hash", ""},
 		},
-		Date: r.date, ByHash: true, SHA256: hashes,
+		ByHash: true, SHA256: hashes,
 	}
-	r.release = doc.Render()
-	if err := s.sign(ctx, id, r); err != nil {
+	if err := s.sign(ctx, viewer, last, r, doc); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -381,28 +394,43 @@ func gzipBytes(b []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// sign sets r's InRelease and Release.gpg: the stored ones when they sign
-// r.release with the current key, otherwise new signatures, which are then stored.
-func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error {
-	sum := hexSHA256(r.release)
-	key := s.renderedKey(id)
+// sign dates doc, sets it as r's Release and signs it: with the viewer's
+// stored Date and signatures when they are for r's identity, otherwise
+// with the next Date after the stored one and last, storing the new
+// signatures.
+func (s *StorageSource) sign(ctx context.Context, viewer string, last time.Time, r *rendering, doc ReleaseDoc) error {
+	key := s.renderedKey(viewer)
+	var prev signedDoc
 	rc, _, err := s.cache.Get(ctx, key)
 	switch {
 	case err == nil:
 		b, err := io.ReadAll(io.LimitReader(rc, maxSignedBytes+1))
 		rc.Close()
-		var doc signedDoc
-		if err == nil && len(b) <= maxSignedBytes && json.Unmarshal(b, &doc) == nil &&
-			doc.ReleaseSHA256 == sum && doc.Signer == s.signer.Fingerprint() {
-			r.inRelease, r.releaseGPG = doc.InRelease, doc.ReleaseGPG
-			return nil
-		}
 		if err != nil {
 			return err
+		}
+		if len(b) > maxSignedBytes || json.Unmarshal(b, &prev) != nil {
+			prev = signedDoc{}
 		}
 	case !errors.Is(err, storage.ErrNotFound):
 		return err
 	}
+	if prev.ID == r.id {
+		doc.Date = prev.Date
+		if rel := doc.Render(); hexSHA256(rel) == prev.ReleaseSHA256 {
+			r.date, r.release, r.inRelease, r.releaseGPG = prev.Date, rel, prev.InRelease, prev.ReleaseGPG
+			return nil
+		}
+	}
+	// The Release states the Date in seconds; Last-Modified agrees with it.
+	r.date = s.now().UTC().Truncate(time.Second)
+	for _, t := range []time.Time{prev.Date, last} {
+		if !r.date.After(t) {
+			r.date = t.UTC().Add(time.Second)
+		}
+	}
+	doc.Date = r.date
+	r.release = doc.Render()
 	if r.inRelease, err = s.signer.ClearSign(r.release); err != nil {
 		return err
 	}
@@ -410,12 +438,13 @@ func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error
 		return err
 	}
 	metrics.ObserveAptSignature(s.name)
-	b, err := json.Marshal(signedDoc{Signer: s.signer.Fingerprint(), ReleaseSHA256: sum, InRelease: r.inRelease, ReleaseGPG: r.releaseGPG})
+	b, err := json.Marshal(signedDoc{ID: r.id, Date: r.date, ReleaseSHA256: hexSHA256(r.release), InRelease: r.inRelease, ReleaseGPG: r.releaseGPG})
 	if err != nil {
 		return err
 	}
 	if err := s.cache.Put(ctx, key, bytes.NewReader(b)); err != nil {
-		// Served anyway: the next rendering of this set signs again.
+		// Served anyway: the viewer's next rendering is dated after this one
+		// while this one is in memory.
 		s.log.Warn("apt: storing a Release signature failed", "source", s.name, "error", err)
 	}
 	return nil

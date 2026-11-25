@@ -231,8 +231,9 @@ func (h *APT) access(caller identity.Caller) ReadAccess {
 		h.logMalformed(caller)
 	}
 	return ReadAccess{
-		Any:  anyRule,
-		Name: func(name string) bool { return authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) },
+		Any:    anyRule,
+		Name:   func(name string) bool { return authz.Allowed(caller.Rules, ecoName, name, authz.Read, Match) },
+		Viewer: caller.NodeStableID,
 	}
 }
 

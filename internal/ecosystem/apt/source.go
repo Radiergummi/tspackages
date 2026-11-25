@@ -27,6 +27,9 @@ var ErrExists = errors.New("already exists with other content")
 type ReadAccess struct {
 	Any  bool                   // some valid apt: read rule (or "*")
 	Name func(name string) bool // authz.Allowed(rules, "apt", name, authz.Read, Match)
+	// Viewer is the caller's node, one apt client state: the Release
+	// Dates it is served only rise.
+	Viewer string
 }
 
 // Blob is a file a source serves. The caller closes Body.

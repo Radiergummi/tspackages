@@ -56,6 +56,7 @@ type StorageSource struct {
 	rec    *records.Store
 	signer *Signer
 	log    *slog.Logger
+	now    func() time.Time // replaced in tests
 
 	rendered *lru.Cache[*rendering]
 	renders  singleflight.Group
@@ -69,7 +70,7 @@ func NewStorageSource(name string, claims []string, d storage.Driver, cache *sto
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log,
+	return &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log, now: time.Now,
 		rendered: lru.New(maxRenderedBytes, (*rendering).size)}
 }
 
