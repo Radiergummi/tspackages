@@ -15,7 +15,9 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/metrics"
@@ -660,4 +662,70 @@ func releaseDocOf(t *testing.T, e *stEnv, acc ReadAccess) ReleaseDoc {
 	t.Helper()
 	doc, _ := e.release(t, acc, "bookworm")
 	return doc
+}
+
+// blockSigned blocks the first read of a viewer's signed document until
+// release is closed, after closing started.
+type blockSigned struct {
+	storage.Driver
+	once             sync.Once
+	started, release chan struct{}
+}
+
+func (d *blockSigned) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if strings.Contains(key, "/rendered/") {
+		d.once.Do(func() {
+			close(d.started)
+			<-d.release
+		})
+	}
+	return d.Driver.Get(ctx, key)
+}
+
+// TestRenderFollowerGetsOwnView: a request of a node that joins a
+// rendering the node started with other rules (a rule revoked in between)
+// gets a rendering of its own visible set, never the other one.
+func TestRenderFollowerGetsOwnView(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newStEnv(t, fsDriver(t))
+		for _, n := range []string{"acme-a", "other"} {
+			e.uploadArch("bookworm", n, "amd64")
+		}
+		block := &blockSigned{Driver: e.cacheD, started: make(chan struct{}), release: make(chan struct{})}
+		cache, err := storage.NewCache(context.Background(), block, 1<<30, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+		ctx := context.Background()
+
+		go func() { _, _ = e.src.Release(ctx, viewerAcc("*", "n1"), "bookworm", "InRelease") }()
+		<-block.started
+		revoked := viewerAcc("acme-*", "n1")
+		var rel, idx Blob
+		var relErr, idxErr error
+		var wg sync.WaitGroup
+		wg.Go(func() { rel, relErr = e.src.Release(ctx, revoked, "bookworm", "InRelease") })
+		wg.Go(func() { idx, idxErr = e.src.Dist(ctx, revoked, "bookworm", "main/binary-amd64/Packages") })
+		synctest.Wait() // both wait on the rendering in progress
+		close(block.release)
+		wg.Wait()
+
+		pkgs := blobBytes(t, idx, idxErr)
+		if bytes.Contains(pkgs, []byte("Package: other")) || !bytes.Contains(pkgs, []byte("Package: acme-a")) {
+			t.Errorf("Packages after the revoke:\n%s", pkgs)
+		}
+		text, err := keyring(t, e.entity).VerifyInRelease(blobBytes(t, rel, relErr), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, err := ParseRelease(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, h := byHash(t, doc, "main/binary-amd64/Packages")
+		if h != hexSHA256(pkgs) {
+			t.Error("InRelease after the revoke lists another Packages than the node's own")
+		}
+	})
 }
