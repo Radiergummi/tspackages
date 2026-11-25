@@ -98,6 +98,7 @@ type regEnv struct {
 	cd      storage.Driver
 	relay   *relay.Relay
 	rec     *records.Store
+	state   storage.Driver
 	key     *openpgp.Entity
 	clock   time.Time
 	debs    map[string][]byte // pool path → bytes
@@ -109,6 +110,26 @@ func newRegEnv(t *testing.T) *regEnv {
 	e := &regEnv{up: newAptUpstream(t), key: newEntity(t, "upstream", nil), clock: time.Now().Add(time.Minute).UTC(),
 		debs:    map[string][]byte{curlPool: []byte("curl deb bytes"), acmePool: []byte("acme deb bytes")},
 		claimed: map[string]bool{}}
+	e.freshCache(t)
+	var err error
+	e.state, err = storage.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.rec = records.New(e.state)
+	e.cfg = RegistryConfig{
+		Name: regSource, URL: e.up.srv.URL + "/", Keyring: keyring(t, e.key),
+		Suites: []string{regSuite}, Components: []string{"main"}, Architectures: []string{"amd64"},
+		TTL: time.Hour, MaxArtifact: 1 << 20,
+		Claimed: func(name string) bool { return e.claimed[name] },
+	}
+	e.src = e.newSource()
+	return e
+}
+
+// freshCache gives e an empty cache and relay, as after the cache was lost.
+func (e *regEnv) freshCache(t *testing.T) {
+	t.Helper()
 	var err error
 	e.cd, err = storage.NewFS(t.TempDir())
 	if err != nil {
@@ -123,26 +144,13 @@ func newRegEnv(t *testing.T) *regEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.relay.Wait)
-	sd, err := storage.NewFS(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.rec = records.New(sd)
-	e.cfg = RegistryConfig{
-		Name: regSource, URL: e.up.srv.URL + "/", Keyring: keyring(t, e.key),
-		Suites: []string{regSuite}, Components: []string{"main"}, Architectures: []string{"amd64"},
-		TTL: time.Hour, MaxArtifact: 1 << 20,
-		Claimed: func(name string) bool { return e.claimed[name] },
-	}
-	e.src = e.newSource()
-	return e
 }
 
 // newSource returns a source over e's cache, upstream and config, as after
 // a restart.
 func (e *regEnv) newSource() *RegistrySource {
 	c := upstream.New(upstream.Options{FetchHosts: []string{"127.0.0.1"}, AllowPrivateForTesting: true})
-	s := NewRegistrySource(e.cfg, c, e.cache, e.relay, e.rec, nil, slog.New(slog.DiscardHandler))
+	s := NewRegistrySource(e.cfg, c, e.cache, e.state, e.relay, e.rec, nil, slog.New(slog.DiscardHandler))
 	s.now = func() time.Time { return e.clock }
 	return s
 }
@@ -171,6 +179,7 @@ type pubOpts struct {
 	date, validUntil time.Time
 	signer           *openpgp.Entity // nil: e.key
 	noInRelease      bool
+	suite            string // the Suite and Codename fields; "": regSuite
 }
 
 // publish puts the repository on the upstream: pool files, the Packages
@@ -184,13 +193,16 @@ func (e *regEnv) publish(t *testing.T, o pubOpts) []byte {
 	if o.signer == nil {
 		o.signer = e.key
 	}
+	if o.suite == "" {
+		o.suite = regSuite
+	}
 	for p, b := range e.debs {
 		e.up.set(p, b)
 	}
 	plain := e.packages()
 	gz := testutil.Gzip(t, plain)
 	var rel strings.Builder
-	fmt.Fprintf(&rel, "Origin: Test\nSuite: %s\nCodename: %s\nDate: %s\n", regSuite, regSuite, o.date.Format(releaseDate))
+	fmt.Fprintf(&rel, "Origin: Test\nSuite: %s\nCodename: %s\nDate: %s\n", o.suite, o.suite, o.date.Format(releaseDate))
 	if !o.validUntil.IsZero() {
 		fmt.Fprintf(&rel, "Valid-Until: %s\n", o.validUntil.Format(releaseDate))
 	}
@@ -398,6 +410,34 @@ func TestRegistryRejects(t *testing.T) {
 		if got := body(t)(e.newSource().Release(ctx, anyAcc, regSuite, "InRelease")); string(got) != string(in) {
 			t.Error("an older Release replaced the cached one after a restart")
 		}
+	})
+
+	t.Run("rollback after the cache is lost", func(t *testing.T) {
+		e := newRegEnv(t)
+		e.publish(t, pubOpts{})
+		body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+		e.publish(t, pubOpts{date: e.clock.Add(-2 * time.Hour)})
+		e.freshCache(t)
+		_, err := e.newSource().Release(ctx, anyAcc, regSuite, "InRelease")
+		bad(t, err)
+	})
+
+	t.Run("other suite", func(t *testing.T) {
+		e := newRegEnv(t)
+		in := e.publish(t, pubOpts{})
+		body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+		e.publish(t, pubOpts{suite: "testing", date: e.clock})
+		e.clock = e.clock.Add(2 * time.Hour)
+		if got := body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease")); string(got) != string(in) {
+			t.Error("another suite's Release replaced the cached one")
+		}
+		if h := e.src.Health(ctx); h[0].OK {
+			t.Errorf("Health = %+v", h)
+		}
+		fresh := newRegEnv(t)
+		fresh.publish(t, pubOpts{suite: "testing"})
+		_, err := fresh.src.Release(ctx, anyAcc, regSuite, "InRelease")
+		bad(t, err)
 	})
 
 	t.Run("index mismatch", func(t *testing.T) {

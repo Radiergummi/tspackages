@@ -62,6 +62,10 @@ type ChangedFile struct{ Source, Path, First, Now string }
 //	apt/<src>/sha256-<hex>                          a verified dists or pool file
 //	apt/<src>/lookup/<release sha256>/<xx>.json     the pool lookup, see lookup.go
 //
+// The state store holds, per suite, the Date of the newest Release accepted
+// (apt/<src>/release-mark/<suite>): no older one is accepted, whatever the
+// cache has lost.
+//
 // Suites, components and architectures not configured are misses without an
 // upstream request; so is a package any storage source claims.
 type RegistrySource struct {
@@ -70,6 +74,7 @@ type RegistrySource struct {
 	archs  []string // configured, and "all"
 	c      *upstream.Client
 	cache  *storage.Cache
+	state  storage.Driver // the Release high-water marks
 	relay  *relay.Relay
 	rec    *records.Store
 	wait   func(context.Context) error
@@ -92,9 +97,9 @@ type RegistrySource struct {
 var _ Source = (*RegistrySource)(nil)
 
 // NewRegistrySource returns a pass-through source for the repository at
-// cfg.URL. wait, if non-nil, is called before every upstream request; log
+// cfg.URL that keeps its Release high-water marks in state. wait, if non-nil, is called before every upstream request; log
 // nil means slog.Default().
-func NewRegistrySource(cfg RegistryConfig, c *upstream.Client, cache *storage.Cache, rl *relay.Relay, rec *records.Store, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
+func NewRegistrySource(cfg RegistryConfig, c *upstream.Client, cache *storage.Cache, state storage.Driver, rl *relay.Relay, rec *records.Store, wait func(context.Context) error, log *slog.Logger) *RegistrySource {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -102,7 +107,7 @@ func NewRegistrySource(cfg RegistryConfig, c *upstream.Client, cache *storage.Ca
 		wait = func(context.Context) error { return nil }
 	}
 	cfg.URL = strings.TrimRight(cfg.URL, "/") + "/"
-	s := &RegistrySource{cfg: cfg, suites: map[string]bool{}, c: c, cache: cache, relay: rl, rec: rec, wait: wait, log: log,
+	s := &RegistrySource{cfg: cfg, suites: map[string]bool{}, c: c, cache: cache, state: state, relay: rl, rec: rec, wait: wait, log: log,
 		now: time.Now, states: map[string]*relState{}}
 	for _, suite := range cfg.Suites {
 		s.suites[suite] = true
@@ -455,7 +460,8 @@ func (s *RegistrySource) refresh(ctx context.Context, suite string) (*relState, 
 
 // fetchRelease fetches suite's InRelease, or Release and Release.gpg when
 // there is none, and accepts it when it verifies, its Valid-Until has not
-// passed and its Date is not older than old's.
+// passed, its Suite or Codename is suite, and its Date is older neither than
+// the high-water mark nor than old's.
 func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *relState) (*relState, error) {
 	base := s.cfg.URL + "dists/" + url.PathEscape(suite) + "/"
 	var obj releaseObj
@@ -480,6 +486,14 @@ func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *re
 	if vu := st.doc.ValidUntil; !vu.IsZero() && s.now().After(vu) {
 		return nil, fmt.Errorf("upstream Release of %s rejected: Valid-Until %s has passed", suite, vu.Format(time.RFC3339))
 	}
+	rs, _ := st.doc.Fields.Get("Suite")
+	rc, _ := st.doc.Fields.Get("Codename")
+	if rs != suite && rc != suite {
+		return nil, fmt.Errorf("upstream Release of %s rejected: it is for Suite %q, Codename %q", suite, truncate(rs, 80), truncate(rc, 80))
+	}
+	if err := s.raiseMark(ctx, suite, st); err != nil {
+		return nil, err
+	}
 	if old == nil {
 		s.writeRelease(ctx, suite, st)
 		return st, nil
@@ -499,6 +513,61 @@ func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *re
 	}
 	s.writeRelease(ctx, suite, st)
 	return st, nil
+}
+
+// releaseMark is the newest Release Date a source accepted for a suite,
+// kept in the state store so that losing the cache never lets an older
+// Release back in.
+type releaseMark struct {
+	Date   time.Time `json:"date"`
+	SHA256 string    `json:"sha256"` // of the verified upstream bytes
+}
+
+func (s *RegistrySource) markKey(suite string) string {
+	return "apt/" + s.cfg.Name + "/release-mark/" + storage.EscapeSegment(suite)
+}
+
+// raiseMark rejects st when its Date is older than suite's high-water mark,
+// and raises the mark to st's Date when it is newer, with a compare-and-swap
+// so that concurrent writers never lower it. Failing to read or write the
+// mark rejects st.
+func (s *RegistrySource) raiseMark(ctx context.Context, suite string, st *relState) error {
+	key := s.markKey(suite)
+	for range updateRetries {
+		var m releaseMark
+		etag := ""
+		rc, info, err := s.state.Get(ctx, key)
+		switch {
+		case err == nil:
+			err = json.NewDecoder(io.LimitReader(rc, maxSidecarBytes)).Decode(&m)
+			rc.Close()
+			if err != nil {
+				return fmt.Errorf("apt Release mark %s: %w", key, err)
+			}
+			etag = info.ETag
+		case !errors.Is(err, storage.ErrNotFound):
+			return fmt.Errorf("read apt Release mark: %w", err)
+		}
+		if st.doc.Date.Before(m.Date) {
+			return fmt.Errorf("upstream Release of %s rejected: Date %s is older than the newest accepted, %s", suite,
+				st.doc.Date.Format(time.RFC3339), m.Date.Format(time.RFC3339))
+		}
+		if etag != "" && !st.doc.Date.After(m.Date) {
+			return nil
+		}
+		b, err := json.Marshal(releaseMark{Date: st.doc.Date, SHA256: st.sum})
+		if err != nil {
+			return err
+		}
+		_, err = s.state.PutIfMatch(ctx, key, bytes.NewReader(b), etag)
+		if !errors.Is(err, storage.ErrPrecondition) {
+			if err != nil {
+				return fmt.Errorf("write apt Release mark: %w", err)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("write apt Release mark: %d conflicting writes in a row", updateRetries)
 }
 
 // writeRelease caches st. A failure is logged: st is verified and serves
