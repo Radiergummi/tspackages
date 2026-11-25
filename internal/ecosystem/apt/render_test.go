@@ -383,9 +383,9 @@ func TestIndexNoInjection(t *testing.T) {
 	d := fsDriver(t)
 	e := newStEnvLog(t, d, slog.New(slog.NewTextHandler(&logs, nil)))
 	e.uploadArch("bookworm", "acme-a", "amd64")
-	e.uploadArch("bookworm", "acme-b", "amd64")
+	e.uploadArch("bookworm", "acme-b", "s390x")
 	ctx := context.Background()
-	key := poolPrefix("hosted", Deb{"acme-b", "1.0", "amd64"}) + "deb.json"
+	key := poolPrefix("hosted", Deb{"acme-b", "1.0", "s390x"}) + "deb.json"
 	sc, _, err := e.src.readSidecar(ctx, key)
 	if err != nil {
 		t.Fatal(err)
@@ -395,6 +395,8 @@ func TestIndexNoInjection(t *testing.T) {
 			sc.Fields[i][1] = "x\n\nPackage: evil"
 		}
 	}
+	future := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	sc.Uploaded = future
 	b, _ := json.Marshal(sc)
 	if _, err := d.Put(ctx, key, bytes.NewReader(b)); err != nil {
 		t.Fatal(err)
@@ -406,6 +408,13 @@ func TestIndexNoInjection(t *testing.T) {
 	doc, _ := e.release(t, acc, "bookworm")
 	if got := e.checkIndexes(t, acc, "bookworm", doc)["main/binary-amd64/Packages"]; !slices.Equal(got, []string{"acme-a"}) {
 		t.Errorf("Packages lists %v", got)
+	}
+	// The skipped member adds neither its architecture nor its date.
+	if v, _ := doc.Fields.Get("Architectures"); v != "all amd64" {
+		t.Errorf("Architectures = %q", v)
+	}
+	if doc.Date.Equal(future) {
+		t.Error("Date is the skipped member's upload time")
 	}
 	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "acme-b") {
 		t.Errorf("no error logged for the skipped member:\n%s", logs.String())
@@ -432,5 +441,47 @@ func TestByHashKeptAcrossRenderings(t *testing.T) {
 	}
 	if _, err := e.src.ByHash(ctx, accFor("acme-*"), "bookworm", rel, sum); !errors.Is(err, resolve.ErrNotFound) {
 		t.Errorf("caller without other: %v, want ErrNotFound", err)
+	}
+}
+
+func TestByHashRestoredAfterEviction(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	e.uploadArch("bookworm", "acme-a", "amd64")
+	ctx := context.Background()
+	acc := accFor("acme-*")
+	doc, _ := e.release(t, acc, "bookworm")
+	rel, sum := byHash(t, doc, "main/binary-amd64/Packages.gz")
+	key := e.src.byHashKey("bookworm", sum)
+	if err := e.cacheD.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	b, err := e.src.ByHash(ctx, acc, "bookworm", rel, sum)
+	if got := blobBytes(t, b, err); hexSHA256(got) != sum || !b.Immutable {
+		t.Errorf("served %d bytes, Immutable %v", len(got), b.Immutable)
+	}
+	if _, err := e.cacheD.Stat(ctx, key); err != nil {
+		t.Errorf("entry not stored again: %v", err)
+	}
+	// A caller whose rendering lacks the hash still misses.
+	if _, err := e.src.ByHash(ctx, ReadAccess{Any: true, Name: func(string) bool { return false }}, "bookworm", rel, sum); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("caller without acme-a: %v", err)
+	}
+}
+
+func TestSignatureBoundToKey(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	e.uploadArch("bookworm", "acme-a", "amd64")
+	acc := accFor("*")
+	before := signatures(t)
+	e.release(t, acc, "bookworm")
+	cache, err := storage.NewCache(context.Background(), e.cacheD, 1<<30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.entity = newEntity(t, "rotated", nil)
+	e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, signer(t, e.entity), e.src.log)
+	e.release(t, acc, "bookworm") // verifies with the new key
+	if got := signatures(t) - before; got != 2 {
+		t.Errorf("signed %v times, want 2", got)
 	}
 }

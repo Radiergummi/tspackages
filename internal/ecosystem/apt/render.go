@@ -39,7 +39,7 @@ const (
 //
 // Renderings live in memory and, in the cache store,
 //
-//	apt/<src>/rendered/<identity>/signed       the Release's sha256, InRelease and Release.gpg
+//	apt/<src>/rendered/<identity>/signed       the key's fingerprint, the Release's sha256, InRelease and Release.gpg
 //	apt/<src>/byhash/<suite>/<sha256>           {"suite", "members"} line, then an index file's bytes
 //
 // Indexes are deterministic for a visible set and rendered again after an
@@ -47,7 +47,8 @@ const (
 // the same Release. By-hash files are written with each rendering and kept
 // until the cache evicts them, so a client that read an InRelease can still
 // fetch its indexes after an upload; each request checks the caller may
-// read every package in the file.
+// read every package in the file. One evicted while its rendering is still
+// served is stored again from that rendering when a caller asks for it.
 type rendering struct {
 	date       time.Time
 	release    []byte
@@ -68,8 +69,10 @@ func (r *rendering) size() int64 {
 	return n
 }
 
-// signedDoc is a stored signature of a rendering's Release.
+// signedDoc is a stored signature of a rendering's Release by the key with
+// fingerprint Signer.
 type signedDoc struct {
+	Signer        string `json:"signer"`
 	ReleaseSHA256 string `json:"release_sha256"`
 	InRelease     []byte `json:"inrelease"`
 	ReleaseGPG    []byte `json:"release_gpg"`
@@ -131,8 +134,9 @@ func (s *StorageSource) Dist(ctx context.Context, acc ReadAccess, suite, rel str
 }
 
 // ByHash serves rel, "<component>/binary-<arch>/by-hash/SHA256/<sum>", when
-// a rendering of suite stored an index with that hash and acc may
-// read every package in it.
+// a rendering of suite stored an index with that hash and acc may read every
+// package in it, or when an index of acc's current rendering has that hash
+// (an entry the cache evicted is then stored again).
 func (s *StorageSource) ByHash(ctx context.Context, acc ReadAccess, suite, rel, sum string) (Blob, error) {
 	miss := fmt.Errorf("%w: %s", resolve.ErrNotFound, rel)
 	dir, ok := strings.CutSuffix(rel, "/by-hash/SHA256/"+sum)
@@ -141,12 +145,38 @@ func (s *StorageSource) ByHash(ctx context.Context, acc ReadAccess, suite, rel, 
 	if !ok || !isBin || !ValidSuite(comp) || !ValidArch(arch) || !ValidSuite(suite) || !isHex64(sum) || acc.Name == nil {
 		return Blob{}, miss
 	}
-	rc, size, err := s.cache.Open(ctx, s.byHashKey(suite, sum))
-	if errors.Is(err, storage.ErrNotFound) {
+	b, found, err := s.storedByHash(ctx, acc, suite, sum)
+	if err != nil || found {
+		return b, err
+	}
+	r, err := s.current(ctx, acc, suite)
+	if errors.Is(err, resolve.ErrNotFound) {
 		return Blob{}, miss
 	}
 	if err != nil {
 		return Blob{}, err
+	}
+	for path, idx := range r.indexes {
+		if hexSHA256(idx) != sum {
+			continue
+		}
+		if err := s.storeIndex(context.WithoutCancel(ctx), suite, r, path); err != nil {
+			s.log.Warn("apt: storing a by-hash file failed", "source", s.name, "suite", suite, "error", err)
+		}
+		return Blob{Body: io.NopCloser(bytes.NewReader(idx)), Size: int64(len(idx)), ETag: `"` + sum + `"`, Immutable: true}, nil
+	}
+	return Blob{}, miss
+}
+
+// storedByHash serves the stored by-hash file sum of suite when acc may read
+// every package in it; found is false when there is none acc may read.
+func (s *StorageSource) storedByHash(ctx context.Context, acc ReadAccess, suite, sum string) (Blob, bool, error) {
+	rc, size, err := s.cache.Open(ctx, s.byHashKey(suite, sum))
+	if errors.Is(err, storage.ErrNotFound) {
+		return Blob{}, false, nil
+	}
+	if err != nil {
+		return Blob{}, false, err
 	}
 	br := bufio.NewReader(rc)
 	line, err := readLine(br, maxByHashHeader)
@@ -156,23 +186,23 @@ func (s *StorageSource) ByHash(ctx context.Context, acc ReadAccess, suite, rel, 
 	}
 	if err != nil {
 		rc.Close()
-		return Blob{}, fmt.Errorf("apt: by-hash object %s: %w", sum, err)
+		return Blob{}, false, fmt.Errorf("apt: by-hash object %s: %w", sum, err)
 	}
 	if h.Suite != suite {
 		rc.Close()
-		return Blob{}, miss
+		return Blob{}, false, nil
 	}
 	for _, id := range h.Members {
 		if !acc.Name(memberName(id)) {
 			rc.Close()
-			return Blob{}, miss
+			return Blob{}, false, nil
 		}
 	}
 	body := struct {
 		io.Reader
 		io.Closer
 	}{br, rc}
-	return Blob{Body: body, Size: size - int64(len(line)) - 1, ETag: `"` + sum + `"`, Immutable: true}, nil
+	return Blob{Body: body, Size: size - int64(len(line)) - 1, ETag: `"` + sum + `"`, Immutable: true}, true, nil
 }
 
 // memberName is the package name in a member ID,
@@ -250,12 +280,6 @@ func (s *StorageSource) render(ctx context.Context, suite, id string, ms, visibl
 	r := &rendering{date: time.Unix(0, 0).UTC(), indexes: map[string][]byte{}, members: map[string][]string{}}
 	stanzas := make([][]byte, len(visible))
 	for i, m := range visible {
-		if m.Deb.Arch != "all" {
-			archs = append(archs, m.Deb.Arch)
-		}
-		if m.Uploaded.After(r.date) {
-			r.date = m.Uploaded.UTC()
-		}
 		var b bytes.Buffer
 		if err := WriteStanza(&b, indexStanza(m)); err != nil {
 			s.log.Error("apt: leaving out of the index a member whose fields cannot be written",
@@ -263,6 +287,12 @@ func (s *StorageSource) render(ctx context.Context, suite, id string, ms, visibl
 			continue
 		}
 		stanzas[i] = b.Bytes()
+		if m.Deb.Arch != "all" {
+			archs = append(archs, m.Deb.Arch)
+		}
+		if m.Uploaded.After(r.date) {
+			r.date = m.Uploaded.UTC()
+		}
 	}
 	// The Release states the date in seconds; Last-Modified agrees with it.
 	r.date = r.date.Truncate(time.Second)
@@ -349,7 +379,7 @@ func gzipBytes(b []byte) ([]byte, error) {
 }
 
 // sign sets r's InRelease and Release.gpg: the stored ones when they sign
-// r.release, otherwise new signatures, which are then stored.
+// r.release with the current key, otherwise new signatures, which are then stored.
 func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error {
 	sum := hexSHA256(r.release)
 	key := s.renderedKey(id)
@@ -359,7 +389,8 @@ func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error
 		b, err := io.ReadAll(io.LimitReader(rc, maxSignedBytes+1))
 		rc.Close()
 		var doc signedDoc
-		if err == nil && len(b) <= maxSignedBytes && json.Unmarshal(b, &doc) == nil && doc.ReleaseSHA256 == sum {
+		if err == nil && len(b) <= maxSignedBytes && json.Unmarshal(b, &doc) == nil &&
+			doc.ReleaseSHA256 == sum && doc.Signer == s.signer.Fingerprint() {
 			r.inRelease, r.releaseGPG = doc.InRelease, doc.ReleaseGPG
 			return nil
 		}
@@ -376,7 +407,7 @@ func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error
 		return err
 	}
 	metrics.ObserveAptSignature(s.name)
-	b, err := json.Marshal(signedDoc{ReleaseSHA256: sum, InRelease: r.inRelease, ReleaseGPG: r.releaseGPG})
+	b, err := json.Marshal(signedDoc{Signer: s.signer.Fingerprint(), ReleaseSHA256: sum, InRelease: r.inRelease, ReleaseGPG: r.releaseGPG})
 	if err != nil {
 		return err
 	}
@@ -389,15 +420,21 @@ func (s *StorageSource) sign(ctx context.Context, id string, r *rendering) error
 
 // storeByHash stores each of r's indexes by its hash.
 func (s *StorageSource) storeByHash(ctx context.Context, suite string, r *rendering) error {
-	for path, b := range r.indexes {
-		hdr, err := json.Marshal(byHashHeader{Suite: suite, Members: r.members[path]})
-		if err != nil {
-			return err
-		}
-		body := io.MultiReader(bytes.NewReader(hdr), strings.NewReader("\n"), bytes.NewReader(b))
-		if err := s.cache.Put(ctx, s.byHashKey(suite, hexSHA256(b)), body); err != nil {
+	for path := range r.indexes {
+		if err := s.storeIndex(ctx, suite, r, path); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// storeIndex stores r's index at path by its hash.
+func (s *StorageSource) storeIndex(ctx context.Context, suite string, r *rendering, path string) error {
+	b := r.indexes[path]
+	hdr, err := json.Marshal(byHashHeader{Suite: suite, Members: r.members[path]})
+	if err != nil {
+		return err
+	}
+	body := io.MultiReader(bytes.NewReader(hdr), strings.NewReader("\n"), bytes.NewReader(b))
+	return s.cache.Put(ctx, s.byHashKey(suite, hexSHA256(b)), body)
 }
