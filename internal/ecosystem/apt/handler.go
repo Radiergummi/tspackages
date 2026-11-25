@@ -118,6 +118,14 @@ func (h *APT) serve(rw http.ResponseWriter, r *http.Request) {
 		problem(rw, http.StatusForbidden, "forbidden")
 		return
 	}
+	if caller.NodeStableID == "" {
+		// A node is one apt client state, whose Release Dates only rise and
+		// whose renderings no other node shares; WhoIs always names it.
+		h.log.Warn("apt request without a node stable ID", "caller", caller.String(), "path", r.URL.Path, "status", http.StatusForbidden)
+		metrics.ObserveRequest(ecoName, "none", http.StatusForbidden)
+		problem(rw, http.StatusForbidden, "forbidden")
+		return
+	}
 	w := &statusWriter{ResponseWriter: rw}
 	e := &entry{}
 	h.route(w, r, caller, e)

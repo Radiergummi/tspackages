@@ -541,3 +541,38 @@ func TestViewerIsTheNode(t *testing.T) {
 		t.Errorf("Viewer = %q, want the node's stable ID", src.viewer)
 	}
 }
+
+// TestNoNodeForbidden: a caller without a node stable ID has no apt client
+// state of its own, so it is refused, and logged, before any source sees it.
+func TestNoNodeForbidden(t *testing.T) {
+	src := hosted()
+	src.viewer = "none yet"
+	var logs bytes.Buffer
+	mux := http.NewServeMux()
+	New([]Source{src}, nil, 1<<20, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil))).Mount(mux)
+	noNode := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := identity.FromContext(r.Context())
+		c.NodeStableID = ""
+		mux.ServeHTTP(w, r.WithContext(identity.WithCaller(r.Context(), c)))
+	})
+	h := identity.Middleware(testutil.Who{Cap: hCap, Rules: []string{writeAcm, readAll}}, hCap, nil)(noNode)
+	for _, tc := range []struct{ method, path string }{
+		{"GET", releaseURL}, {"GET", "/apt/hosted/dists/bookworm/main/binary-amd64/Packages"},
+		{"GET", "/apt/hosted/dists/bookworm/main/by-hash/SHA256/" + strings.Repeat("a", 64)},
+		{"GET", "/apt/hosted/pool/acme/acme_1.0_all.deb"}, {"PUT", debPath},
+	} {
+		var body io.Reader
+		if tc.method == "PUT" {
+			body = bytes.NewReader(debFor(t, "acme"))
+		}
+		if w := do(h, tc.method, tc.path, body); w.Code != 403 {
+			t.Errorf("%s %s: %d, want 403", tc.method, tc.path, w.Code)
+		}
+	}
+	if src.viewer != "none yet" || len(src.pools) != 0 || src.uploads != 0 {
+		t.Errorf("a source was asked: viewer %q, pools %v, uploads %d", src.viewer, src.pools, src.uploads)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "node stable ID") {
+		t.Errorf("no warning logged:\n%s", logs.String())
+	}
+}

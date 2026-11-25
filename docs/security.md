@@ -416,7 +416,10 @@ whole only up to their caps. The caps:
   `Release` is rendered and cached per client node, and rendered again
   when what the node may see changes or the key does, so a changed key is
   never answered with an old signature. Its `Date` only rises for a node,
-  because apt ignores an older `Release`.
+  because apt ignores an older `Release`. A request is served only a
+  rendering of what its own rules allow, even one that waits on a
+  rendering for the same node started under other rules. A caller whose
+  WhoIs names no node stable ID is refused with `403`.
 - **Verification chain for `registry` sources.** The upstream's `Release`
   (or `InRelease` and the detached signature) is checked against the
   configured `keyring`, and any one valid signature is enough. It is
