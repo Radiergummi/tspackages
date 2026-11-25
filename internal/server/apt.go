@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"os"
 	"slices"
 
 	"github.com/radiergummi/tspackages/internal/config"
@@ -47,9 +48,16 @@ func buildAPT(sh *shared, e config.Ecosystem) (built, error) {
 			if err != nil {
 				return built{}, fmt.Errorf("apt source %q: %w", s.Name, err)
 			}
-			keyring, err := apt.LoadKeyring([]byte(s.Keyring))
+			// The keyring may be binary, so it is read as a file, not expanded
+			// into the config.
+			field := fmt.Sprintf("ecosystems.apt.sources[%s].keyring", s.Name)
+			raw, err := os.ReadFile(s.Keyring)
 			if err != nil {
-				return built{}, fmt.Errorf("apt source %q: keyring: %w", s.Name, err)
+				return built{}, fmt.Errorf("%s: %w", field, err)
+			}
+			keyring, err := apt.LoadKeyring(raw)
+			if err != nil {
+				return built{}, fmt.Errorf("%s: %w", field, err)
 			}
 			src := apt.NewRegistrySource(apt.RegistryConfig{
 				Name: s.Name, URL: s.URL, Keyring: keyring,

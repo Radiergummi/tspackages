@@ -31,7 +31,7 @@ func statusPage(t *testing.T, signer *apt.Signer, read ...string) string {
 			[]apt.RegistryStanza{{Name: "debian", Suites: []string{"bookworm", "bookworm-updates"}, Components: []string{"main"}}},
 			signer,
 			func() []apt.ChangedFile {
-				return []apt.ChangedFile{{Source: "debian", Path: "pool/main/h/hello/hello_1.0_amd64.deb", First: "aaaa", Now: "bbbb"}}
+				return []apt.ChangedFile{{Source: "debian", Package: "hello", Path: "pool/main/h/hello/hello_1.0_amd64.deb", First: "aaaa", Now: "bbbb"}}
 			})},
 	})
 	mux := http.NewServeMux()

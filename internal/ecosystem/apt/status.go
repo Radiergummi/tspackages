@@ -76,7 +76,7 @@ func StatusSection(storage []string, registry []RegistryStanza, signer *Signer, 
 					var rows []web.Row
 					for _, c := range changed() {
 						file := path.Base(c.Path)
-						pkg, _, _ := strings.Cut(file, "_")
+						pkg := c.Package
 						rows = append(rows, web.Row{
 							Packages: []string{pkg},
 							Cells: []web.Cell{

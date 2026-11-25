@@ -48,7 +48,7 @@ type RegistryConfig struct {
 // ChangedFile is a pool file whose upstream bytes differ from the ones this
 // source first recorded for it. It is served anyway and shown on the status
 // page.
-type ChangedFile struct{ Source, Path, First, Now string }
+type ChangedFile struct{ Source, Package, Path, First, Now string }
 
 // RegistrySource passes one upstream apt repository through. The upstream
 // Release (InRelease, else Release and Release.gpg) is verified against the
@@ -627,7 +627,7 @@ func (s *RegistrySource) checkChanged(ctx context.Context, e lookupEntry, sha256
 	if s.changed == nil {
 		s.changed = map[string]ChangedFile{}
 	}
-	s.changed[e.Path] = ChangedFile{Source: s.cfg.Name, Path: e.Path, First: first.SHA256, Now: sha256Hex}
+	s.changed[e.Path] = ChangedFile{Source: s.cfg.Name, Package: e.Package, Path: e.Path, First: first.SHA256, Now: sha256Hex}
 	return nil
 }
 

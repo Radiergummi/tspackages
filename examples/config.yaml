@@ -118,7 +118,7 @@ ecosystems:
         type: registry
         url: https://deb.debian.org/debian/
         fetch_hosts: [deb.debian.org]
-        keyring: ${file:/usr/share/keyrings/debian-archive-keyring.gpg}   # verifies the upstream's Release
+        keyring: /usr/share/keyrings/debian-archive-keyring.gpg   # path; verifies the upstream's Release
         suites: [bookworm, bookworm-updates]
         components: [main]
         architectures: [amd64, arm64]

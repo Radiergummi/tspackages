@@ -588,7 +588,7 @@ func TestRegistryChanged(t *testing.T) {
 		t.Fatalf("changed file not served: %q", got)
 	}
 	e.relay.Wait()
-	want := []ChangedFile{{Source: regSource, Path: curlPool, First: first, Now: hexSHA256(e.debs[curlPool])}}
+	want := []ChangedFile{{Source: regSource, Package: "curl", Path: curlPool, First: first, Now: hexSHA256(e.debs[curlPool])}}
 	if got := e.src.Changed(); !slices.Equal(got, want) {
 		t.Errorf("Changed = %+v, want %+v", got, want)
 	}

@@ -119,7 +119,7 @@ type Source struct {
 	// Modules maps a module path (without a major-version suffix) to its
 	// repository. go git sources only.
 	Modules map[string]GoModule `yaml:"modules"`
-	// Keyring is the file of public keys an apt registry source's Release
+	// Keyring is the path of the file of public keys an apt registry source's Release
 	// signatures are verified against; Suites, Components and Architectures
 	// list what it mirrors. apt registry sources only.
 	Keyring       string   `yaml:"keyring"`
