@@ -21,9 +21,9 @@ const releaseDate = "Mon, 02 Jan 2006 15:04:05 UTC"
 // FileHash is one entry of a Release file's SHA256 list. SHA256 is lowercase
 // hex.
 type FileHash struct {
-	Path   string
-	Size   int64
-	SHA256 string
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
 }
 
 // ReleaseDoc is a Release file.
