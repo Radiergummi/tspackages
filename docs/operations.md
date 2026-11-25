@@ -886,7 +886,9 @@ kept in the state store, so a lost cache doesn't allow a rollback. A
 suite that the upstream renames or retires therefore stops updating and
 needs its config changed. Files are served only when the verified
 `Release` or `Packages` lists them, and are checked against that hash
-before they are cached.
+before they are cached. A pool file the previous `Release` listed stays
+served after the upstream drops it, so a client that updated just before
+can still download it.
 
 Any `apt:` read rule allows reading from a registry source, indexes and
 downloads alike. The first `apt-get update` of a large suite fetches the

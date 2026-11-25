@@ -620,3 +620,46 @@ func TestRegistryChanged(t *testing.T) {
 		t.Errorf("Changed = %+v, want %+v", got, want)
 	}
 }
+
+func TestRegistryPoolFromPreviousRelease(t *testing.T) {
+	e := newRegEnv(t)
+	old := "pool/main/o/old/old_1.0_amd64.deb"
+	e.debs[old] = []byte("old deb bytes")
+	e.publish(t, pubOpts{})
+	ctx := context.Background()
+	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease")) // a client lists from this Release
+
+	// The next Release drops the version; the upstream pool still has it.
+	delete(e.debs, old)
+	e.publish(t, pubOpts{date: e.clock})
+	e.clock = e.clock.Add(2 * time.Hour)
+	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+	// Verified against the previous Release's index.
+	e.up.set(old, []byte("evil deb bytes"))
+	if _, err := readBlob(e.src.Pool(ctx, anyAcc, poolPath(t, old))); !errors.Is(err, relay.ErrDigestMismatch) {
+		t.Errorf("tampered file of the previous Release: err = %v, want relay.ErrDigestMismatch", err)
+	}
+	e.relay.Wait()
+	e.up.set(old, []byte("old deb bytes"))
+	if got := body(t)(e.src.Pool(ctx, anyAcc, poolPath(t, old))); string(got) != "old deb bytes" {
+		t.Fatalf("Pool = %q", got)
+	}
+	e.relay.Wait()
+	// After a restart too.
+	e.src = e.newSource()
+	if got := body(t)(e.src.Pool(ctx, anyAcc, poolPath(t, old))); string(got) != "old deb bytes" {
+		t.Fatalf("Pool after a restart = %q", got)
+	}
+	// A file in neither Release is a miss.
+	if _, err := e.src.Pool(ctx, anyAcc, poolPath(t, "pool/main/x/xyz/xyz_1.0_amd64.deb")); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("unlisted: err = %v, want ErrNotFound", err)
+	}
+	// Two Releases on, the dropped version is a miss.
+	e.debs["pool/main/n/new/new_1.0_amd64.deb"] = []byte("new")
+	e.publish(t, pubOpts{date: e.clock})
+	e.clock = e.clock.Add(2 * time.Hour)
+	body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+	if _, err := e.src.Pool(ctx, anyAcc, poolPath(t, old)); !errors.Is(err, resolve.ErrNotFound) {
+		t.Errorf("two Releases back: err = %v, want ErrNotFound", err)
+	}
+}

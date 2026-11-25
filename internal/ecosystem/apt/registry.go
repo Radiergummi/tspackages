@@ -59,7 +59,8 @@ type ChangedFile struct{ Source, Package, Path, First, Now string }
 // keyring and served byte for byte; it is refreshed after the TTL and served
 // stale when the refresh fails or is rejected. A dists file is served only
 // when the verified Release lists it, a pool file only when the lookup built
-// from the verified Packages indexes lists it; both are verified by SHA256
+// from the verified Packages indexes of the current or the previous Release
+// lists it; both are verified by SHA256
 // through the relay before they are cached, keyed by that hash:
 //
 //	apt/<src>/dists/<suite>/release                 the verified Release (JSON)
@@ -126,13 +127,16 @@ func NewRegistrySource(cfg RegistryConfig, c *upstream.Client, cache *storage.Ca
 func (s *RegistrySource) Name() string { return s.cfg.Name }
 
 // releaseObj is what the cache holds of a suite's verified Release: the
-// upstream bytes (InRelease, or Release and Release.gpg) and the SHA256
-// list of the Release it replaced, whose by-hash files stay served.
+// upstream bytes (InRelease, or Release and Release.gpg) and, of the
+// Release it replaced, the SHA256 list (whose by-hash files stay served),
+// its sha256 and whether it said Acquire-By-Hash (for its pool lookup).
 type releaseObj struct {
-	InRelease  []byte     `json:"in_release,omitempty"`
-	Release    []byte     `json:"release,omitempty"`
-	ReleaseGPG []byte     `json:"release_gpg,omitempty"`
-	Previous   []FileHash `json:"previous,omitempty"`
+	InRelease      []byte     `json:"in_release,omitempty"`
+	Release        []byte     `json:"release,omitempty"`
+	ReleaseGPG     []byte     `json:"release_gpg,omitempty"`
+	Previous       []FileHash `json:"previous,omitempty"`
+	PreviousSHA256 string     `json:"previous_sha256,omitempty"`
+	PreviousByHash bool       `json:"previous_by_hash,omitempty"`
 }
 
 // relState is a suite's verified Release, ready to answer requests. It is
@@ -145,6 +149,9 @@ type relState struct {
 	files   map[string]FileHash    // the current Release's list, by path
 	hashes  map[[2]string]FileHash // the current and previous lists, by directory and sha256
 	fetched time.Time
+	// prev is the Release this one replaced, as far as its pool lookup
+	// needs it; nil when unknown.
+	prev *relState
 }
 
 // newState verifies obj and parses its Release.
@@ -170,6 +177,13 @@ func (s *RegistrySource) newState(obj releaseObj, fetched time.Time) (*relState,
 		hashes: map[[2]string]FileHash{}, fetched: fetched}
 	for _, h := range obj.Previous {
 		st.hashes[[2]string{path.Dir(h.Path), h.SHA256}] = h
+	}
+	if obj.PreviousSHA256 != "" {
+		st.prev = &relState{sum: obj.PreviousSHA256, doc: ReleaseDoc{ByHash: obj.PreviousByHash, SHA256: obj.Previous},
+			files: map[string]FileHash{}}
+		for _, h := range obj.Previous {
+			st.prev.files[h.Path] = h
+		}
 	}
 	for _, h := range doc.SHA256 {
 		st.files[h.Path] = h
@@ -323,23 +337,41 @@ func (s *RegistrySource) Pool(ctx context.Context, _ ReadAccess, p Path) (Blob, 
 	return Blob{Body: body, Size: size, ETag: `"` + e.SHA256 + `"`, Immutable: true}, nil
 }
 
-// findPool looks rel up in the lookup of each configured suite, in order.
-// A suite whose Release or lookup fails is skipped; its error is returned
-// when no other suite lists rel.
+// findPool looks rel up in the lookup of each configured suite's Release,
+// in order, then in the lookups of the Releases they replaced: a client
+// that listed the previous Release still downloads what it lists. A suite
+// whose Release or lookup fails is skipped; its error is returned when no
+// other lookup lists rel.
 func (s *RegistrySource) findPool(ctx context.Context, rel string) (lookupEntry, error) {
 	var firstErr error
-	for _, suite := range s.cfg.Suites {
-		st, err := s.current(ctx, suite)
-		if err == nil {
-			var e lookupEntry
-			var found bool
-			if e, found, err = s.find(ctx, suite, st, rel); err == nil && found {
-				return e, nil
-			}
-		}
+	note := func(err error) {
 		if err != nil && !errors.Is(err, resolve.ErrNotFound) && firstErr == nil {
 			firstErr = err
 		}
+	}
+	var prevs []*relState
+	var prevSuites []string
+	for _, suite := range s.cfg.Suites {
+		st, err := s.current(ctx, suite)
+		if err != nil {
+			note(err)
+			continue
+		}
+		e, found, err := s.find(ctx, suite, st, rel)
+		if err == nil && found {
+			return e, nil
+		}
+		note(err)
+		if st.prev != nil {
+			prevs, prevSuites = append(prevs, st.prev), append(prevSuites, suite)
+		}
+	}
+	for i, st := range prevs {
+		e, found, err := s.find(ctx, prevSuites[i], st, rel)
+		if err == nil && found {
+			return e, nil
+		}
+		note(err)
 	}
 	if firstErr != nil {
 		return lookupEntry{}, firstErr
@@ -516,7 +548,7 @@ func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *re
 		same.fetched = st.fetched
 		return &same, nil
 	}
-	obj.Previous = old.doc.SHA256
+	obj.Previous, obj.PreviousSHA256, obj.PreviousByHash = old.doc.SHA256, old.sum, old.doc.ByHash
 	if st, err = s.newState(obj, st.fetched); err != nil {
 		return nil, err
 	}
