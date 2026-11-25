@@ -158,3 +158,32 @@ func TestLookupXZBomb(t *testing.T) {
 		t.Errorf("allocated %d bytes", n)
 	}
 }
+
+// TestInspectXZ9Control: a control tarball compressed as dpkg-deb -Zxz -z9
+// does, with a 64MiB dictionary, is accepted.
+func TestInspectXZ9Control(t *testing.T) {
+	tarball := testutil.Tar(t, map[string]string{"./control": "Package: acme\nVersion: 1.0\nArchitecture: amd64\nMaintainer: A <a@example.com>\nDescription: d\n"})
+	var ctl bytes.Buffer
+	w, err := xz.WriterConfig{DictCap: 64 << 20}.NewWriter(&ctl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(tarball); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if h := ctl.Bytes()[12:]; !bytes.Contains(h[2:(int(h[0])+1)*4], []byte{0x21, 0x01, 28}) {
+		t.Fatalf("block header %x does not state a 64MiB dictionary", h[:(int(h[0])+1)*4])
+	}
+	data := string(testutil.Gzip(t, testutil.Tar(t, map[string]string{"./x": "x"})))
+	b := testutil.Ar(t, [][2]string{{"debian-binary", "2.0\n"}, {"control.tar.xz", ctl.String()}, {"data.tar.gz", data}})
+	c, err := inspect(t, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Deb.Name != "acme" {
+		t.Errorf("Deb = %+v", c.Deb)
+	}
+}

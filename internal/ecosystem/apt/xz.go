@@ -13,8 +13,8 @@ import (
 
 const (
 	// maxControlDict caps the LZMA2 dictionary of an uploaded control
-	// tarball; xz -9 uses 64MiB, dpkg-deb's default 8MiB.
-	maxControlDict = 8 << 20
+	// tarball: 64MiB, what xz -9 (dpkg-deb -Zxz -z9) uses.
+	maxControlDict = 64 << 20
 	// maxIndexDict caps the LZMA2 dictionary of an upstream Packages.xz.
 	maxIndexDict = 64 << 20
 )
