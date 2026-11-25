@@ -548,9 +548,15 @@ func TestRegistryClaimedName(t *testing.T) {
 // index.
 func (e *regEnv) publishIndex(t *testing.T, idx []byte) {
 	t.Helper()
+	e.publishIndexAs(t, pkgsPath, idx)
+}
+
+// publishIndexAs publishes a Release listing only idx, at rel.
+func (e *regEnv) publishIndexAs(t *testing.T, rel string, idx []byte) {
+	t.Helper()
 	sum := hexSHA256(idx)
 	text := fmt.Sprintf("Suite: %s\nDate: %s\nAcquire-By-Hash: yes\nSHA256:\n %s %d %s\n", regSuite,
-		e.clock.Add(-time.Hour).Format(releaseDate), sum, len(idx), pkgsPath)
+		e.clock.Add(-time.Hour).Format(releaseDate), sum, len(idx), rel)
 	e.up.set("dists/"+regSuite+"/main/binary-amd64/by-hash/SHA256/"+sum, idx)
 	in, err := signer(t, e.key).ClearSign([]byte(text))
 	if err != nil {

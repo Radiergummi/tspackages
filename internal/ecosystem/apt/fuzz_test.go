@@ -2,10 +2,13 @@ package apt
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ulikunitz/xz"
 
 	"github.com/radiergummi/tspackages/internal/testutil"
 )
@@ -133,6 +136,40 @@ func FuzzParseRelease(f *testing.F) {
 		}
 		if !slices.Equal(slices.DeleteFunc(slices.Clone(d.Fields), typed), slices.DeleteFunc(slices.Clone(d2.Fields), typed)) {
 			t.Fatalf("fields changed in round trip of %q: %+v -> %+v", b, d.Fields, d2.Fields)
+		}
+	})
+}
+
+// FuzzXZGuard checks that the guard passes on exactly what the decoder
+// reads when it accepts a file.
+func FuzzXZGuard(f *testing.F) {
+	data := []byte(strings.Repeat("Package: acme\n", 100))
+	for _, bs := range []int64{0, 256} {
+		var out bytes.Buffer
+		w, err := xz.WriterConfig{BlockSize: bs}.NewWriter(&out)
+		if err != nil {
+			f.Fatal(err)
+		}
+		w.Write(data)
+		w.Close()
+		f.Add(out.Bytes())
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		r, err := newXZReader(bytes.NewReader(b), maxControlDict)
+		if err != nil {
+			return
+		}
+		got, err := io.ReadAll(io.LimitReader(r, 1<<20))
+		if err != nil {
+			return
+		}
+		plain, err := xz.NewReader(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("guard accepted what the decoder refuses: %v", err)
+		}
+		want, err := io.ReadAll(io.LimitReader(plain, 1<<20))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("decoder alone: %d bytes, %v; through the guard %d bytes", len(want), err, len(got))
 		}
 	})
 }

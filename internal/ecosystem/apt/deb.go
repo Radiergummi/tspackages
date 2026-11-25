@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
-	"github.com/ulikunitz/xz"
 )
 
 const (
@@ -163,7 +162,7 @@ func controlFile(r io.Reader, ext string) ([]byte, error) {
 		defer z.Close()
 		dec = z
 	case ".xz":
-		z, err := xz.NewReader(r)
+		z, err := newXZReader(r, maxControlDict)
 		if err != nil {
 			return nil, badDeb("control.tar.xz: %v", err)
 		}

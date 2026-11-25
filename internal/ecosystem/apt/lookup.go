@@ -17,7 +17,6 @@ import (
 
 	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/storage"
-	"github.com/ulikunitz/xz"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -219,7 +218,7 @@ func (s *RegistrySource) scanIndex(ctx context.Context, suite string, st *relSta
 	var dec io.Reader = body
 	switch {
 	case strings.HasSuffix(fh.Path, ".xz"):
-		z, err := xz.NewReader(body)
+		z, err := newXZReader(body, maxIndexDict)
 		if err != nil {
 			return err
 		}

@@ -448,7 +448,8 @@ Uploads are spooled to disk before inspection. The caps:
 |---|---|---|
 | Paths | request paths | at most 16 segments; names and versions of at most 156 bytes, architectures 32, suites and components 64 |
 | `ar` | uploads | at most 16 members, validated headers |
-| Control tarball | uploads | 4MiB decompressed, `control` file 256KiB |
+| Control tarball | uploads | 4MiB decompressed, `control` file 256KiB, xz dictionary 8MiB |
+| `Packages.xz` | upstream indexes | xz dictionary 64MiB |
 | deb822 | control files, upstream `Release` and `Packages` | stanza 1MiB, field 256KiB, `Release` 4MiB |
 | OpenPGP | upstream signatures, keyrings | `Release` and signature 4MiB |
 | Other files | uploads, upstream | `max_upload_bytes`, `max_artifact_bytes` |
