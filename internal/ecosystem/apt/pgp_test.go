@@ -378,10 +378,12 @@ func TestLoadSigner(t *testing.T) {
 		t.Fatalf("RSA 3072: %v", err)
 	}
 	for name, cfg := range map[string]*packet.Config{
-		"RSA 2048": {Algorithm: packet.PubKeyAlgoRSA, RSABits: 2048},
-		"ECDSA":    {Algorithm: packet.PubKeyAlgoECDSA, Curve: packet.CurveNistP256},
-		"Ed448":    {Algorithm: packet.PubKeyAlgoEd448},
-		"expired":  {Algorithm: packet.PubKeyAlgoEdDSA, KeyLifetimeSecs: 60, Time: func() time.Time { return time.Now().Add(-time.Hour) }},
+		"RSA 2048":                {Algorithm: packet.PubKeyAlgoRSA, RSABits: 2048},
+		"ECDSA":                   {Algorithm: packet.PubKeyAlgoECDSA, Curve: packet.CurveNistP256},
+		"Ed448":                   {Algorithm: packet.PubKeyAlgoEd448},
+		"Ed25519 v6":              {Algorithm: packet.PubKeyAlgoEd25519, V6Keys: true},
+		"Ed25519 v4 algorithm 27": {Algorithm: packet.PubKeyAlgoEd25519},
+		"expired":                 {Algorithm: packet.PubKeyAlgoEdDSA, KeyLifetimeSecs: 60, Time: func() time.Time { return time.Now().Add(-time.Hour) }},
 	} {
 		if _, err := LoadSigner(armorPrivate(t, newEntity(t, "x", cfg)), ""); err == nil {
 			t.Fatalf("%s accepted", name)
@@ -460,5 +462,126 @@ func TestSignerPublicKey(t *testing.T) {
 	}
 	if _, err := k.VerifyInRelease(in, time.Now()); err != nil {
 		t.Fatalf("own public key does not verify own InRelease: %v", err)
+	}
+}
+
+func TestLoadSignerRejectsRFC9580Ed25519(t *testing.T) {
+	_, err := LoadSigner(armorPrivate(t, newEntity(t, "v6", &packet.Config{Algorithm: packet.PubKeyAlgoEd25519, V6Keys: true})), "")
+	if err == nil || !strings.Contains(err.Error(), "legacy (v4, EdDSA) Ed25519") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// inRelease clear-signs text (which ends in a newline) with the given raw
+// signature packets.
+func inRelease(t *testing.T, text string, packets ...[]byte) []byte {
+	t.Helper()
+	return append([]byte("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"+text), armorSig(t, packets...)...)
+}
+
+func TestVerifyBoundsSignatures(t *testing.T) {
+	a := newEntity(t, "a", nil)
+	k := keyring(t, a)
+	now := time.Now()
+	at := now.Add(-time.Second)
+	text := strings.TrimSuffix(testRelease, "\n")
+	valid := detachedSig(t, a.PrivateKey, packet.SigTypeText, crypto.SHA256, []byte(text), at)
+	forged := detachedSig(t, a.PrivateKey, packet.SigTypeText, crypto.SHA256, []byte("other"), at)
+	forgedN := func(n int, tail ...[]byte) [][]byte {
+		var ps [][]byte
+		for range n {
+			ps = append(ps, forged)
+		}
+		return append(ps, tail...)
+	}
+
+	if _, err := k.VerifyInRelease(inRelease(t, testRelease, forgedN(5, valid)...), now); err != nil {
+		t.Fatalf("valid signature after 5 forged ones: %v", err)
+	}
+	if _, err := k.VerifyInRelease(inRelease(t, testRelease, forgedN(31, valid)...), now); err != nil {
+		t.Fatalf("valid 32nd signature: %v", err)
+	}
+	_, err := k.VerifyInRelease(inRelease(t, testRelease, forgedN(33)...), now)
+	if err == nil || !strings.Contains(err.Error(), "more than 32") {
+		t.Fatalf("33 forged signatures: %v", err)
+	}
+	if _, err := k.VerifyInRelease(inRelease(t, testRelease, forgedN(32, valid)...), now); err == nil {
+		t.Fatal("a valid 33rd signature was examined")
+	}
+
+	_, err = k.VerifyInRelease(inRelease(t, testRelease, forgedN(10)...), now)
+	if err == nil || strings.Count(err.Error(), "verification failure") != 3 || !strings.Contains(err.Error(), "7 more") {
+		t.Fatalf("error of 10 forged signatures is not bounded: %v", err)
+	}
+
+	big := inRelease(t, "X: "+strings.Repeat("a", MaxRelease)+"\n", valid)
+	if _, err := k.VerifyInRelease(big, now); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized InRelease: %v", err)
+	}
+	if err := k.VerifyDetached(make([]byte, MaxRelease+1), armorSig(t, valid), now); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized Release: %v", err)
+	}
+	if err := k.VerifyDetached([]byte(text), armorSig(t, forgedN(1000)...), now); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized Release.gpg: %v", err)
+	}
+}
+
+// A packet go-crypto can't parse, such as a v3 signature, is skipped like a
+// signature by an unknown key.
+func TestVerifySkipsUnsupportedPacket(t *testing.T) {
+	a := newEntity(t, "a", nil)
+	k := keyring(t, a)
+	now := time.Now()
+	text := strings.TrimSuffix(testRelease, "\n")
+	valid := detachedSig(t, a.PrivateKey, packet.SigTypeText, crypto.SHA256, []byte(text), now.Add(-time.Second))
+	// Old-format signature packet (tag 2), 6 body bytes, version 3.
+	v3 := []byte{0x88, 0x06, 0x03, 0x05, 0x00, 0x00, 0x00, 0x00}
+	if _, err := k.VerifyInRelease(inRelease(t, testRelease, v3, valid), now); err != nil {
+		t.Fatalf("v3 packet before a valid signature: %v", err)
+	}
+	if err := k.VerifyDetached([]byte(text), armorSig(t, v3, valid), now); err != nil {
+		t.Fatalf("detached, v3 packet before a valid signature: %v", err)
+	}
+	if _, err := k.VerifyInRelease(inRelease(t, testRelease, v3), now); err == nil {
+		t.Fatal("v3 packet alone verified")
+	}
+}
+
+// With the same key twice in the keyring, an expired export first and a
+// refreshed one after it, the refreshed copy verifies.
+func TestVerifyDuplicateKeyCopies(t *testing.T) {
+	now := time.Now()
+	e := newEntity(t, "dup", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, KeyLifetimeSecs: 3600, Time: func() time.Time { return now.Add(-2 * time.Hour) }})
+	in := clearSignMulti(t, testRelease, now.Add(-90*time.Minute), e)
+	var expired bytes.Buffer
+	if err := e.Serialize(&expired); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range e.Identities {
+		id.SelfSignature.KeyLifetimeSecs = nil
+	}
+	if err := e.SerializePrivate(io.Discard, nil); err != nil { // re-signs the identities
+		t.Fatal(err)
+	}
+	var refreshed bytes.Buffer
+	if err := e.Serialize(&refreshed); err != nil {
+		t.Fatal(err)
+	}
+	only, err := LoadKeyring(expired.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := only.VerifyInRelease(in, now); err == nil {
+		t.Fatal("expired copy alone verified")
+	}
+	both, err := LoadKeyring(append(bytes.Clone(expired.Bytes()), refreshed.Bytes()...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(both.el) != 2 {
+		t.Fatalf("keyring holds %d entities", len(both.el))
+	}
+	if _, err := both.VerifyInRelease(in, now); err != nil {
+		t.Fatalf("expired copy then refreshed copy: %v", err)
 	}
 }

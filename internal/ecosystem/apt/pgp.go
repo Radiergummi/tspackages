@@ -24,7 +24,8 @@ type Signer struct {
 
 // LoadSigner reads one armored private key, decrypting it with passphrase if
 // it is encrypted. The primary key and the signing (sub)key must each be
-// Ed25519 or RSA of at least 3072 bits, and a signing-capable key with its
+// Ed25519 as legacy EdDSA (algorithm 22, which apt's gpgv verifies) or RSA
+// of at least 3072 bits, and a signing-capable key with its
 // private part must be valid now.
 func LoadSigner(armored, passphrase string) (*Signer, error) {
 	el, err := openpgp.ReadArmoredKeyRing(strings.NewReader(armored))
@@ -94,10 +95,10 @@ func checkKeyAlgorithm(pk *packet.PublicKey) error {
 			return nil
 		}
 	case packet.PubKeyAlgoEd25519:
-		return nil
+		return fmt.Errorf("apt: signing key %s: use a legacy (v4, EdDSA) Ed25519 key; apt's gpgv can't verify RFC 9580 Ed25519 keys", pk.KeyIdString())
 	default:
 	}
-	return fmt.Errorf("apt: signing key %s: only Ed25519 and RSA keys are supported", pk.KeyIdString())
+	return fmt.Errorf("apt: signing key %s: only Ed25519 (legacy EdDSA) and RSA keys are supported", pk.KeyIdString())
 }
 
 // signingKey is the key chosen at load, as long as it is still valid.
@@ -164,6 +165,16 @@ func (s *Signer) Fingerprint() string {
 	return strings.ToUpper(hex.EncodeToString(s.entity.PrimaryKey.Fingerprint))
 }
 
+// Caps on upstream signature verification. Every signature packet whose
+// issuer names a keyring key costs a hash of the whole signed text, and
+// issuer key IDs are public, so the packets examined are capped (real
+// repositories carry one to three) along with the input sizes.
+const (
+	maxSignatures   = 32
+	maxDetachedSig  = 64 << 10
+	maxReportedErrs = 3
+)
+
 // Keyring holds the public keys an upstream's Release must be signed by.
 type Keyring struct{ el openpgp.EntityList }
 
@@ -212,6 +223,9 @@ func LoadKeyring(b []byte) (*Keyring, error) {
 // as apt reads it: every line newline-terminated. The input must be exactly
 // one signed message, with nothing before or after it.
 func (k *Keyring) VerifyInRelease(b []byte, now time.Time) ([]byte, error) {
+	if len(b) > MaxRelease {
+		return nil, fmt.Errorf("apt: InRelease exceeds %d bytes", MaxRelease)
+	}
 	if !bytes.HasPrefix(b, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
 		return nil, errors.New("apt: InRelease does not start with a signed message")
 	}
@@ -233,6 +247,12 @@ func (k *Keyring) VerifyInRelease(b []byte, now time.Time) ([]byte, error) {
 
 // VerifyDetached checks sig (Release.gpg, armored or binary) over release.
 func (k *Keyring) VerifyDetached(release, sig []byte, now time.Time) error {
+	if len(release) > MaxRelease {
+		return fmt.Errorf("apt: Release exceeds %d bytes", MaxRelease)
+	}
+	if len(sig) > maxDetachedSig {
+		return fmt.Errorf("apt: Release.gpg exceeds %d bytes", maxDetachedSig)
+	}
 	var r io.Reader = bytes.NewReader(sig)
 	if bytes.HasPrefix(bytes.TrimLeft(sig, " \t\r\n"), []byte("-----BEGIN ")) {
 		blk, err := armor.Decode(r)
@@ -248,31 +268,45 @@ func (k *Keyring) VerifyDetached(release, sig []byte, now time.Time) error {
 }
 
 // verify succeeds if any signature packet in sigs is a valid signature of
-// signed by a key in the keyring at now. Signatures by other keys, and ones
-// that fail, are skipped; any packet other than a signature is an error.
+// signed by a key in the keyring at now. Signatures by other keys, ones that
+// fail and packets go-crypto can't parse (v3 signatures, unknown versions or
+// algorithms) are skipped; any other packet is an error, and so is a block
+// of more than maxSignatures packets.
 func (k *Keyring) verify(signed []byte, sigs io.Reader, now time.Time) error {
 	pr := packet.NewReader(sigs)
 	var errs []error
-	for {
-		p, err := pr.Next()
+	n := 0
+	for ; ; n++ {
+		p, err := pr.NextWithUnsupported()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("apt: reading signatures: %w", err)
 		}
-		sig, ok := p.(*packet.Signature)
-		if !ok {
+		if n == maxSignatures {
+			return fmt.Errorf("apt: signature block holds more than %d packets", maxSignatures)
+		}
+		switch p := p.(type) {
+		case *packet.Signature:
+			err = k.check(signed, p, now)
+		case *packet.UnsupportedPacket:
+			err = fmt.Errorf("unsupported packet: %w", p.Error)
+		default:
 			return fmt.Errorf("apt: signature block holds a %T packet", p)
 		}
-		err = k.check(signed, sig, now)
 		if err == nil {
 			return nil
 		}
-		errs = append(errs, err)
+		if len(errs) < maxReportedErrs {
+			errs = append(errs, err)
+		}
 	}
-	if len(errs) == 0 {
+	if n == 0 {
 		return errors.New("apt: no signature found")
+	}
+	if n > len(errs) {
+		errs = append(errs, fmt.Errorf("%d more", n-len(errs)))
 	}
 	return fmt.Errorf("apt: no valid signature by a key in the keyring: %w", errors.Join(errs...))
 }
@@ -313,7 +347,11 @@ func (k *Keyring) check(signed []byte, sig *packet.Signature, now time.Time) err
 			err = fmt.Errorf("key %s: %w", key.PublicKey.KeyIdString(), err)
 			continue
 		}
-		return keyValid(key, sig, now)
+		// Another copy of the key in the keyring (a refreshed export, say)
+		// may still be valid at now.
+		if err = keyValid(key, sig, now); err == nil {
+			return nil
+		}
 	}
 	return err
 }
