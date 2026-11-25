@@ -682,7 +682,7 @@ func (d *blockSigned) Get(ctx context.Context, key string) (io.ReadCloser, stora
 	return d.Driver.Get(ctx, key)
 }
 
-// TestRenderFollowerGetsOwnView: a request of a node that joins a
+// TestRenderFollowerGetsOwnView: a request of a node that waits for a
 // rendering the node started with other rules (a rule revoked in between)
 // gets a rendering of its own visible set, never the other one.
 func TestRenderFollowerGetsOwnView(t *testing.T) {
@@ -807,34 +807,50 @@ func TestRenderSerializedPerViewer(t *testing.T) {
 }
 
 // TestRenderStormDatesDistinct: many concurrent requests of one node with
-// alternating rules never give two identities the same Date.
+// alternating rules never give two identities the same Date, and every
+// InRelease lists the Packages of its own caller's visible set.
 func TestRenderStormDatesDistinct(t *testing.T) {
 	e := newStEnv(t, fsDriver(t))
 	for _, n := range []string{"acme-a", "other"} {
 		e.uploadArch("bookworm", n, "amd64")
 	}
 	ctx := context.Background()
+	patterns := []string{"*", "acme-*"}
+	// Packages indexes are deterministic per visible set: render each once
+	// for another node to know what each caller must be pointed at.
+	want := map[string]string{}
+	for _, p := range patterns {
+		idx, err := e.src.Dist(ctx, viewerAcc(p, "reference"), "bookworm", "main/binary-amd64/Packages")
+		want[p] = hexSHA256(blobBytes(t, idx, err))
+	}
+	if want["*"] == want["acme-*"] {
+		t.Fatal("test needs two visible sets")
+	}
 	type served struct {
-		date time.Time
-		etag string
+		date    time.Time
+		etag    string
+		pattern string
+		body    []byte
 	}
 	var mu sync.Mutex
 	var got []served
 	var wg sync.WaitGroup
 	for i := range 40 {
-		pattern := "*"
-		if i%2 == 1 {
-			pattern = "acme-*"
-		}
+		pattern := patterns[i%2]
 		wg.Go(func() {
 			b, err := e.src.Release(ctx, viewerAcc(pattern, "n1"), "bookworm", "InRelease")
 			if err != nil {
 				t.Error(err)
 				return
 			}
+			body, err := io.ReadAll(b.Body)
 			_ = b.Body.Close()
+			if err != nil {
+				t.Error(err)
+				return
+			}
 			mu.Lock()
-			got = append(got, served{b.Modified, b.ETag})
+			got = append(got, served{b.Modified, b.ETag, pattern, body})
 			mu.Unlock()
 		})
 	}
@@ -845,5 +861,61 @@ func TestRenderStormDatesDistinct(t *testing.T) {
 			t.Fatalf("two renderings share Date %v", g.date)
 		}
 		byDate[g.date] = g.etag
+		text, err := keyring(t, e.entity).VerifyInRelease(g.body, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, err := ParseRelease(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, h := byHash(t, doc, "main/binary-amd64/Packages"); h != want[g.pattern] {
+			t.Fatalf("a %q caller got an InRelease of another visible set", g.pattern)
+		}
 	}
+}
+
+// TestRenderWaitCancelled: a request whose context ends while it waits for
+// its node's rendering gives up with the context's error, and the rendering
+// it waited for completes and is served.
+func TestRenderWaitCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newStEnv(t, fsDriver(t))
+		e.uploadArch("bookworm", "acme-a", "amd64")
+		block := &blockSigned{Driver: e.cacheD, started: make(chan struct{}), release: make(chan struct{})}
+		cache, err := storage.NewCache(context.Background(), block, 1<<30, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+
+		var first Blob
+		var firstErr error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			first, firstErr = e.src.Release(context.Background(), viewerAcc("*", "n1"), "bookworm", "InRelease")
+		})
+		<-block.started
+		ctx, cancel := context.WithCancel(context.Background())
+		var waitErr error
+		wg.Go(func() { _, waitErr = e.src.Release(ctx, viewerAcc("acme-*", "n1"), "bookworm", "InRelease") })
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		if !errors.Is(waitErr, context.Canceled) {
+			t.Errorf("waiting request: %v, want context.Canceled", waitErr)
+		}
+		close(block.release)
+		wg.Wait()
+		if firstErr != nil {
+			t.Fatal(firstErr)
+		}
+		_ = first.Body.Close()
+		// The lock was handed back: the node renders again.
+		b, err := e.src.Release(context.Background(), viewerAcc("acme-*", "n1"), "bookworm", "InRelease")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = b.Body.Close()
+	})
 }

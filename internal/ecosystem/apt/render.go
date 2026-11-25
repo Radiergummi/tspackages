@@ -250,6 +250,9 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 	// they are served: a request waits for the viewer's rendering in
 	// progress, then takes the viewer's current rendering if it is of its
 	// own identity, and renders its own otherwise.
+	if r, ok := s.rendered.Get(viewer); ok && r.id == id {
+		return r, nil // complete: a rendering is kept only once stored
+	}
 	lock := s.renderLocks[viewerStripe(viewer)]
 	select {
 	case lock <- struct{}{}:
@@ -280,10 +283,7 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 
 // viewerStripe maps a viewer key (hex sha256) to its render lock.
 func viewerStripe(viewer string) int {
-	b, err := hex.DecodeString(viewer[:2])
-	if err != nil || len(b) == 0 {
-		return 0
-	}
+	b, _ := hex.DecodeString(viewer[:2]) // viewer is hex
 	return int(b[0]) % renderLockStripes
 }
 
