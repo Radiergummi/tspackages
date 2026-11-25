@@ -384,7 +384,10 @@ whole only up to their caps. The caps:
   here defends against that. Upstream `Release` files pass through
   unchanged, so they carry tspackages' `Origin` only if the upstream is
   hostile. Pins can't match the host, because `storage` and `registry`
-  sources share it.
+  sources share it. Pins match package names only: when a claimed
+  package has no candidate for a client (no read rule, or no version for
+  its architecture), a public package that declares `Provides: <claimed
+  name>` can satisfy a dependency on it.
 - **A name claimed by a `storage` source is never fetched upstream.** It
   is `404` on every `registry` source, so clients that use the mirror
   without the pins still don't get a public package of that name.
@@ -448,8 +451,8 @@ Uploads are spooled to disk before inspection. The caps:
 |---|---|---|
 | Paths | request paths | at most 16 segments; names and versions of at most 156 bytes, architectures 32, suites and components 64 |
 | `ar` | uploads | at most 16 members, validated headers |
-| Control tarball | uploads | 4MiB decompressed, `control` file 256KiB, xz dictionary 8MiB |
-| `Packages.xz` | upstream indexes | xz dictionary 64MiB |
+| Control tarball | uploads | 4MiB decompressed, `control` file 256KiB, `xz` dictionary 8MiB |
+| `Packages.xz` | upstream indexes | `xz` dictionary 64MiB |
 | deb822 | control files, upstream `Release` and `Packages` | stanza 1MiB, field 256KiB, `Release` 4MiB |
-| OpenPGP | upstream signatures, keyrings | `Release` and signature 4MiB |
+| OpenPGP | upstream `Release`, `InRelease`, `Release.gpg` | `Release` and `InRelease` 4MiB, `Release.gpg` 64KiB, at most 32 signature packets |
 | Other files | uploads, upstream | `max_upload_bytes`, `max_artifact_bytes` |

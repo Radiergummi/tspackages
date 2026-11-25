@@ -890,6 +890,16 @@ before they are cached. A pool file the previous `Release` listed stays
 served after the upstream drops it, so a client that updated just before
 can still download it.
 
+The high-water mark for a suite, `apt/<source>/release-mark/E(suite)` in
+the state store, only rises (`E()` is the `esc` function under [Removing a
+bad publish](#removing-a-bad-publish)). After an upstream
+fault (a `Release` dated up to a day ahead that it later withdraws), or
+when you point a source at a mirror that lags behind, it rejects every
+`Release` until the upstream's `Date` catches up. To reset it, stop
+tspackages, delete that object and the cached copy
+`apt/<source>/dists/E(suite)/release` from the cache store, and start it
+again. The next `Release` it fetches becomes the mark.
+
 Any `apt:` read rule allows reading from a registry source, indexes and
 downloads alike. The first `apt-get update` of a large suite fetches the
 `Packages` index and builds a pool lookup from it; later ones fetch only
