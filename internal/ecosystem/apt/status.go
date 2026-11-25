@@ -11,13 +11,15 @@ import (
 // StatusSection is apt's part of the status page: one deb822 stanza per
 // source, storage sources (names in storage) first, then registry sources
 // with their configured suites and components. A nil signer hides the key
-// fingerprint; a nil changed reports nothing.
+// download and fingerprint; a nil changed reports nothing.
 func StatusSection(storage []string, registry []RegistryStanza, signer *Signer, changed func() []ChangedFile) web.Section {
 	var snippets []web.Snippet
-	snippets = append(snippets, web.Snippet{
-		Intro: template.HTML("apt: install the signing key of the generated repositories (<code>apt/key.asc</code>):"),
-		Code:  "curl -fsSL https://{{host}}/apt/key.asc -o /etc/apt/keyrings/tspackages.asc",
-	})
+	if signer != nil {
+		snippets = append(snippets, web.Snippet{
+			Intro: template.HTML("apt: install the signing key of the generated repositories (<code>apt/key.asc</code>):"),
+			Code:  "curl -fsSL https://{{host}}/apt/key.asc -o /etc/apt/keyrings/tspackages.asc",
+		})
+	}
 	for _, s := range storage {
 		snippets = append(snippets, web.Snippet{
 			Intro: template.HTML("apt source for a hosted repository (<code>/etc/apt/sources.list.d/tspackages.sources</code>). Replace <code>&lt;suite&gt;</code> with the suite you upload to:"),

@@ -73,7 +73,8 @@ func TestStatusSection(t *testing.T) {
 		t.Error("host placeholder left in the page")
 	}
 
-	if body := statusPage(t, nil, "apt:other"); strings.Contains(body, "hello_1.0_amd64.deb") || strings.Contains(body, "signing key fingerprint") {
-		t.Error("changed row shown without a read rule, or fingerprint without a signer")
+	if body := statusPage(t, nil, "apt:other"); strings.Contains(body, "hello_1.0_amd64.deb") || strings.Contains(body, "signing key fingerprint") ||
+		strings.Contains(body, "apt/key.asc") {
+		t.Error("changed row shown without a read rule, or fingerprint or key download without a signer")
 	}
 }
