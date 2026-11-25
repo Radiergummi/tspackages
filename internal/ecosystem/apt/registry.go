@@ -33,6 +33,10 @@ const (
 	// maxReleaseObject caps the cached Release object: the upstream
 	// files, base64-encoded, and the previous Release's hash list.
 	maxReleaseObject = 24 << 20
+	// maxFutureDate is how far ahead of the clock an upstream Release's
+	// Date may be; a later one would raise the high-water mark past every
+	// honest Release until then.
+	maxFutureDate = 24 * time.Hour
 )
 
 // RegistryConfig configures a RegistrySource.
@@ -460,8 +464,9 @@ func (s *RegistrySource) refresh(ctx context.Context, suite string) (*relState, 
 
 // fetchRelease fetches suite's InRelease, or Release and Release.gpg when
 // there is none, and accepts it when it verifies, its Valid-Until has not
-// passed, its Suite or Codename is suite, and its Date is older neither than
-// the high-water mark nor than old's.
+// passed, its Date is at most maxFutureDate ahead, its Suite or Codename is
+// suite, and its Date is older neither than the high-water mark nor than
+// old's.
 func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *relState) (*relState, error) {
 	base := s.cfg.URL + "dists/" + url.PathEscape(suite) + "/"
 	var obj releaseObj
@@ -485,6 +490,10 @@ func (s *RegistrySource) fetchRelease(ctx context.Context, suite string, old *re
 	}
 	if vu := st.doc.ValidUntil; !vu.IsZero() && s.now().After(vu) {
 		return nil, fmt.Errorf("upstream Release of %s rejected: Valid-Until %s has passed", suite, vu.Format(time.RFC3339))
+	}
+	if st.doc.Date.After(s.now().Add(maxFutureDate)) {
+		return nil, fmt.Errorf("upstream Release of %s rejected: Date %s is more than %s ahead", suite,
+			st.doc.Date.Format(time.RFC3339), maxFutureDate)
 	}
 	rs, _ := st.doc.Fields.Get("Suite")
 	rc, _ := st.doc.Fields.Get("Codename")

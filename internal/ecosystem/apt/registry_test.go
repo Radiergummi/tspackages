@@ -422,6 +422,27 @@ func TestRegistryRejects(t *testing.T) {
 		bad(t, err)
 	})
 
+	t.Run("date in the future", func(t *testing.T) {
+		e := newRegEnv(t)
+		in := e.publish(t, pubOpts{})
+		body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease"))
+		e.publish(t, pubOpts{date: e.clock.Add(2*time.Hour + 25*time.Hour)})
+		e.clock = e.clock.Add(2 * time.Hour)
+		if got := body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease")); string(got) != string(in) {
+			t.Error("a Release dated more than a day ahead replaced the cached one")
+		}
+		// The high-water mark was not raised: a Release dated now is taken.
+		next := e.publish(t, pubOpts{date: e.clock})
+		e.clock = e.clock.Add(2 * time.Hour)
+		if got := body(t)(e.src.Release(ctx, anyAcc, regSuite, "InRelease")); string(got) != string(next) {
+			t.Error("a Release dated now is rejected after a future-dated one")
+		}
+		fresh := newRegEnv(t)
+		fresh.publish(t, pubOpts{date: fresh.clock.Add(25 * time.Hour)})
+		_, err := fresh.src.Release(ctx, anyAcc, regSuite, "InRelease")
+		bad(t, err)
+	})
+
 	t.Run("other suite", func(t *testing.T) {
 		e := newRegEnv(t)
 		in := e.publish(t, pubOpts{})

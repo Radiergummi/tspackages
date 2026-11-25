@@ -417,8 +417,9 @@ whole only up to their caps. The caps:
   (or `InRelease` and the detached signature) is checked against the
   configured `keyring`, and any one valid signature is enough. It is
   rejected when `Valid-Until` has passed, when `Suite` or `Codename`
-  differs from the configured suite, or when its `Date` is older than the
-  newest accepted one, which is kept in the state store so that a lost
+  differs from the configured suite, when its `Date` is more than a day
+  ahead of the clock, or when its `Date` is older than the newest accepted
+  one, which is kept in the state store so that a lost
   cache doesn't allow a rollback; the previous copy is served meanwhile.
   The `Release` is passed through byte for byte and the client verifies it
   again against its own keyring. Index files are served only when the

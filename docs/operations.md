@@ -880,7 +880,8 @@ rule gets valid, empty indexes for an existing suite.
 one valid signature is enough) before anything else is fetched. They
 reject it, and serve the previous copy meanwhile, when its `Valid-Until`
 has passed, when its `Suite` or `Codename` isn't the configured suite,
-or when its `Date` is older than the newest accepted one. That date is
+when its `Date` is more than a day ahead of the clock, or when its `Date`
+is older than the newest accepted one. That date is
 kept in the state store, so a lost cache doesn't allow a rollback. A
 suite that the upstream renames or retires therefore stops updating and
 needs its config changed. Files are served only when the verified
