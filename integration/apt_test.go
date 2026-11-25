@@ -207,7 +207,7 @@ func startAptRegistry(t *testing.T, o aptOptions) *aptRegistry {
 	if o.rules == "" {
 		o.rules = `{"read":["*"],"write":["apt:acme-*"]}`
 	}
-	root := t.TempDir()
+	root := aptRoot(t)
 	r := &aptRegistry{t: t, up: newFakeAptRepo(t)}
 	uu, _ := url.Parse(r.up.URL)
 	keyring := filepath.Join(root, "upstream.asc")
@@ -270,6 +270,28 @@ func startAptRegistry(t *testing.T, o aptOptions) *aptRegistry {
 		t.Fatal(err)
 	}
 	return r
+}
+
+// aptRoot returns a temporary directory removed after the test, once
+// nothing writes to it any more: the relay commits a download to the cache
+// after the client has read it, so a write may still run when the test
+// ends.
+func aptRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("", "tsp-apt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for range 50 {
+			if err = os.RemoveAll(root); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Errorf("remove %s: %v", root, err)
+	})
+	return root
 }
 
 type statusRecorder struct {
