@@ -17,11 +17,23 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
+// Tests build lookups of few shards; TestLookupStreams uses the production
+// count.
+func init() { lookupShards = 4 }
+
 func TestLookupStreams(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a 60,000-package index")
 	}
-	const n = 60000
+	// Under the race detector the index takes half a minute to build and
+	// the heap is not representative: a small index checks the lookup, and
+	// the memory bound is checked without -race (make test).
+	n, bounded := 60000, !raceEnabled
+	if raceEnabled {
+		n = 2000
+	}
+	defer func(n int) { lookupShards = n }(lookupShards)
+	lookupShards = 256
 	e := newRegEnv(t)
 	// Descriptions make the decompressed index larger than the bound, so
 	// holding it whole fails the test.
@@ -44,7 +56,7 @@ func TestLookupStreams(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if plainSize < 32<<20 {
+	if bounded && plainSize < 32<<20 {
 		t.Fatalf("generated index is only %d bytes decompressed", plainSize)
 	}
 	idx := xzBuf.Bytes()
@@ -84,24 +96,26 @@ func TestLookupStreams(t *testing.T) {
 			}
 		}
 	})
-	want := "pool/main/p/pkg30000/pkg30000_1.30000-1_amd64.deb"
+	mid := n / 2
+	want := fmt.Sprintf("pool/main/p/pkg%05d/pkg%05d_1.%d-1_amd64.deb", mid, mid, mid)
 	got, found, err := e.src.find(ctx, regSuite, st, want)
 	close(stop)
 	wg.Wait()
 	if err != nil || !found {
 		t.Fatalf("find = %+v, %v, %v", got, found, err)
 	}
-	wantSum := sha256.Sum256([]byte("30000"))
-	if got.Path != want || got.Package != "pkg30000" || got.Version != "1:1.30000-1" || got.Size != 31000 ||
+	wantSum := sha256.Sum256(fmt.Appendf(nil, "%d", mid))
+	if got.Path != want || got.Package != fmt.Sprintf("pkg%05d", mid) || got.Version != fmt.Sprintf("1:1.%d-1", mid) ||
+		got.Size != int64(1000+mid) ||
 		got.SHA256 != hex.EncodeToString(wantSum[:]) {
 		t.Errorf("entry = %+v", got)
 	}
 	growth := int64(peak.Load()) - int64(before.HeapAlloc)
 	t.Logf("heap growth building the lookup: %.1f MiB", float64(growth)/(1<<20))
-	if growth >= 32<<20 {
+	if bounded && growth >= 32<<20 {
 		t.Errorf("heap grew by %d MiB building the lookup", growth>>20)
 	}
-	if _, found, err := e.src.find(ctx, regSuite, st, "pool/main/p/pkg30000/absent.deb"); err != nil || found {
+	if _, found, err := e.src.find(ctx, regSuite, st, "pool/main/p/pkg00000/absent.deb"); err != nil || found {
 		t.Errorf("absent path: found %v, %v", found, err)
 	}
 }

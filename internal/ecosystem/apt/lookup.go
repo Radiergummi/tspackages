@@ -18,12 +18,17 @@ import (
 	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/ulikunitz/xz"
+	"golang.org/x/sync/errgroup"
 )
 
+// lookupShards is the number of shard objects per lookup, at most 256: the
+// first byte of sha256(pool path), modulo lookupShards, picks one. Tests
+// lower it.
+var lookupShards = 256
+
 const (
-	// lookupShards is the number of shard objects per lookup: the first
-	// byte of sha256(pool path) picks one.
-	lookupShards = 256
+	// shardWriters bounds the shard objects written at once.
+	shardWriters = 16
 	// lookupTimeout bounds building a lookup, its index downloads
 	// included.
 	lookupTimeout = 30 * time.Minute
@@ -49,8 +54,8 @@ type lookupEntry struct {
 // The pool lookup of a suite's Release maps each pool path its Packages
 // indexes list (for every configured component and architecture, and
 // "all") to its entry. It is built once per Release, identified by the
-// sha256 of its verified bytes, and stored as lookupShards objects, each a
-// JSON array of entries sorted by path:
+// sha256 of its verified bytes, and stored as lookupShards objects (written
+// shardWriters at a time), each a JSON array of entries sorted by path:
 //
 //	apt/<src>/lookup/<release sha256>/<xx>.json
 //
@@ -65,7 +70,7 @@ func (s *RegistrySource) shardKey(sum string, shard int) string {
 
 func shardOf(poolPath string) int {
 	h := sha256.Sum256([]byte(poolPath))
-	return int(h[0])
+	return int(h[0]) % lookupShards
 }
 
 // find returns rel's entry in the lookup of suite's Release st, building
@@ -114,7 +119,7 @@ func (s *RegistrySource) build(ctx context.Context, suite string, st *relState) 
 	defer cancel()
 	// Entries as "path\tsha256\tsize\tpackage\tversion\n" lines, by shard:
 	// none of the fields can hold a tab or a newline.
-	var shards [lookupShards][]byte
+	shards := make([][]byte, lookupShards)
 	skipped := 0
 	for _, comp := range s.cfg.Components {
 		for _, arch := range s.archs {
@@ -140,24 +145,30 @@ func (s *RegistrySource) build(ctx context.Context, suite string, st *relState) 
 		s.log.Warn("apt index entries skipped: malformed Filename, SHA256, Size, Package or Version", "source", s.cfg.Name,
 			"suite", suite, "count", skipped)
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(shardWriters)
 	for i := range shards {
-		es := parseShardLines(shards[i])
+		lines := shards[i]
 		shards[i] = nil
-		// Stable: the first index listing a path wins.
-		slices.SortStableFunc(es, func(a, b lookupEntry) int { return cmp.Compare(a.Path, b.Path) })
-		es = slices.CompactFunc(es, func(a, b lookupEntry) bool { return a.Path == b.Path })
-		if es == nil {
-			es = []lookupEntry{}
-		}
-		b, err := json.Marshal(es)
-		if err != nil {
-			return err
-		}
-		if err := s.cache.Put(ctx, s.shardKey(st.sum, i), bytes.NewReader(b)); err != nil {
-			return fmt.Errorf("cache apt pool lookup: %w", err)
-		}
+		g.Go(func() error {
+			es := parseShardLines(lines)
+			// Stable: the first index listing a path wins.
+			slices.SortStableFunc(es, func(a, b lookupEntry) int { return cmp.Compare(a.Path, b.Path) })
+			es = slices.CompactFunc(es, func(a, b lookupEntry) bool { return a.Path == b.Path })
+			if es == nil {
+				es = []lookupEntry{}
+			}
+			b, err := json.Marshal(es)
+			if err != nil {
+				return err
+			}
+			if err := s.cache.Put(gctx, s.shardKey(st.sum, i), bytes.NewReader(b)); err != nil {
+				return fmt.Errorf("cache apt pool lookup: %w", err)
+			}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func parseShardLines(b []byte) []lookupEntry {
