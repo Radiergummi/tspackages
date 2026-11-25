@@ -3,8 +3,10 @@ package apt
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 const descStanza = "Package: acme\nVersion: 1.0-1\nDescription: short\n long text\n .\n second paragraph\n\ttabbed\nHomepage: https://example.org\n"
@@ -137,5 +139,47 @@ func TestStanzas(t *testing.T) {
 	// PGP armor is not special-cased: the header line has no colon.
 	if _, err := collect(t, "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nSuite: x\n", 1024); err == nil {
 		t.Error("armor header accepted")
+	}
+}
+
+func TestParseStanzaLinear(t *testing.T) {
+	long := "A: x\n" + strings.Repeat(" a\n", 350000)
+	names := new(strings.Builder)
+	for i := 0; names.Len() < 1<<20; i++ {
+		fmt.Fprintf(names, "N%d: x\n", i)
+	}
+	start := time.Now()
+	if _, err := ParseStanza([]byte(long), 256<<10); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("long field: err = %v", err)
+	}
+	if s, err := ParseStanza([]byte(names.String()), 256<<10); err != nil || len(s) < 100000 {
+		t.Fatalf("many fields: %d, %v", len(s), err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("took %v", d)
+	}
+}
+
+func TestStanzasLenientNamesAndSeparators(t *testing.T) {
+	got, err := collect(t, "X-Foo_Bar.Baz: 1\nA@b~: 2\n", 1024)
+	if err != nil || len(got) != 1 || len(got[0]) != 2 {
+		t.Fatalf("names: %+v, %v", got, err)
+	}
+	if v, _ := got[0].Get("x-foo_bar.baz"); v != "1" {
+		t.Errorf("value = %q", v)
+	}
+	for _, in := range []string{"-a: 1\n", "a b: 1\n", "\xc3\xa4: 1\n"} {
+		if _, err := collect(t, in, 1024); err == nil {
+			t.Errorf("%q accepted", in)
+		}
+	}
+	sep := strings.Repeat("\n# c\n", 100)
+	got, err = collect(t, "A: 1\n"+sep+"B: 2\n", 64)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("separators: %d, %v", len(got), err)
+	}
+	start := time.Now()
+	if got, err = collect(t, "A:\n"+strings.Repeat(" a\n", 350000), 2<<20); err != nil || len(got) != 1 || time.Since(start) > time.Second {
+		t.Fatalf("long continuation: %v, %v", err, time.Since(start))
 	}
 }

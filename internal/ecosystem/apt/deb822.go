@@ -91,33 +91,54 @@ func ParseStanza(b []byte, maxField int) (Stanza, error) {
 	if !utf8.Valid(b) {
 		return nil, errors.New("deb822: stanza is not valid UTF-8")
 	}
-	b = bytes.TrimSuffix(b, []byte("\n"))
-	var s Stanza
-	for line := range strings.SplitSeq(string(b), "\n") {
-		if line == "" {
-			return nil, errors.New("deb822: empty line in stanza")
+	src := strings.TrimSuffix(string(b), "\n")
+	// A field's value is one contiguous slice of src: the first line after the
+	// colon through the end of its last continuation line.
+	type span struct {
+		name       string
+		start, end int
+	}
+	var spans []span
+	seen := map[string]struct{}{}
+	for pos := 0; pos <= len(src); {
+		end := strings.IndexByte(src[pos:], '\n')
+		if end < 0 {
+			end = len(src)
+		} else {
+			end += pos
 		}
-		if line[0] == ' ' || line[0] == '\t' {
-			if len(s) == 0 {
+		line := src[pos:end]
+		switch {
+		case line == "":
+			return nil, errors.New("deb822: empty line in stanza")
+		case line[0] == ' ' || line[0] == '\t':
+			if len(spans) == 0 {
 				return nil, errors.New("deb822: continuation line before any field")
 			}
-			s[len(s)-1].Value += "\n" + line
-			continue
-		}
-		name, value, ok := strings.Cut(line, ":")
-		if !ok {
-			return nil, fmt.Errorf("deb822: line %q has no colon", line)
-		}
-		s = append(s, Field{name, strings.TrimLeft(value, " \t")})
-	}
-	for i, f := range s {
-		if err := checkField(f, maxField); err != nil {
-			return nil, err
-		}
-		for _, g := range s[:i] {
-			if strings.EqualFold(g.Name, f.Name) {
-				return nil, fmt.Errorf("deb822: duplicate field %s", f.Name)
+			spans[len(spans)-1].end = end
+		default:
+			name, value, ok := strings.Cut(line, ":")
+			if !ok {
+				return nil, fmt.Errorf("deb822: line %q has no colon", truncate(line, 80))
 			}
+			key := strings.ToLower(name)
+			if _, dup := seen[key]; dup {
+				return nil, fmt.Errorf("deb822: duplicate field %s", truncate(name, 80))
+			}
+			seen[key] = struct{}{}
+			start := end - len(strings.TrimLeft(value, " \t"))
+			spans = append(spans, span{name, start, end})
+		}
+		if sp := spans[len(spans)-1]; maxField > 0 && sp.end-sp.start > maxField {
+			return nil, fmt.Errorf("deb822: field %s exceeds %d bytes", truncate(sp.name, 80), maxField)
+		}
+		pos = end + 1
+	}
+	s := make(Stanza, len(spans))
+	for i, sp := range spans {
+		s[i] = Field{sp.name, src[sp.start:sp.end]}
+		if err := checkField(s[i], maxField); err != nil {
+			return nil, err
 		}
 	}
 	return s, nil
@@ -149,20 +170,28 @@ func WriteStanza(w io.Writer, s Stanza) error {
 
 // Stanzas streams the stanzas of an index or Release file. It is lenient about
 // what real archives contain (duplicate fields, any bytes but NUL, "#" comment
-// lines, runs of blank lines between stanzas) and strict about CR, a line
+// lines, runs of blank lines between stanzas, any field name Debian Policy 5.1
+// allows) and strict about CR, a line
 // without a colon outside a continuation, and a stanza longer than maxStanza
 // bytes, which ends the sequence with ErrStanzaTooLarge.
 func Stanzas(r io.Reader, maxStanza int) iter.Seq2[Stanza, error] {
 	return func(yield func(Stanza, error) bool) {
 		br := bufio.NewReaderSize(r, 64<<10)
 		var cur Stanza
+		var val []byte // the open field's value, grown linearly
 		size := 0
+		closeField := func() {
+			if len(cur) > 0 {
+				cur[len(cur)-1].Value = string(val)
+			}
+		}
 		flush := func() bool {
 			if len(cur) == 0 {
 				return true
 			}
+			closeField()
 			s := cur
-			cur, size = nil, 0
+			cur, val, size = nil, nil, 0
 			return yield(s, nil)
 		}
 		for {
@@ -192,14 +221,19 @@ func Stanzas(r io.Reader, maxStanza int) iter.Seq2[Stanza, error] {
 					yield(nil, errors.New("deb822: continuation line before any field"))
 					return
 				}
-				cur[len(cur)-1].Value += "\n" + text
+				val = append(append(val, '\n'), text...)
 			default:
 				name, value, ok := strings.Cut(text, ":")
-				if !ok || !validFieldName(name) {
+				if !ok || !validLenientFieldName(name) {
 					yield(nil, fmt.Errorf("deb822: malformed line %q", truncate(text, 80)))
 					return
 				}
-				cur = append(cur, Field{name, strings.TrimLeft(value, " \t")})
+				closeField()
+				cur = append(cur, Field{Name: name})
+				val = append(val[:0:0], strings.TrimLeft(value, " \t")...)
+			}
+			if len(cur) == 0 {
+				size = 0 // separators between stanzas don't count against the cap
 			}
 			if eof {
 				flush()
@@ -233,6 +267,20 @@ func readLine(br *bufio.Reader, budget int) ([]byte, error) {
 			return nil, err
 		}
 	}
+}
+
+// validLenientFieldName is Debian Policy 5.1: printable US-ASCII except space
+// and colon, not starting with "#" or "-".
+func validLenientFieldName(n string) bool {
+	if n == "" || n[0] == '#' || n[0] == '-' {
+		return false
+	}
+	for i := 0; i < len(n); i++ {
+		if n[i] <= ' ' || n[i] > '~' || n[i] == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 func truncate(s string, n int) string {
