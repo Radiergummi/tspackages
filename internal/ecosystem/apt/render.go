@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/radiergummi/tspackages/internal/flight"
 	"github.com/radiergummi/tspackages/internal/metrics"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
@@ -29,9 +28,9 @@ const (
 	maxSignedBytes = 3 * MaxRelease
 	// maxByHashHeader caps the first line of a by-hash object.
 	maxByHashHeader = 16 << 20
-	// maxRenderJoins is how often a request joins a viewer's rendering in
-	// progress before it renders its own.
-	maxRenderJoins = 3
+	// renderLockStripes is how many locks serialize renderings: a viewer
+	// always takes the same one, unrelated viewers may share one.
+	renderLockStripes = 64
 )
 
 // A rendering is a suite as one viewer sees it: its indexes and the
@@ -247,43 +246,45 @@ func (s *StorageSource) current(ctx context.Context, acc ReadAccess, suite strin
 	}
 	id := renderingID(suite, etag, visible, s.signer.Fingerprint())
 	viewer := hexSHA256([]byte(acc.Viewer + "\n" + suite))
-	// One rendering at a time per viewer, so its Dates rise in order. A
-	// request that waits on another's gets that one, which may be of
-	// another identity (the viewer's rules changed in between); it then
-	// waits for one of its own, and renders it itself after
-	// maxRenderJoins tries.
-	render := func() (*rendering, error) {
-		var last time.Time
-		if r, ok := s.rendered.Get(viewer); ok {
-			if r.id == id {
-				return r, nil
-			}
-			last = r.date
-		}
-		r, err := s.render(context.WithoutCancel(ctx), suite, id, viewer, last, ms, visible)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.storeByHash(context.WithoutCancel(ctx), suite, r); err != nil {
-			// Served anyway: apt falls back to the canonical path after a
-			// by-hash miss, and ByHash stores an entry of the current
-			// rendering again when asked for it.
-			s.log.Warn("apt: storing by-hash files failed", "source", s.name, "suite", suite, "error", err)
-		}
-		s.rendered.Put(viewer, r)
-		return r, nil
+	// One rendering at a time per viewer, so its Dates rise in the order
+	// they are served: a request waits for the viewer's rendering in
+	// progress, then takes the viewer's current rendering if it is of its
+	// own identity, and renders its own otherwise.
+	lock := s.renderLocks[viewerStripe(viewer)]
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	r, ok := s.rendered.Get(viewer)
-	for joins := 0; !ok || r.id != id; joins++ {
-		if joins == maxRenderJoins {
-			return render()
+	defer func() { <-lock }()
+	var last time.Time
+	if r, ok := s.rendered.Get(viewer); ok {
+		if r.id == id {
+			return r, nil
 		}
-		if r, err = flight.Do(ctx, &s.renders, viewer, render); err != nil {
-			return nil, err
-		}
-		ok = true
+		last = r.date
 	}
+	r, err := s.render(context.WithoutCancel(ctx), suite, id, viewer, last, ms, visible)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.storeByHash(context.WithoutCancel(ctx), suite, r); err != nil {
+		// Served anyway: apt falls back to the canonical path after a
+		// by-hash miss, and ByHash stores an entry of the current
+		// rendering again when asked for it.
+		s.log.Warn("apt: storing by-hash files failed", "source", s.name, "suite", suite, "error", err)
+	}
+	s.rendered.Put(viewer, r)
 	return r, nil
+}
+
+// viewerStripe maps a viewer key (hex sha256) to its render lock.
+func viewerStripe(viewer string) int {
+	b, err := hex.DecodeString(viewer[:2])
+	if err != nil || len(b) == 0 {
+		return 0
+	}
+	return int(b[0]) % renderLockStripes
 }
 
 func memberID(m member) string {

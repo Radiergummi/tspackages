@@ -22,7 +22,6 @@ import (
 	"github.com/radiergummi/tspackages/internal/records"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -59,7 +58,9 @@ type StorageSource struct {
 	now    func() time.Time // replaced in tests
 
 	rendered *lru.Cache[*rendering]
-	renders  singleflight.Group
+	// renderLocks serialize the renderings of a viewer (each viewer maps to
+	// one lock), so a viewer's Dates rise in the order they are served.
+	renderLocks [renderLockStripes]chan struct{}
 }
 
 var _ Uploader = (*StorageSource)(nil)
@@ -70,8 +71,12 @@ func NewStorageSource(name string, claims []string, d storage.Driver, cache *sto
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log, now: time.Now,
+	s := &StorageSource{name: name, claims: claims, d: d, cache: cache, rec: rec, signer: signer, log: log, now: time.Now,
 		rendered: lru.New(maxRenderedBytes, (*rendering).size)}
+	for i := range s.renderLocks {
+		s.renderLocks[i] = make(chan struct{}, 1)
+	}
+	return s
 }
 
 func (s *StorageSource) Name() string     { return s.name }

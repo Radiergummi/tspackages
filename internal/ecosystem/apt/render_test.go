@@ -770,3 +770,80 @@ func TestDateRisesPastUnstoredRendering(t *testing.T) {
 		t.Errorf("Date %v back at the stored view, after %v", back.Date, unstored.Date)
 	}
 }
+
+// TestRenderSerializedPerViewer: a request of a node that arrives while the
+// node's rendering is in progress waits for it, and a rendering of another
+// identity it then makes is dated after the one it waited for.
+func TestRenderSerializedPerViewer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newStEnv(t, fsDriver(t))
+		for _, n := range []string{"acme-a", "other"} {
+			e.uploadArch("bookworm", n, "amd64")
+		}
+		block := &blockSigned{Driver: e.cacheD, started: make(chan struct{}), release: make(chan struct{})}
+		cache, err := storage.NewCache(context.Background(), block, 1<<30, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.src = NewStorageSource("hosted", []string{"acme*"}, e.d, cache, e.src.rec, e.src.signer, e.src.log)
+		ctx := context.Background()
+
+		var first, second Blob
+		var firstErr, secondErr error
+		var wg sync.WaitGroup
+		wg.Go(func() { first, firstErr = e.src.Release(ctx, viewerAcc("*", "n1"), "bookworm", "InRelease") })
+		<-block.started
+		wg.Go(func() { second, secondErr = e.src.Release(ctx, viewerAcc("acme-*", "n1"), "bookworm", "InRelease") })
+		synctest.Wait() // the second request waits for the first rendering
+		close(block.release)
+		wg.Wait()
+		if firstErr != nil || secondErr != nil {
+			t.Fatal(firstErr, secondErr)
+		}
+		if !second.Modified.After(first.Modified) {
+			t.Errorf("rendering made after waiting dated %v, the one it waited for %v", second.Modified, first.Modified)
+		}
+	})
+}
+
+// TestRenderStormDatesDistinct: many concurrent requests of one node with
+// alternating rules never give two identities the same Date.
+func TestRenderStormDatesDistinct(t *testing.T) {
+	e := newStEnv(t, fsDriver(t))
+	for _, n := range []string{"acme-a", "other"} {
+		e.uploadArch("bookworm", n, "amd64")
+	}
+	ctx := context.Background()
+	type served struct {
+		date time.Time
+		etag string
+	}
+	var mu sync.Mutex
+	var got []served
+	var wg sync.WaitGroup
+	for i := range 40 {
+		pattern := "*"
+		if i%2 == 1 {
+			pattern = "acme-*"
+		}
+		wg.Go(func() {
+			b, err := e.src.Release(ctx, viewerAcc(pattern, "n1"), "bookworm", "InRelease")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = b.Body.Close()
+			mu.Lock()
+			got = append(got, served{b.Modified, b.ETag})
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	byDate := map[time.Time]string{}
+	for _, g := range got {
+		if etag, ok := byDate[g.date]; ok && etag != g.etag {
+			t.Fatalf("two renderings share Date %v", g.date)
+		}
+		byDate[g.date] = g.etag
+	}
+}
