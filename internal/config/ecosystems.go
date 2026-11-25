@@ -20,12 +20,24 @@ type ecosystemRules struct {
 	validClaim func(string) bool      // claim grammar
 	hint       string                 // claim grammar hint in errors
 	overlap    func(a, b string) bool // some name matches both valid claims
+	// perRepository says unclaimed sources are not competing for the same
+	// names (apt registry sources are separate repositories), so they aren't
+	// counted.
+	perRepository bool
 	// source checks ecosystem-only keys of one source; earlier are the
 	// sources before it, in order.
 	source func(s Source, earlier []Source, opts ValidateOptions, add func(format string, a ...any))
 }
 
 var ecosystems = map[string]ecosystemRules{
+	"apt": {
+		types:         []string{"registry", "storage"},
+		validClaim:    func(c string) bool { return aptClaimRe.MatchString(c) },
+		hint:          `use "*" or a lowercase name pattern of [a-z0-9+.*-]`,
+		overlap:       func(a, b string) bool { return a == "*" || b == "*" || globsOverlap(a, b) },
+		perRepository: true,
+		source:        aptSource,
+	},
 	"composer": {
 		types:      []string{"git", "storage", "registry"},
 		validClaim: func(c string) bool { return validClaim("composer", c) },
@@ -128,6 +140,59 @@ func noGitSource(eco string) func(Source, []Source, ValidateOptions, func(string
 		}
 	}
 }
+
+var aptClaimRe = regexp.MustCompile(`^[a-z0-9+.*-]+$`)
+
+// aptSource checks the apt-only keys of one source. A storage claim of "*"
+// is refused because its pin would block every other repository; registry
+// sources take no claims (clients pin claimed names) and mirror a fixed set of
+// suites, components and architectures verified against a keyring.
+func aptSource(s Source, _ []Source, _ ValidateOptions, add func(string, ...any)) {
+	noGitSource("apt")(s, nil, ValidateOptions{}, add)
+	switch s.Type {
+	case "storage":
+		if s.Keyring != "" || len(s.Suites) > 0 || len(s.Components) > 0 || len(s.Architectures) > 0 {
+			add("keyring, suites, components and architectures are only supported on apt registry sources")
+		}
+		if slices.Contains(s.Claims, "*") {
+			add(`"*" can't be a storage claim: its pin would block every other repository`)
+		}
+	case "registry":
+		if len(s.Claims) > 0 {
+			add("registry sources take no claims; clients pin claimed names (see /apt/preferences)")
+		}
+		for _, f := range []struct {
+			name  string
+			empty bool
+		}{
+			{"keyring", s.Keyring == ""}, {"suites", len(s.Suites) == 0},
+			{"components", len(s.Components) == 0}, {"architectures", len(s.Architectures) == 0},
+		} {
+			if f.empty {
+				add("%s is required", f.name)
+			}
+		}
+		for _, f := range []struct {
+			name   string
+			values []string
+			valid  func(string) bool
+		}{
+			{"suite", s.Suites, aptSuiteRe.MatchString}, {"component", s.Components, aptSuiteRe.MatchString},
+			{"architecture", s.Architectures, aptArchRe.MatchString},
+		} {
+			for _, v := range f.values {
+				if !f.valid(v) {
+					add("invalid %s %q", f.name, v)
+				}
+			}
+		}
+	}
+}
+
+var (
+	aptSuiteRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+	aptArchRe  = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+)
 
 // checkRemotes runs the remote checks (RemoteKind, no credentials,
 // known_hosts for SSH) on remotes.

@@ -7,7 +7,7 @@ import (
 )
 
 func TestEveryEcosystemHasRules(t *testing.T) {
-	if got := SupportedEcosystems(); !slices.Equal(got, []string{"composer", "go", "maven", "npm", "pypi"}) {
+	if got := SupportedEcosystems(); !slices.Equal(got, []string{"apt", "composer", "go", "maven", "npm", "pypi"}) {
 		t.Fatalf("SupportedEcosystems = %v", got)
 	}
 	for name, r := range ecosystems {
@@ -18,8 +18,8 @@ func TestEveryEcosystemHasRules(t *testing.T) {
 		if name == "maven" {
 			want = []string{"registry", "storage"} // Maven has no git source
 		}
-		if name == "npm" {
-			want = []string{"registry", "storage"} // npm has no git source
+		if name == "npm" || name == "apt" {
+			want = []string{"registry", "storage"} // npm and apt have no git source
 		}
 		for _, typ := range want {
 			if !slices.Contains(r.types, typ) {
@@ -219,5 +219,86 @@ func TestMavenSourceKeys(t *testing.T) {
 	g := Source{Name: "g", Type: "git", Claims: []string{"com.a.*"}, Remotes: []string{"https://x/y.git"}}
 	if got := mavenErrs(g); !strings.Contains(got, `type "git" is not supported for maven`) {
 		t.Errorf("git: %q", got)
+	}
+}
+
+func aptErrs(eco Ecosystem) string {
+	c := npmCfg()
+	c.Ecosystems = map[string]Ecosystem{"apt": eco}
+	err := ValidateWith(c, ValidateOptions{})
+	if err == nil {
+		return ""
+	}
+	var out []string
+	for m := range strings.SplitSeq(err.Error(), "\n") {
+		if strings.HasPrefix(m, "apt") {
+			out = append(out, m)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func aptReg(name string) Source {
+	return Source{
+		Name: name, Type: "registry", URL: "https://deb.debian.org/debian/", FetchHosts: []string{"deb.debian.org"},
+		Keyring: "/etc/keys/" + name + ".gpg", Suites: []string{"bookworm"}, Components: []string{"main"}, Architectures: []string{"amd64"},
+	}
+}
+
+func aptEco(sources ...Source) Ecosystem { return Ecosystem{Sources: sources, SigningKey: "armored"} }
+
+func TestAptSources(t *testing.T) {
+	if got := aptErrs(aptEco(npmStore("hosted", "acme-*", "tool"), aptReg("debian"))); got != "" {
+		t.Fatalf("valid config: %s", got)
+	}
+	// Registry sources are never claimed, so any number of them is fine.
+	if got := aptErrs(aptEco(aptReg("debian"), aptReg("security"))); got != "" {
+		t.Errorf("two registry sources: %s", got)
+	}
+	for name, c := range map[string]struct {
+		eco  Ecosystem
+		want string
+	}{
+		"storage star":      {aptEco(npmStore("hosted", "*")), `"*" can't be a storage claim: its pin would block every other repository`},
+		"registry claim":    {aptEco(func() Source { s := aptReg("debian"); s.Claims = []string{"acme"}; return s }()), "registry sources take no claims; clients pin claimed names (see /apt/preferences)"},
+		"invalid claim":     {aptEco(npmStore("hosted", "Acme")), "invalid claim"},
+		"overlap":           {aptEco(npmStore("a", "acme-*"), npmStore("b", "acme-tool")), "overlaps claim"},
+		"no signing key":    {Ecosystem{Sources: []Source{npmStore("hosted", "acme")}}, "signing_key is required for apt storage sources"},
+		"storage keyring":   {aptEco(func() Source { s := npmStore("h", "a"); s.Keyring = "k"; return s }()), "only supported on apt registry sources"},
+		"no keyring":        {aptEco(func() Source { s := aptReg("d"); s.Keyring = ""; return s }()), "keyring is required"},
+		"no suites":         {aptEco(func() Source { s := aptReg("d"); s.Suites = nil; return s }()), "suites is required"},
+		"no components":     {aptEco(func() Source { s := aptReg("d"); s.Components = nil; return s }()), "components is required"},
+		"no architectures":  {aptEco(func() Source { s := aptReg("d"); s.Architectures = nil; return s }()), "architectures is required"},
+		"bad suite":         {aptEco(func() Source { s := aptReg("d"); s.Suites = []string{"Bookworm"}; return s }()), "invalid suite"},
+		"bad component":     {aptEco(func() Source { s := aptReg("d"); s.Components = []string{"a/b"}; return s }()), "invalid component"},
+		"bad architecture":  {aptEco(func() Source { s := aptReg("d"); s.Architectures = []string{"AMD64"}; return s }()), "invalid architecture"},
+		"url without slash": {aptEco(func() Source { s := aptReg("d"); s.URL = "https://deb.debian.org/debian"; return s }()), "must end in a trailing /"},
+		"remotes":           {aptEco(func() Source { s := aptReg("d"); s.Remotes = []string{"https://x/y.git"}; return s }()), "remotes is not supported for apt"},
+		"git type":          {aptEco(Source{Name: "g", Type: "git"}), `type "git" is not supported for apt`},
+	} {
+		if got := aptErrs(c.eco); !strings.Contains(got, c.want) {
+			t.Errorf("%s: errors = %q, want %q", name, got, c.want)
+		}
+	}
+	if got := aptErrs(aptEco(aptReg("debian"))); strings.Contains(got, "signing_key") {
+		t.Errorf("registry-only apt needs no signing key: %s", got)
+	}
+}
+
+func TestAptKeysOnOtherEcosystems(t *testing.T) {
+	for _, mut := range []func(*Source){
+		func(s *Source) { s.Keyring = "k" }, func(s *Source) { s.Suites = []string{"x"} },
+		func(s *Source) { s.Components = []string{"x"} }, func(s *Source) { s.Architectures = []string{"x"} },
+	} {
+		s := npmReg("https://registry.npmjs.org/")
+		mut(&s)
+		if got := npmErrs(s); !strings.Contains(got, "only supported on apt registry sources") {
+			t.Errorf("errors = %q", got)
+		}
+	}
+	c := npmCfg(npmStore("own", "a.b"))
+	c.Ecosystems = map[string]Ecosystem{"maven": {Sources: []Source{npmStore("own", "a.b")}, SigningKey: "k"}}
+	if err := ValidateWith(c, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "signing_key is only supported for apt") {
+		t.Errorf("err = %v", err)
 	}
 }

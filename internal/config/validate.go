@@ -43,6 +43,12 @@ func ValidateWith(c *Config, opts ValidateOptions) error {
 			continue
 		}
 		errs = append(errs, validateSources(eco, e.Sources, c.Storage.Stores, opts)...)
+		switch {
+		case eco != "apt" && (e.SigningKey != "" || e.SigningKeyPassphrase != ""):
+			add("%s: signing_key is only supported for apt", eco)
+		case eco == "apt" && e.SigningKey == "" && slices.ContainsFunc(e.Sources, func(s Source) bool { return s.Type == "storage" }):
+			add("apt: signing_key is required for apt storage sources")
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -265,8 +271,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			rules.source(s, sources[:i], opts, add)
 		}
 
-		if len(s.Claims) == 0 && s.Type != "storage" {
+		if len(s.Claims) == 0 && s.Type != "storage" && !rules.perRepository {
 			unclaimed++
+		}
+		if eco != "apt" && (s.Keyring != "" || len(s.Suites) > 0 || len(s.Components) > 0 || len(s.Architectures) > 0) {
+			add("keyring, suites, components and architectures are only supported on apt registry sources")
 		}
 		if s.MetadataTTL < 0 {
 			add("metadata_ttl must not be negative")

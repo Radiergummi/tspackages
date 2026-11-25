@@ -90,6 +90,10 @@ type Limits struct {
 
 type Ecosystem struct {
 	Sources []Source `yaml:"sources"`
+	// SigningKey is an armored private key that signs generated apt Release
+	// files; SigningKeyPassphrase unlocks it. apt only.
+	SigningKey           string `yaml:"signing_key"`
+	SigningKeyPassphrase string `yaml:"signing_key_passphrase"`
 }
 
 type Source struct {
@@ -115,6 +119,13 @@ type Source struct {
 	// Modules maps a module path (without a major-version suffix) to its
 	// repository. go git sources only.
 	Modules map[string]GoModule `yaml:"modules"`
+	// Keyring is the file of public keys an apt registry source's Release
+	// signatures are verified against; Suites, Components and Architectures
+	// list what it mirrors. apt registry sources only.
+	Keyring       string   `yaml:"keyring"`
+	Suites        []string `yaml:"suites"`
+	Components    []string `yaml:"components"`
+	Architectures []string `yaml:"architectures"`
 }
 
 // GoModule locates a Go module in a repository.
