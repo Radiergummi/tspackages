@@ -358,7 +358,22 @@ func TestExampleConfigValidates(t *testing.T) {
 	for k, v := range map[string]string{"DEPLOY_KEY": "key", "KNOWN_HOSTS": "github.com ssh-ed25519 AAAA", "GITHUB_TOKEN": "t"} {
 		t.Setenv(k, v)
 	}
-	if _, err := Load("../../examples/config.yaml"); err != nil {
+	// The example's ${file:} references point at system paths; load a copy
+	// that points at files here.
+	raw, err := os.ReadFile("../../examples/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	example := string(raw)
+	for _, f := range []string{"/etc/tspackages/apt-signing.asc", "/usr/share/keyrings/debian-archive-keyring.gpg"} {
+		local := filepath.Join(dir, filepath.Base(f))
+		if err := os.WriteFile(local, []byte("key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		example = strings.Replace(example, "${file:"+f+"}", "${file:"+local+"}", 1)
+	}
+	if _, err := Load(writeConfig(t, example)); err != nil {
 		t.Fatal(err)
 	}
 }

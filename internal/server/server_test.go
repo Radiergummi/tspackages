@@ -462,3 +462,39 @@ func TestBuildMaven(t *testing.T) {
 		t.Fatalf("status page lacks the maven snippet: %d", w.Code)
 	}
 }
+
+func TestBuildAPT(t *testing.T) {
+	priv, pub := testutil.PGPKey(t, "apt")
+	cfg := fsConfig(t)
+	cfg.Ecosystems["apt"] = config.Ecosystem{
+		SigningKey: priv,
+		Sources: []config.Source{
+			{Name: "hosted", Type: "storage", Claims: []string{"example-*"}, Store: "main"},
+			{Name: "debian", Type: "registry", URL: "https://deb.debian.org/debian/", FetchHosts: []string{"deb.debian.org"},
+				Keyring: pub, Suites: []string{"bookworm"}, Components: []string{"main"}, Architectures: []string{"amd64"}},
+		},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["apt:example-*"]}`), quiet, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	if w := do(h, "GET", "/apt/key.asc", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET /apt/key.asc = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/apt/hosted/") {
+		t.Fatalf("status page lacks the apt snippet: %d", w.Code)
+	}
+
+	cfg = fsConfig(t)
+	cfg.Ecosystems["apt"] = config.Ecosystem{
+		SigningKey: "not a key",
+		Sources:    []config.Source{{Name: "hosted", Type: "storage", Claims: []string{"example-*"}, Store: "main"}},
+	}
+	_, _, err = Build(ctx, cfg, testutil.NewWho(testCap, `{}`), quiet, Hooks{})
+	if err == nil || !strings.Contains(err.Error(), "ecosystems.apt.signing_key") {
+		t.Fatalf("bad signing key: err = %v", err)
+	}
+}
