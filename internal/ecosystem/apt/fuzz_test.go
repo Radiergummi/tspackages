@@ -1,6 +1,10 @@
 package apt
 
-import "testing"
+import (
+	"bytes"
+	"reflect"
+	"testing"
+)
 
 func FuzzParsePath(f *testing.F) {
 	for _, s := range []string{
@@ -37,6 +41,29 @@ func FuzzParsePath(f *testing.F) {
 			if !put || p.Suite == "" || p.Component == "" || p.Deb.Name == "" || p.Deb.Version == "" || p.Deb.Arch == "" {
 				bad("upload field")
 			}
+		}
+	})
+}
+
+func FuzzParseStanza(f *testing.F) {
+	for _, s := range []string{
+		"Package: acme\nVersion: 1.0-1\nDescription: short\n long\n .\n more\n",
+		"Files:\n abc 1 x\n def 2 y\n", "A: b", "A:\n\tb\n", "", "\n", "A: b\n\nC: d\n", "A: b\r\n", "A: \x00\n", "A: \xff\n",
+	} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		s, err := ParseStanza(b, 1<<10)
+		if err != nil {
+			return
+		}
+		var buf bytes.Buffer
+		if err := WriteStanza(&buf, s); err != nil {
+			t.Fatalf("ParseStanza(%q) = %+v does not write: %v", b, s, err)
+		}
+		s2, err := ParseStanza(buf.Bytes(), 1<<10)
+		if err != nil || !reflect.DeepEqual(s, s2) {
+			t.Fatalf("round trip of %q: %+v, %v (wrote %q)", b, s2, err, buf.Bytes())
 		}
 	})
 }
