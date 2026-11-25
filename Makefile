@@ -27,7 +27,7 @@ fmt-check:
 test:
 	go test ./...
 
-## Run the end-to-end tests against real Composer, pip, uv, twine, the go command, npm, pnpm, mvn and gradle (needs composer 2.x, git, python3 with pip, uv and twine, go, node with npm and pnpm, a JDK, mvn, gradle and gpg; the PyPI tests download pinned build backends once, the mvn tests need make maven-seed)
+## Run the end-to-end tests against real Composer, pip, uv, twine, the go command, npm, pnpm, mvn, gradle and apt (needs composer 2.x, git, python3 with pip, uv and twine, go, node with npm and pnpm, a JDK, mvn, gradle, gpg, apt-get and apt-cache; the PyPI tests download pinned build backends once, the mvn tests need make maven-seed)
 integration:
 	TSP_TEST_MAVEN_SEED="$${TSP_TEST_MAVEN_SEED:-$(MAVEN_SEED)}" go test -timeout 30m -tags integration ./integration/...
 

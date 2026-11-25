@@ -101,6 +101,8 @@ jobs:
       - if: steps.maven-seed.outputs.cache-hit != 'true'
         run: make maven-seed
       - uses: ./.github/actions/minio
+      # The apt tests use the runner's own apt-get and apt-cache.
+      - run: apt-get --version
       # Below the job's timeout, so a hang prints its goroutine dump.
       - run: go test -timeout 25m -tags integration ./integration/...
 

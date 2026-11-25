@@ -26,7 +26,7 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real Composer/pip/uv/twine/go/npm/pnpm/mvn/gradle end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm, a JDK, mvn, gradle and gpg (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine/go/npm/pnpm/mvn/gradle/apt end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm, a JDK, mvn, gradle, gpg, apt-get and apt-cache (S3 variant: TSP_TEST_S3_ENDPOINT)
 make maven-seed    # once, with network: the local repository the mvn tests' fake Central serves (TSP_TEST_MAVEN_SEED; missing: skip, fail under CI=true)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
@@ -92,7 +92,7 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   `goproxy` or `npm` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
 - `integration/` — end-to-end tests with real Composer, pip, uv, twine,
-  the go command, npm, pnpm, mvn and Gradle (`-tags integration`).
+  the go command, npm, pnpm, mvn, Gradle and apt (`-tags integration`).
 
 ## Invariants — do not break
 
