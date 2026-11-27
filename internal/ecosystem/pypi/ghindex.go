@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/radiergummi/tspackages/internal/digest"
 	"github.com/radiergummi/tspackages/internal/githubapp"
 )
 
@@ -93,17 +95,19 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 					continue
 				}
 				c := ghCandidate{repo: repo, release: rel, asset: a, pkg: pkg}
-				sum, ok := strings.CutPrefix(a.Digest, "sha256:")
-				if !ok || !ghHex64(sum) {
-					sum = strings.TrimPrefix(digests[a.ID], "sha256:")
+				sum := ""
+				if s, ok := strings.CutPrefix(a.Digest, "sha256:"); ok && digest.IsHex(s, 64) {
+					sum = s
+				} else if pin := digests[a.ID]; digest.IsHex(pin, 64) {
+					sum = pin
 				}
-				if id, ok := owners[pkg]; !ghHex64(sum) && ok && id != repo.ID {
+				if id, ok := owners[pkg]; sum == "" && ok && id != repo.ID {
 					// Never served, so never hashed.
 					skip.Reason = "owned by " + ghRepoName(names, id)
 					idx.Skipped = append(idx.Skipped, skip)
 					continue
 				}
-				if !ghHex64(sum) {
+				if sum == "" {
 					idx.NeedHash = append(idx.NeedHash, ghPending{Repo: repo, Asset: a, Package: pkg})
 					skip.Reason = "no digest yet"
 					idx.Skipped = append(idx.Skipped, skip)
@@ -125,8 +129,7 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 	first := map[string]ghCandidate{}
 	for _, c := range cands {
 		f, ok := first[c.pkg]
-		if !ok || c.asset.CreatedAt.Before(f.asset.CreatedAt) ||
-			(c.asset.CreatedAt.Equal(f.asset.CreatedAt) && c.repo.ID < f.repo.ID) {
+		if !ok || ghEarlier(c.asset.CreatedAt, c.repo.ID, f.asset.CreatedAt, f.repo.ID) {
 			first[c.pkg] = c
 		}
 	}
@@ -136,8 +139,8 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 			continue
 		}
 		if slices.ContainsFunc(idx.NeedHash, func(p ghPending) bool {
-			return p.Package == pkg && p.Repo.ID != c.repo.ID && (p.Asset.CreatedAt.Before(c.asset.CreatedAt) ||
-				(p.Asset.CreatedAt.Equal(c.asset.CreatedAt) && p.Repo.ID < c.repo.ID))
+			return p.Package == pkg && p.Repo.ID != c.repo.ID &&
+				ghEarlier(p.Asset.CreatedAt, p.Repo.ID, c.asset.CreatedAt, c.repo.ID)
 		}) {
 			continue // an older asset may win once hashed
 		}
@@ -170,18 +173,7 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 	})
 	for _, k := range keys {
 		group := byFile[k]
-		best := group[0]
-		same := true
-		for _, c := range group[1:] {
-			if c.file.SHA256 != best.file.SHA256 {
-				same = false
-			}
-			if c.release.CreatedAt.After(best.release.CreatedAt) ||
-				(c.release.CreatedAt.Equal(best.release.CreatedAt) && c.release.ID > best.release.ID) {
-				best = c
-			}
-		}
-		if !same {
+		if slices.ContainsFunc(group, func(c ghCandidate) bool { return c.file.SHA256 != group[0].file.SHA256 }) {
 			conf := GitHubConflict{Package: k[0], Filename: k[1]}
 			for _, c := range group {
 				conf.Releases = append(conf.Releases, c.release.Tag)
@@ -190,7 +182,10 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 			idx.Conflicts = append(idx.Conflicts, conf)
 			continue
 		}
-		best.file.UploadTime = best.asset.CreatedAt
+		// Equal digests: the newest release's asset.
+		best := slices.MaxFunc(group, func(a, b ghCandidate) int {
+			return cmp.Or(a.release.CreatedAt.Compare(b.release.CreatedAt), cmp.Compare(a.release.ID, b.release.ID))
+		})
 		idx.Projects[k[0]] = append(idx.Projects[k[0]], best.file)
 	}
 	return idx, decided
@@ -231,15 +226,9 @@ func ghClaimed(claims []string, pkg string) bool {
 	return slices.ContainsFunc(claims, func(c string) bool { return Match(c, pkg) })
 }
 
-// ghHex64 reports whether s is 64 lowercase hex characters.
-func ghHex64(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
+// ghEarlier reports whether an asset created at at in repository id comes
+// before one created at bt in repository bid: older, or as old from a lower
+// repository ID.
+func ghEarlier(at time.Time, id int64, bt time.Time, bid int64) bool {
+	return at.Before(bt) || (at.Equal(bt) && id < bid)
 }

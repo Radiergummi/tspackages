@@ -3,8 +3,6 @@ package pypi
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"io"
 	"iter"
@@ -114,7 +112,7 @@ func (f *fakeGH) publish(repo githubapp.Repo, relID int64, tag string, assetID i
 	}
 	a := githubapp.Asset{ID: assetID, Name: name, State: "uploaded", Size: int64(len(body)), CreatedAt: created, UpdatedAt: created}
 	if digest {
-		a.Digest = "sha256:" + sha256Hex(body)
+		a.Digest = "sha256:" + sum256(body)
 	}
 	f.releases[repo.ID] = append(f.releases[repo.ID], githubapp.Release{ID: relID, Tag: tag, CreatedAt: created, Assets: []githubapp.Asset{a}})
 	f.bodies[assetID] = body
@@ -130,11 +128,6 @@ func (f *fakeGH) setBody(id int64, b []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.bodies[id] = b
-}
-
-func sha256Hex(b []byte) string {
-	s := sha256.Sum256(b)
-	return hex.EncodeToString(s[:])
 }
 
 // lockedBuffer collects log output written from several goroutines.
@@ -237,7 +230,7 @@ func TestGitHubProjectAndFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Files) != 1 || p.Files[0].Filename != wheel1 || p.Files[0].SHA256 != sha256Hex(bodyOne) ||
+	if len(p.Files) != 1 || p.Files[0].Filename != wheel1 || p.Files[0].SHA256 != sum256(bodyOne) ||
 		p.Files[0].Size != int64(len(bodyOne)) || !p.Files[0].UploadTime.Equal(t0) {
 		t.Fatalf("files: %+v", p.Files)
 	}
@@ -253,7 +246,7 @@ func TestGitHubProjectAndFile(t *testing.T) {
 		t.Fatalf("provenance: %+v, %v", recs, err)
 	}
 	r := recs[0]
-	if r.SourceType != "github" || r.Source != "gh" || r.SHA256 != sha256Hex(bodyOne) ||
+	if r.SourceType != "github" || r.Source != "gh" || r.SHA256 != sum256(bodyOne) ||
 		r.UpstreamURL != "https://api.github.com/repos/acme/lib/releases/assets/10" {
 		t.Fatalf("provenance record: %+v", r)
 	}
@@ -306,14 +299,14 @@ func TestGitHubHashesOldAssets(t *testing.T) {
 	e := newGHEnv(t)
 	e.api.publish(repoA, 1, "v1.0.0", 10, wheel1, bodyOne, false, t0)
 	e.mustPass(t)
-	if p, err := e.src.Project(ctxBg, "acme-lib"); err != nil || len(p.Files) != 1 || p.Files[0].SHA256 != sha256Hex(bodyOne) {
+	if p, err := e.src.Project(ctxBg, "acme-lib"); err != nil || len(p.Files) != 1 || p.Files[0].SHA256 != sum256(bodyOne) {
 		t.Fatalf("the pass that hashed the asset does not list it: %+v, %v", p, err)
 	}
 	if n := e.api.openCount(10); n != 1 {
 		t.Fatalf("the pass opened the asset %d times", n)
 	}
 	digests, err := newGHPins(e.state, "gh", discardLog).Digests(ctxBg)
-	if err != nil || digests[10] != sha256Hex(bodyOne) {
+	if err != nil || digests[10] != sum256(bodyOne) {
 		t.Fatalf("digest pins: %v, %v", digests, err)
 	}
 	if n := e.src.Backlog(); n != 0 {
@@ -325,7 +318,7 @@ func TestGitHubHashesOldAssets(t *testing.T) {
 		t.Fatalf("a pinned asset was hashed again (%d opens)", n)
 	}
 	p, err := e.src.Project(ctxBg, "acme-lib")
-	if err != nil || len(p.Files) != 1 || p.Files[0].SHA256 != sha256Hex(bodyOne) {
+	if err != nil || len(p.Files) != 1 || p.Files[0].SHA256 != sum256(bodyOne) {
 		t.Fatalf("pass 2: %+v, %v", p, err)
 	}
 	e.api.setBody(10, []byte("other bytes"))
@@ -446,7 +439,7 @@ func TestGitHubChangedBytesReported(t *testing.T) {
 	}
 	ch := e.src.Changed()
 	if len(ch) != 1 || ch[0].Package != "acme-lib" || ch[0].Filename != wheel1 ||
-		ch[0].FirstSHA256 != sha256Hex(bodyOne) || ch[0].NewSHA256 != sha256Hex(other) || ch[0].Seen.IsZero() {
+		ch[0].FirstSHA256 != sum256(bodyOne) || ch[0].NewSHA256 != sum256(other) || ch[0].Seen.IsZero() {
 		t.Fatalf("changed: %+v", ch)
 	}
 }

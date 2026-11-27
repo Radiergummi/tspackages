@@ -246,7 +246,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			}
 			// Uploads go to the first claiming source, so a name that an
 			// earlier source also claims could never be uploaded here.
-			if s.Type != "storage" && s.Type != "github" {
+			if !hostsNames(s.Type) {
 				continue
 			}
 			for _, e := range earlier {
@@ -265,7 +265,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			rules.source(s, sources[:i], opts, add)
 		}
 
-		if len(s.Claims) == 0 && s.Type != "storage" && s.Type != "github" {
+		if len(s.Claims) == 0 && !hostsNames(s.Type) {
 			unclaimed++
 		}
 		if s.Type != "github" && (s.AppID != 0 || s.InstallationID != 0 || s.PrivateKey != "") {
@@ -284,11 +284,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 				continue
 			}
 		}
+		if hostsNames(s.Type) && len(s.Claims) == 0 {
+			errs = append(errs, fmt.Errorf("%s: %s source %q must have claims", eco, s.Type, s.Name))
+		}
 		switch s.Type {
 		case "storage":
-			if len(s.Claims) == 0 {
-				errs = append(errs, fmt.Errorf("%s: storage source %q must have claims", eco, s.Name))
-			}
 			if _, ok := stores[s.Store]; !ok {
 				add("unknown store %q", s.Store)
 			}
@@ -325,11 +325,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 					add("download_credentials host %q is not in fetch_hosts", host)
 				}
 			}
-		case "github":
-			if len(s.Claims) == 0 {
-				errs = append(errs, fmt.Errorf("%s: github source %q must have claims", eco, s.Name))
-			}
-		case "git": // checked by the ecosystem's source hook
+		case "git", "github": // checked by the ecosystem's source hook
 		default:
 			add("type must be git, storage, registry or github, got %q", s.Type)
 		}
@@ -339,6 +335,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 	}
 	return errs
 }
+
+// hostsNames reports whether a source of type t is where its names live
+// (storage, github): it must have claims, and they must not overlap a claim
+// of an earlier source.
+func hostsNames(t string) bool { return t == "storage" || t == "github" }
 
 // sourceNameRe keeps source names safe as storage key segments, file names
 // and URL path segments.

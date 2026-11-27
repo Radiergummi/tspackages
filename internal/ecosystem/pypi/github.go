@@ -24,6 +24,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/relay"
 	"github.com/radiergummi/tspackages/internal/resolve"
 	"github.com/radiergummi/tspackages/internal/storage"
+	"github.com/radiergummi/tspackages/internal/upstream"
 )
 
 // GitHubAPI is what the github source needs from a GitHub App installation;
@@ -43,6 +44,9 @@ const ghHashIdle = 2 * time.Minute
 // ghHashConcurrency bounds the downloads a pass makes to hash assets that
 // GitHub reports no digest for.
 const ghHashConcurrency = 4
+
+// ghListConcurrency bounds the release listings a pass runs at once.
+const ghListConcurrency = 8
 
 // GitHubSource serves the wheels and sdists attached to the releases of the
 // repositories a GitHub App installation can see. A pass lists them every
@@ -140,15 +144,22 @@ func (s *GitHubSource) nextPass(err error) time.Duration {
 	if !limited {
 		return s.poll
 	}
-	reset := rl.Reset
-	if reset.IsZero() {
-		_, reset = s.api.RateLimit()
-	}
+	reset := s.resetOf(rl)
 	wait := reset.Sub(s.now())
 	if reset.IsZero() || wait <= 0 {
 		return s.poll
 	}
 	return min(wait+ghRateLimitMargin, ghMaxRateLimitWait)
+}
+
+// resetOf is rl's reset time, or the client's last known one when the error
+// carries none.
+func (s *GitHubSource) resetOf(rl *githubapp.RateLimitError) time.Time {
+	if !rl.Reset.IsZero() {
+		return rl.Reset
+	}
+	_, reset := s.api.RateLimit()
+	return reset
 }
 
 // pass indexes once and records the outcome for Health and the metrics.
@@ -178,13 +189,9 @@ func (s *GitHubSource) index(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list repositories: %w", err)
 	}
-	listed := make(map[githubapp.Repo][]githubapp.Release, len(repos))
-	for _, r := range repos {
-		rels, err := s.api.Releases(ctx, r)
-		if err != nil {
-			return fmt.Errorf("list releases of %s: %w", r.FullName, err)
-		}
-		listed[r] = rels
+	listed, err := s.listReleases(ctx, repos)
+	if err != nil {
+		return err
 	}
 	owners, err := s.pins.Owners(ctx)
 	if err != nil {
@@ -325,6 +332,28 @@ func (s *GitHubSource) hashPending(ctx context.Context, todo []ghPending) (map[i
 	return pinned, len(todo) - len(pinned), err
 }
 
+// listReleases lists every repository's releases, ghListConcurrency at a
+// time; the first failure stops the rest.
+func (s *GitHubSource) listReleases(ctx context.Context, repos []githubapp.Repo) (map[githubapp.Repo][]githubapp.Release, error) {
+	var mu sync.Mutex
+	listed := make(map[githubapp.Repo][]githubapp.Release, len(repos))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(ghListConcurrency)
+	for _, r := range repos {
+		g.Go(func() error {
+			rels, err := s.api.Releases(gctx, r)
+			if err != nil {
+				return fmt.Errorf("list releases of %s: %w", r.FullName, err)
+			}
+			mu.Lock()
+			listed[r] = rels
+			mu.Unlock()
+			return nil
+		})
+	}
+	return listed, g.Wait()
+}
+
 // errHashStalled is a hash download that sent nothing for s.hashIdle.
 var errHashStalled = errors.New("download stalled")
 
@@ -333,20 +362,17 @@ var errHashStalled = errors.New("download stalled")
 // download that sends nothing for s.hashIdle is abandoned, as the relay
 // abandons a stalled upstream.
 func (s *GitHubSource) hashAsset(ctx context.Context, p ghPending) (string, error) {
+	if p.Asset.Size > s.maxArtifact {
+		// Listed larger than the limit: the download could only fail.
+		return "", fmt.Errorf("%d bytes exceed the limit of %d: %w", p.Asset.Size, s.maxArtifact, upstream.ErrTooLarge)
+	}
 	dctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var stalled atomic.Bool
 	timer := time.AfterFunc(s.hashIdle, func() { stalled.Store(true); cancel() })
 	defer timer.Stop()
 	h := sha256.New()
-	n, err := func() (int64, error) {
-		body, _, err := s.api.OpenAsset(dctx, p.Repo, p.Asset.ID, s.maxArtifact)
-		if err != nil {
-			return 0, err
-		}
-		defer body.Close()
-		return io.Copy(h, ghIdleReader{body, func() { timer.Reset(s.hashIdle) }})
-	}()
+	n, err := s.download(dctx, p, h, func() { timer.Reset(s.hashIdle) })
 	if err != nil && stalled.Load() {
 		return "", errHashStalled
 	}
@@ -354,6 +380,17 @@ func (s *GitHubSource) hashAsset(ctx context.Context, p ghPending) (string, erro
 		return "", err
 	}
 	return s.pins.PinDigest(ctx, p.Asset.ID, hex.EncodeToString(h.Sum(nil)), n)
+}
+
+// download copies p's asset into w, calling progress after every read that
+// returned bytes.
+func (s *GitHubSource) download(ctx context.Context, p ghPending, w io.Writer, progress func()) (int64, error) {
+	body, _, err := s.api.OpenAsset(ctx, p.Repo, p.Asset.ID, s.maxArtifact)
+	if err != nil {
+		return 0, err
+	}
+	defer body.Close()
+	return io.Copy(w, ghIdleReader{body, progress})
 }
 
 // ghIdleReader calls progress after every read that returned bytes.
@@ -561,10 +598,7 @@ func (s *GitHubSource) Health(context.Context) []metrics.Health {
 	}
 	switch rl, limited := errors.AsType[*githubapp.RateLimitError](err); {
 	case limited:
-		reset := rl.Reset
-		if reset.IsZero() {
-			_, reset = s.api.RateLimit()
-		}
+		reset := s.resetOf(rl)
 		h.Detail = "rate limited; " + kept
 		if !reset.IsZero() {
 			h.Detail = "rate limited until " + reset.UTC().Format(time.RFC3339) + "; " + kept
