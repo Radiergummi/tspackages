@@ -11,6 +11,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,12 +47,15 @@ type GitHubSource struct {
 	name        string
 	claims      []string
 	api         GitHubAPI
+	apiURL      string // ends in "/"
 	pins        *ghPins
 	relay       *relay.Relay
 	rec         *records.Store
 	poll        time.Duration
 	maxArtifact int64
 	log         *slog.Logger
+	now         func() time.Time                     // replaced in tests
+	after       func(time.Duration) <-chan time.Time // replaced in tests
 
 	mu  sync.Mutex // one pass at a time
 	idx atomic.Pointer[ghServed]
@@ -60,8 +64,22 @@ type GitHubSource struct {
 	passErr error
 
 	cmu     sync.Mutex
-	changed map[[3]string]bool // (project, filename, sha256) reported as changed
+	seen    map[[3]string]bool // (project, filename, sha256) reported as changed
+	changes []GitHubChange
 }
+
+// GitHubChange is a served file whose bytes differ from the first provenance
+// record of its filename: the asset was deleted and uploaded again.
+type GitHubChange struct {
+	Package, Filename, FirstSHA256, NewSHA256 string
+	Seen                                      time.Time
+}
+
+// ghRateLimitMargin is waited beyond a rate limit's reset time.
+const ghRateLimitMargin = 5 * time.Second
+
+// ghMaxRateLimitWait caps the wait for a rate limit's reset.
+const ghMaxRateLimitWait = time.Hour
 
 var _ Source = (*GitHubSource)(nil)
 
@@ -73,15 +91,17 @@ type ghServed struct {
 	backlog     int
 }
 
-// NewGitHubSource builds a github source. state holds the owner and digest
-// pins; log nil means slog.Default().
-func NewGitHubSource(name string, claims []string, api GitHubAPI, state storage.Driver, rl *relay.Relay, rec *records.Store, poll time.Duration, maxArtifact int64, log *slog.Logger) *GitHubSource {
+// NewGitHubSource builds a github source. apiURL is the API base api talks
+// to, named in provenance records; state holds the owner and digest pins;
+// log nil means slog.Default().
+func NewGitHubSource(name string, claims []string, api GitHubAPI, apiURL string, state storage.Driver, rl *relay.Relay, rec *records.Store, poll time.Duration, maxArtifact int64, log *slog.Logger) *GitHubSource {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &GitHubSource{
-		name: name, claims: claims, api: api, pins: newGHPins(state, name, log), relay: rl, rec: rec,
-		poll: poll, maxArtifact: maxArtifact, log: log, changed: map[[3]string]bool{},
+		name: name, claims: claims, api: api, apiURL: strings.TrimRight(apiURL, "/") + "/",
+		pins: newGHPins(state, name, log), relay: rl, rec: rec, poll: poll, maxArtifact: maxArtifact, log: log,
+		now: time.Now, after: time.After, seen: map[[3]string]bool{},
 	}
 }
 
@@ -89,17 +109,38 @@ func (s *GitHubSource) Name() string     { return s.name }
 func (s *GitHubSource) Claims() []string { return s.claims }
 
 // Run makes a pass at start and then every poll interval until ctx is done.
+// After a rate-limited pass, the next one starts at the limit's reset.
 func (s *GitHubSource) Run(ctx context.Context) {
 	for {
-		if err := s.pass(ctx); err != nil && ctx.Err() == nil {
+		err := s.pass(ctx)
+		if err != nil && ctx.Err() == nil {
 			s.log.Error("pypi github index failed", "source", s.name, "error", err)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(s.poll):
+		case <-s.after(s.nextPass(err)):
 		}
 	}
+}
+
+// nextPass is the wait after a pass that returned err: until the reset
+// (plus a margin, at most ghMaxRateLimitWait) when it was rate limited and
+// the reset is known and ahead, else the poll interval.
+func (s *GitHubSource) nextPass(err error) time.Duration {
+	rl, limited := errors.AsType[*githubapp.RateLimitError](err)
+	if !limited {
+		return s.poll
+	}
+	reset := rl.Reset
+	if reset.IsZero() {
+		_, reset = s.api.RateLimit()
+	}
+	wait := reset.Sub(s.now())
+	if reset.IsZero() || wait <= 0 {
+		return s.poll
+	}
+	return min(wait+ghRateLimitMargin, ghMaxRateLimitWait)
 }
 
 // pass indexes once and records the outcome for Health.
@@ -285,6 +326,9 @@ func (s *GitHubSource) File(ctx context.Context, name, filename string) (Artifac
 	}
 	i := slices.IndexFunc(fs, func(f ghFile) bool { return f.Filename == filename })
 	if i < 0 {
+		if s.conflicted(name, filename) {
+			return Artifact{}, fmt.Errorf("%w: %s has conflicting assets", ErrUnavailable, filename)
+		}
 		return Artifact{}, fmt.Errorf("%w: %s", resolve.ErrNotFound, filename)
 	}
 	f := fs[i]
@@ -304,7 +348,7 @@ func (s *GitHubSource) File(ctx context.Context, name, filename string) (Artifac
 		}
 		if err := s.rec.PutProvenance(ctx, records.Provenance{
 			Ecosystem: ecoName, Package: name, Version: f.Version, File: filename, Source: s.name, SourceType: "github",
-			UpstreamURL:    "https://api.github.com/repos/" + f.Repo.FullName + "/releases/assets/" + strconv.FormatInt(f.AssetID, 10),
+			UpstreamURL:    s.apiURL + "repos/" + f.Repo.FullName + "/releases/assets/" + strconv.FormatInt(f.AssetID, 10),
 			DeclaredDigest: "sha256:" + f.SHA256, SHA1: res.SHA1, SHA256: res.SHA256,
 		}); err != nil {
 			return fmt.Errorf("record provenance: %w", err)
@@ -321,8 +365,17 @@ func (s *GitHubSource) File(ctx context.Context, name, filename string) (Artifac
 	return Artifact{Body: body, Size: max(size, 0)}, nil
 }
 
+// conflicted reports whether the last pass withheld filename of name for
+// conflicting digests.
+func (s *GitHubSource) conflicted(name, filename string) bool {
+	st := s.idx.Load()
+	return st != nil && slices.ContainsFunc(st.Conflicts, func(c GitHubConflict) bool {
+		return c.Package == name && c.Filename == filename
+	})
+}
+
 // checkChanged compares sum with the first digest this source recorded for
-// the file; a difference is served and logged once.
+// the file; a difference is served, and logged and listed by Changed once.
 func (s *GitHubSource) checkChanged(ctx context.Context, pkg, version, file, sum string) error {
 	recs, err := s.rec.FileProvenance(ctx, ecoName, pkg, version, file)
 	if err != nil {
@@ -339,14 +392,26 @@ func (s *GitHubSource) checkChanged(ctx context.Context, pkg, version, file, sum
 	}
 	key := [3]string{pkg, file, sum}
 	s.cmu.Lock()
-	seen := s.changed[key]
-	s.changed[key] = true
+	seen := s.seen[key]
+	if !seen {
+		s.seen[key] = true
+		s.changes = append(s.changes, GitHubChange{
+			Package: pkg, Filename: file, FirstSHA256: first.SHA256, NewSHA256: sum, Seen: s.now(),
+		})
+	}
 	s.cmu.Unlock()
 	if !seen {
 		s.log.Warn("pypi github: asset changed upstream; serving the new bytes", "source", s.name, "package", pkg,
 			"version", version, "file", file, "first_sha256", first.SHA256, "seen_sha256", sum)
 	}
 	return nil
+}
+
+// Changed returns the files seen changing since start, in the order seen.
+func (s *GitHubSource) Changed() []GitHubChange {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	return slices.Clone(s.changes)
 }
 
 // Metadata is not served: release assets carry no separate core metadata.

@@ -137,7 +137,7 @@ type ghEnv struct {
 	logs  *lockedBuffer
 }
 
-func newGHEnvWith(t *testing.T, state storage.Driver) *ghEnv {
+func newGHEnvWith(t *testing.T, state storage.Driver, apiURL string) *ghEnv {
 	t.Helper()
 	cache, err := storage.NewCache(context.Background(), fsDriver(t), 1<<30, nil)
 	if err != nil {
@@ -151,11 +151,11 @@ func newGHEnvWith(t *testing.T, state storage.Driver) *ghEnv {
 	rec := records.New(fsDriver(t))
 	logs := &lockedBuffer{}
 	e := &ghEnv{api: newFakeGH(), rl: rl, rec: rec, state: state, logs: logs}
-	e.src = NewGitHubSource("gh", []string{"acme-*"}, e.api, state, rl, rec, time.Hour, 1<<20, slog.New(slog.NewTextHandler(logs, nil)))
+	e.src = NewGitHubSource("gh", []string{"acme-*"}, e.api, apiURL, state, rl, rec, time.Hour, 1<<20, slog.New(slog.NewTextHandler(logs, nil)))
 	return e
 }
 
-func newGHEnv(t *testing.T) *ghEnv { return newGHEnvWith(t, fsDriver(t)) }
+func newGHEnv(t *testing.T) *ghEnv { return newGHEnvWith(t, fsDriver(t), "https://api.github.com") }
 
 func (e *ghEnv) pass(t *testing.T) error {
 	t.Helper()
@@ -227,7 +227,7 @@ func TestGitHubProjectAndFile(t *testing.T) {
 	}
 	r := recs[0]
 	if r.SourceType != "github" || r.Source != "gh" || r.SHA256 != sha256Hex(bodyOne) ||
-		!strings.Contains(r.UpstreamURL, "acme/lib") || !strings.HasSuffix(r.UpstreamURL, "/10") {
+		r.UpstreamURL != "https://api.github.com/repos/acme/lib/releases/assets/10" {
 		t.Fatalf("provenance record: %+v", r)
 	}
 	if _, err := e.src.Project(ctxBg, "acme-other"); !errors.Is(err, resolve.ErrNotFound) {
@@ -365,7 +365,7 @@ func (r *racingDriver) List(ctx context.Context, prefix string) iter.Seq2[storag
 }
 
 func TestGitHubOwnerRaceLost(t *testing.T) {
-	e := newGHEnvWith(t, &racingDriver{Driver: fsDriver(t)})
+	e := newGHEnvWith(t, &racingDriver{Driver: fsDriver(t)}, "https://api.github.com/")
 	e.api.publish(repoA, 1, "v1.0.0", 10, wheel1, bodyOne, true, t0)
 	e.api.publish(repoB, 2, "v2.0.0", 20, wheel2, []byte("b"), true, t0.Add(time.Hour))
 	e.mustPass(t)
@@ -419,6 +419,11 @@ func TestGitHubChangedBytesReported(t *testing.T) {
 	if n := strings.Count(e.logs.String(), msg); n != 1 {
 		t.Fatalf("%d change reports in:\n%s", n, e.logs.String())
 	}
+	ch := e.src.Changed()
+	if len(ch) != 1 || ch[0].Package != "acme-lib" || ch[0].Filename != wheel1 ||
+		ch[0].FirstSHA256 != sha256Hex(bodyOne) || ch[0].NewSHA256 != sha256Hex(other) || ch[0].Seen.IsZero() {
+		t.Fatalf("changed: %+v", ch)
+	}
 }
 
 func TestGitHubDeletedAssetDisappears(t *testing.T) {
@@ -435,5 +440,78 @@ func TestGitHubDeletedAssetDisappears(t *testing.T) {
 	}
 	if _, err := e.src.File(ctxBg, "acme-lib", wheel1); !errors.Is(err, resolve.ErrNotFound) {
 		t.Fatalf("File after deletion: %v", err)
+	}
+}
+
+func TestGitHubProvenanceNamesGHES(t *testing.T) {
+	e := newGHEnvWith(t, fsDriver(t), "https://ghe.example/api/v3/")
+	e.api.publish(repoA, 1, "v1.0.0", 10, wheel1, bodyOne, true, t0)
+	e.mustPass(t)
+	if _, err := e.read("acme-lib", wheel1); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := e.rec.FileProvenance(ctxBg, "pypi", "acme-lib", "1.0.0", wheel1)
+	if err != nil || len(recs) != 1 || recs[0].UpstreamURL != "https://ghe.example/api/v3/repos/acme/lib/releases/assets/10" {
+		t.Fatalf("provenance: %+v, %v", recs, err)
+	}
+}
+
+// TestGitHubConflictedFileUnavailable: a filename two releases publish with
+// different digests is withheld, never a miss, even next to served files.
+func TestGitHubConflictedFileUnavailable(t *testing.T) {
+	e := newGHEnv(t)
+	e.api.publish(repoA, 1, "v1.0.0", 10, wheel1, bodyOne, true, t0)
+	e.api.publish(repoA, 2, "v1.0.0-again", 11, wheel1, []byte("other"), true, t0.Add(time.Hour))
+	e.api.publish(repoA, 3, "v2.0.0", 12, wheel2, []byte("two"), true, t0.Add(2*time.Hour))
+	e.mustPass(t)
+	p, err := e.src.Project(ctxBg, "acme-lib")
+	if err != nil || len(p.Files) != 1 || p.Files[0].Filename != wheel2 {
+		t.Fatalf("project: %+v, %v", p, err)
+	}
+	_, err = e.src.File(ctxBg, "acme-lib", wheel1)
+	if !errors.Is(err, ErrUnavailable) || errors.Is(err, resolve.ErrNotFound) {
+		t.Fatalf("conflicted file: %v", err)
+	}
+}
+
+// TestGitHubRateLimitWaitsForReset: after a rate-limited pass, Run waits for
+// the reset (plus a margin) rather than the poll interval.
+func TestGitHubRateLimitWaitsForReset(t *testing.T) {
+	e := newGHEnv(t)
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	e.src.now = func() time.Time { return now }
+	e.src.poll = time.Millisecond
+	waits := make(chan time.Duration, 1)
+	e.src.after = func(d time.Duration) <-chan time.Time {
+		waits <- d
+		return make(chan time.Time) // never fires; the test cancels
+	}
+	e.api.mu.Lock()
+	e.api.listErr = &githubapp.RateLimitError{Reset: now.Add(10 * time.Minute)}
+	e.api.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctxBg)
+	done := make(chan struct{})
+	go func() { e.src.Run(ctx); close(done) }()
+	got := <-waits
+	cancel()
+	<-done
+	if got != 10*time.Minute+ghRateLimitMargin {
+		t.Fatalf("Run waited %v after a rate-limited pass", got)
+	}
+
+	e.api.reset = now.Add(20 * time.Minute)
+	for _, tc := range []struct {
+		err  error
+		want time.Duration
+	}{
+		{nil, time.Millisecond},
+		{errors.New("boom"), time.Millisecond},
+		{&githubapp.RateLimitError{}, 20*time.Minute + ghRateLimitMargin}, // reset from RateLimit()
+		{&githubapp.RateLimitError{Reset: now.Add(3 * time.Hour)}, ghMaxRateLimitWait},
+		{&githubapp.RateLimitError{Reset: now.Add(-time.Minute)}, time.Millisecond},
+	} {
+		if got := e.src.nextPass(tc.err); got != tc.want {
+			t.Errorf("nextPass(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
