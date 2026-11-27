@@ -184,9 +184,9 @@ func (f *fakeIndex) file(w http.ResponseWriter, fn string) {
 	w.Write(b[1<<20:])
 }
 
-// pyRegistry is a wired tspackages with a pypi storage source claiming
-// acme-*, a git source claiming gitpkg-* over one bare repository, and the
-// fake index as the unclaimed pass-through.
+// pyRegistry is a wired tspackages with the claimed sources (by default a
+// pypi storage source claiming acme-*), a git source claiming gitpkg-* over
+// one bare repository, and the fake index as the unclaimed pass-through.
 type pyRegistry struct {
 	t     *testing.T
 	URL   string
@@ -196,7 +196,7 @@ type pyRegistry struct {
 	root  string
 }
 
-func startPyRegistry(t *testing.T, rules string) *pyRegistry {
+func startPyRegistry(t *testing.T, rules string, claimed ...config.Source) *pyRegistry {
 	t.Helper()
 	needPython(t)
 	dir := backends(t)
@@ -216,6 +216,13 @@ func startPyRegistry(t *testing.T, rules string) *pyRegistry {
 	testutil.Git(t, root, "clone", "-q", "--bare", r.work, r.bare)
 
 	iu, _ := url.Parse(r.index.URL)
+	if len(claimed) == 0 {
+		claimed = []config.Source{{Name: "hosted", Type: "storage", Store: "main", Claims: []string{"acme-*"}}}
+	}
+	sources := slices.Concat(claimed, []config.Source{
+		{Name: "repo", Type: "git", Claims: []string{"gitpkg-*"}, Remotes: []string{r.bare}, PollInterval: 200 * time.Millisecond},
+		{Name: "upstream", Type: "registry", URL: r.index.URL + "/simple/", FetchHosts: []string{iu.Host}, MetadataTTL: time.Nanosecond},
+	})
 	cfg := &config.Config{
 		Tailscale: config.Tailscale{Hostname: "registry", Capability: capName, StateDir: filepath.Join(root, "ts")},
 		Storage: config.Storage{
@@ -224,17 +231,15 @@ func startPyRegistry(t *testing.T, rules string) *pyRegistry {
 			State:   config.StoreConfig{Driver: "fs", Path: filepath.Join(root, "state")},
 			Stores:  map[string]config.StoreConfig{"main": {Driver: "fs", Path: filepath.Join(root, "hosted")}},
 		},
-		Ecosystems: map[string]config.Ecosystem{"pypi": {Sources: []config.Source{
-			{Name: "hosted", Type: "storage", Store: "main", Claims: []string{"acme-*"}},
-			{Name: "repo", Type: "git", Claims: []string{"gitpkg-*"}, Remotes: []string{r.bare}, PollInterval: 200 * time.Millisecond},
-			{Name: "upstream", Type: "registry", URL: r.index.URL + "/simple/", FetchHosts: []string{iu.Host}, MetadataTTL: time.Nanosecond},
-		}}},
+		Ecosystems: map[string]config.Ecosystem{"pypi": {Sources: sources}},
 	}
 	if rules == "" {
 		rules = `{"read":["*"],"write":["pypi:acme-*"]}`
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, rules), nil, slog.New(slog.DiscardHandler),
+	// The dialer serves only tailnet hosts: those of a fake GitHub Enterprise
+	// Server.
+	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, rules), loopbackTailnet, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
 	if err != nil {
 		cancel()
@@ -600,6 +605,78 @@ func TestUpstreamMismatchAborts(t *testing.T) {
 		n := r.index.count("/files/" + fn)
 		if n == fetches {
 			t.Fatalf("install %d did not fetch upstream; the mismatching file was cached", i+1)
+		}
+		fetches = n
+	}
+}
+
+// TestGitHubReleaseInstalls: a wheel whose digest GitHub declares and an
+// sdist it declares none for, both release assets, install with pip
+// (hash-checked) and uv.
+func TestGitHubReleaseInstalls(t *testing.T) {
+	gh := newFakeGitHub(t)
+	r := startPyRegistry(t, "", gh.source(t, "gh", "acme-lib"))
+	files := r.buildDist("acme-lib", "1.0")
+	whl, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdist, err := os.ReadFile(files[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh.add(filepath.Base(files[0]), whl, true)
+	gh.add(filepath.Base(files[1]), sdist, false)
+	r.waitFor("acme-lib", filepath.Base(files[0])+"#sha256="+sum256(whl))
+	r.waitFor("acme-lib", filepath.Base(files[1])+"#sha256="+sum256(sdist))
+
+	reqs := filepath.Join(t.TempDir(), "requirements.txt")
+	if err := os.WriteFile(reqs, []byte("acme-lib==1.0 --hash=sha256:"+sum256(whl)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	py, out, err := r.pipInstall("--require-hashes", "-r", reqs)
+	if err != nil {
+		t.Fatalf("pip install: %v\n%s", err, out)
+	}
+	if got := r.must("", py, "-c", "import acme_lib; print(acme_lib.VERSION)"); strings.TrimSpace(got) != "1.0" {
+		t.Fatalf("pip installed %q", got)
+	}
+	py, out, err = r.uvInstall("acme-lib==1.0")
+	if err != nil {
+		t.Fatalf("uv pip install: %v\n%s", err, out)
+	}
+	if got := r.must("", py, "-c", "import acme_lib; print(acme_lib.VERSION)"); strings.TrimSpace(got) != "1.0" {
+		t.Fatalf("uv installed %q", got)
+	}
+}
+
+// TestGitHubTamperedAssetRejected: a download host serving other bytes than
+// the declared digest fails the install, and nothing is cached: a second
+// install downloads again.
+func TestGitHubTamperedAssetRejected(t *testing.T) {
+	gh := newFakeGitHub(t)
+	r := startPyRegistry(t, "", gh.source(t, "gh", "acme-lib"))
+	const fn = "acme_lib-1.0-py3-none-any.whl"
+	whl := wheelBytes(t, "acme_lib", "1.0", 0)
+	id := gh.add(fn, whl, true)
+	gh.tamper(id, wheelBytes(t, "acme_lib", "1.0", 64))
+	r.waitFor("acme-lib", fn+"#sha256="+sum256(whl))
+
+	reqs := filepath.Join(t.TempDir(), "requirements.txt")
+	if err := os.WriteFile(reqs, []byte("acme-lib==1.0 --hash=sha256:"+sum256(whl)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetches := 0
+	for i := range 2 {
+		_, out, err := r.pipInstall("--require-hashes", "-r", reqs)
+		// tspackages breaks the transfer before pip could check the hash
+		// itself, so pip reports a broken connection to the file.
+		if err == nil || !strings.Contains(out, "/pypi/files/gh/acme-lib/"+fn) {
+			t.Fatalf("install %d: err=%v\n%s", i+1, err, out)
+		}
+		n := gh.downloads(id)
+		if n == fetches {
+			t.Fatalf("install %d did not download the asset; the tampered bytes were cached", i+1)
 		}
 		fetches = n
 	}
