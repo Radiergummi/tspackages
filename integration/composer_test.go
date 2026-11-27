@@ -259,7 +259,7 @@ func startRegistry(t *testing.T, o options) *registry {
 		}}},
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, o.rules), slog.New(slog.DiscardHandler),
+	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, o.rules), nil, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
 	if err != nil {
 		cancel()

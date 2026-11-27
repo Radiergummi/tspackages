@@ -246,7 +246,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			}
 			// Uploads go to the first claiming source, so a name that an
 			// earlier source also claims could never be uploaded here.
-			if s.Type != "storage" {
+			if !hostsNames(s.Type) {
 				continue
 			}
 			for _, e := range earlier {
@@ -265,8 +265,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			rules.source(s, sources[:i], opts, add)
 		}
 
-		if len(s.Claims) == 0 && s.Type != "storage" {
+		if len(s.Claims) == 0 && !hostsNames(s.Type) {
 			unclaimed++
+		}
+		if s.Type != "github" && (s.AppID != 0 || s.InstallationID != 0 || s.PrivateKey != "") {
+			add("app_id, installation_id and private_key are only supported on github sources")
 		}
 		if s.MetadataTTL < 0 {
 			add("metadata_ttl must not be negative")
@@ -275,17 +278,17 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			add("poll_interval must not be negative")
 		}
 		switch s.Type {
-		case "git", "storage", "registry":
+		case "git", "storage", "registry", "github":
 			if !slices.Contains(rules.types, s.Type) {
 				add("type %q is not supported for %s", s.Type, eco)
 				continue
 			}
 		}
+		if hostsNames(s.Type) && len(s.Claims) == 0 {
+			errs = append(errs, fmt.Errorf("%s: %s source %q must have claims", eco, s.Type, s.Name))
+		}
 		switch s.Type {
 		case "storage":
-			if len(s.Claims) == 0 {
-				errs = append(errs, fmt.Errorf("%s: storage source %q must have claims", eco, s.Name))
-			}
 			if _, ok := stores[s.Store]; !ok {
 				add("unknown store %q", s.Store)
 			}
@@ -322,9 +325,9 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 					add("download_credentials host %q is not in fetch_hosts", host)
 				}
 			}
-		case "git": // checked by the ecosystem's source hook
+		case "git", "github": // checked by the ecosystem's source hook
 		default:
-			add("type must be git, storage or registry, got %q", s.Type)
+			add("type must be git, storage, registry or github, got %q", s.Type)
 		}
 	}
 	if unclaimed > 1 {
@@ -332,6 +335,11 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 	}
 	return errs
 }
+
+// hostsNames reports whether a source of type t is where its names live
+// (storage, github): it must have claims, and they must not overlap a claim
+// of an earlier source.
+func hostsNames(t string) bool { return t == "storage" || t == "github" }
 
 // sourceNameRe keeps source names safe as storage key segments, file names
 // and URL path segments.

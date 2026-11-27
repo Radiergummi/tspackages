@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +41,9 @@ type Hooks struct {
 // GoSumDB replaces sum.golang.org's URL and verifier key. Test-only.
 type GoSumDB struct{ URL, Key string }
 
+// Dialer dials over the tailnet; main passes the tsnet server's Dial.
+type Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // shared holds what every ecosystem builder may use.
 type shared struct {
 	cfg                        *config.Config
@@ -54,6 +58,7 @@ type shared struct {
 	// returns one mirror per remote, shared across sources by mirrorSet.
 	mirrors  func(s config.Source, keyPrefix string, remotes []string) ([]*gitmirror.Mirror, error)
 	upstream func(s config.Source) (*upstream.Client, error)
+	dial     Dialer // nil: tailnet hosts are unreachable
 	hooks    Hooks
 	log      *slog.Logger
 }
@@ -83,8 +88,10 @@ var onMirror = func(*gitmirror.Mirror) {}
 // <work_dir>/git, and directories there that belong to no configured mirror
 // are removed; SSH key material is rewritten to <work_dir>/keys
 // (<source>.key, <source>.known_hosts; pypi/<source>.* for PyPI sources,
-// go/<source>.* for Go sources) at every start.
-func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
+// go/<source>.* for Go sources) at every start. dial reaches tailnet hosts
+// (GitHub Enterprise Server); a source that needs it fails Build when it is
+// nil.
+func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, dial Dialer, log *slog.Logger, h Hooks) (http.Handler, func(context.Context), error) {
 	config.ApplyDefaults(cfg)
 	if err := config.ValidateWith(cfg, config.ValidateOptions{
 		AllowFileRemotes:   h.AllowFileRemotes,
@@ -132,6 +139,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 			return sourceMirrors(s, keyPrefix, gitDir, mirrors, h, log)
 		},
 		upstream: func(s config.Source) (*upstream.Client, error) { return upstreamClient(s, h) },
+		dial:     dial,
 		hooks:    h,
 		log:      log,
 	}

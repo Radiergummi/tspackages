@@ -83,7 +83,7 @@ func TestBuildWiresGo(t *testing.T) {
 			FetchHosts: []string{"proxy.golang.org", "sum.golang.org", u.Host},
 		},
 	}}
-	h, start, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), quiet, Hooks{
+	h, start, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), nil, quiet, Hooks{
 		AllowFileRemotes: true, AllowPrivateUpstreams: true, GoSumDB: GoSumDB{URL: sumdb.URL, Key: key},
 	})
 	if err != nil {
@@ -151,7 +151,7 @@ func TestGoGitClaimedPathNeverForwarded(t *testing.T) {
 			FetchHosts: []string{"sum.golang.org", pu.Host, su.Host},
 		},
 	}}
-	h, start, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), quiet, Hooks{
+	h, start, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), nil, quiet, Hooks{
 		AllowFileRemotes: true, AllowPrivateUpstreams: true, GoSumDB: GoSumDB{URL: sumdb.URL, Key: key},
 	})
 	if err != nil {
@@ -197,7 +197,7 @@ func TestGoKeyFilesDoNotCollide(t *testing.T) {
 	goSrc.Remotes = nil
 	goSrc.Modules = map[string]config.GoModule{"git.example.com/acme/repo": {Remote: sshSource.Remotes[0]}}
 	cfg.Ecosystems["go"] = config.Ecosystem{Sources: []config.Source{goSrc}}
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	keys := filepath.Join(cfg.Storage.WorkDir, "keys")
@@ -225,7 +225,7 @@ func TestGONOSUMDBSnippet(t *testing.T) {
 		if got, want := gonosumdb(cfg.Ecosystems["go"]), "github.com/acme,github.com/Acme/SDK"; got != want {
 			t.Errorf("gonosumdb = %q, want %q", got, want)
 		}
-		h, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), quiet, Hooks{AllowFileRemotes: true})
+		h, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), nil, quiet, Hooks{AllowFileRemotes: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -249,7 +249,7 @@ func TestGONOSUMDBSnippet(t *testing.T) {
 			Name: "public", Type: "registry", URL: "https://proxy.golang.org",
 			FetchHosts: []string{"proxy.golang.org", "sum.golang.org"},
 		}}}
-		h, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), quiet, Hooks{})
+		h, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["go:*"]}`), nil, quiet, Hooks{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -279,7 +279,7 @@ func TestGoStatusFiltersByReadRules(t *testing.T) {
 		"192.0.2.1:1": testutil.NewWho(testCap, `{"read":["go:github.com/acme/*"]}`),
 		"192.0.2.2:1": testutil.NewWho(testCap, `{"read":["go:github.com/other/*"]}`),
 	}
-	h, start, err := Build(t.Context(), cfg, who, quiet, Hooks{AllowFileRemotes: true})
+	h, start, err := Build(t.Context(), cfg, who, nil, quiet, Hooks{AllowFileRemotes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestHostWideClaimWarns(t *testing.T) {
 	}}}
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), log, Hooks{AllowFileRemotes: true}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, log, Hooks{AllowFileRemotes: true}); err != nil {
 		t.Fatal(err)
 	}
 	var lines []string
@@ -340,7 +340,7 @@ func TestGoBuildDirSwept(t *testing.T) {
 	if err := os.Chmod(cfg.Storage.WorkDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(dir)

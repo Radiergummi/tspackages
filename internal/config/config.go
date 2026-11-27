@@ -94,7 +94,7 @@ type Ecosystem struct {
 
 type Source struct {
 	Name                string                `yaml:"name"`
-	Type                string                `yaml:"type"` // "git", "storage" or "registry"
+	Type                string                `yaml:"type"` // "git", "storage", "registry" or "github"
 	Claims              []string              `yaml:"claims"`
 	Remotes             []string              `yaml:"remotes"`
 	Branches            []string              `yaml:"branches"`
@@ -115,6 +115,11 @@ type Source struct {
 	// Modules maps a module path (without a major-version suffix) to its
 	// repository. go git sources only.
 	Modules map[string]GoModule `yaml:"modules"`
+	// AppID, InstallationID and PrivateKey (a PEM RSA private key)
+	// identify the GitHub App of a pypi github source.
+	AppID          int64  `yaml:"app_id"`
+	InstallationID int64  `yaml:"installation_id"`
+	PrivateKey     string `yaml:"private_key"`
 }
 
 // GoModule locates a Go module in a repository.
@@ -215,6 +220,10 @@ func ApplyDefaults(c *Config) {
 	for eco, e := range c.Ecosystems {
 		for i := range e.Sources {
 			setNum(&e.Sources[i].MetadataTTL, 5*time.Minute)
+			if e.Sources[i].Type == "github" {
+				setStr(&e.Sources[i].URL, DefaultGitHubURL)
+				setNum(&e.Sources[i].PollInterval, 5*time.Minute)
+			}
 			setNum(&e.Sources[i].PollInterval, time.Minute)
 		}
 		c.Ecosystems[eco] = e

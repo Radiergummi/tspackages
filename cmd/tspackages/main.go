@@ -82,7 +82,7 @@ func run(parent context.Context, configPath string, log *slog.Logger, node func(
 		return err
 	}
 	// Build runs after Up, so the stores and the tailnet are both ready here.
-	handler, start, err := server.Build(ctx, cfg, lc, log, server.Hooks{})
+	handler, start, err := server.Build(ctx, cfg, lc, srv.Dial, log, server.Hooks{})
 	if err != nil {
 		return err
 	}

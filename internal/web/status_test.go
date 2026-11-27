@@ -291,7 +291,7 @@ func TestStatusShowsPyPIByReadRules(t *testing.T) {
 				{Remote: "https://h/mono.git", Tag: "v1", Dir: "packages/dyn", Package: "acme-dyn", Reason: "version is dynamic"},
 				{Remote: "https://h/x.git", Tag: "v1", Dir: "", Package: "", Reason: "name missing or invalid"},
 			}
-		})},
+		}, nil)},
 	})
 	c := &identity.Caller{Login: "a@b", Rules: []authz.Rule{{Read: []string{"pypi:acme-*"}}}}
 	body := serve(t, w, "/", c).Body.String()

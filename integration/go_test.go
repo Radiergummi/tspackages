@@ -312,7 +312,7 @@ func startGoRegistry(t *testing.T, rules string) *goRegistry {
 func (r *goRegistry) start() {
 	r.t.Helper()
 	ctx, cancel := context.WithCancel(r.t.Context())
-	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, r.rules), slog.New(slog.DiscardHandler),
+	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, r.rules), nil, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true, GoSumDB: server.GoSumDB{URL: r.sumdb.URL, Key: r.key}})
 	if err != nil {
 		cancel()

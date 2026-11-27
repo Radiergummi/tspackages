@@ -159,7 +159,7 @@ the tailnet as [Monitoring](#monitoring) describes.
 | Data | Where | Back up? | If lost |
 |------|-------|----------|---------|
 | Node and TLS keys | `tailscale.state_dir` | Yes, as a secret | New node identity; see [Losing a piece](#losing-a-piece). |
-| Tag pins, git-built Composer archives and their `.meta.json` sidecars, git-built PyPI sdists, git-built Go module zips and pseudo-version records, the latest verified sum.golang.org tree head, provenance, audit records | `storage.state` | Yes | Git-served versions may change bytes or vanish; history is gone. |
+| Tag pins, git-built Composer archives and their `.meta.json` sidecars, git-built PyPI sdists, git-built Go module zips and pseudo-version records, the latest verified sum.golang.org tree head, GitHub release name owners and digest pins, provenance, audit records | `storage.state` | Yes | Git-served versions may change bytes or vanish; history is gone. A GitHub source pins the first repository seen and hashes old assets again, so the pins can change owner or digest. |
 | Uploaded packages and their indexes | each store in `storage.stores` | Yes | Uploaded packages are gone. |
 | Registry metadata and archives, checksum database tiles, Go pseudo-version zips | `storage.cache` | No | Fetched or built again. |
 | Git mirrors, SSH key files, spooled uploads, downloads in progress | `storage.work_dir` | No | Mirrors are cloned again; key files are rewritten at every start. |
@@ -168,7 +168,7 @@ The state store and the hosted stores hold private packages; protect their
 backups as you protect the stores.
 
 The state store's keys are `pins/`, `composer-git/`, `pypi-git/`,
-`go-git/`, `go-pseudo/`, `go-sumdb/`, `provenance/` and `audit/`.
+`pypi-github/`, `go-git/`, `go-pseudo/`, `go-sumdb/`, `provenance/` and `audit/`.
 tspackages only ever creates objects there and never deletes one. The one
 object it overwrites is `go-sumdb/sum.golang.org/latest`, the latest
 verified checksum database tree head, rewritten whenever the tree grows. A hosted store holds `composer/` and `pypi/`;
@@ -345,6 +345,12 @@ Metrics:
 - `tspackages_git_last_sync_timestamp_seconds{ecosystem,source}`: the
   oldest last successful sync among a git source's remotes, `0` until every
   remote has synced at least once. Alert when it falls more than a few poll intervals behind.
+- `tspackages_github_index_passes_total{source,result}`,
+  `tspackages_github_api_requests_total{source,status}` and
+  `tspackages_github_ratelimit_remaining{source}`: the passes of a PyPI
+  `github` source by `ok` or `error`, its GitHub API requests by status and
+  the requests left in the rate-limit window as of its last pass. Alert on
+  a run of `error` passes.
 - `tspackages_upstream_request_duration_seconds{source}`,
   `tspackages_cache_hits_total`, `tspackages_rate_limited_total` and
   `tspackages_build_info{version,commit}`.
@@ -352,11 +358,12 @@ Metrics:
 The status page has a section per configured ecosystem, with each source's
 health, tags that moved upstream, Composer packages declared by several
 remotes, registry archives whose bytes changed, PyPI git conflicts and
-skipped packages, Go tags that were skipped, refused or moved and the
+skipped packages, the names each GitHub release source's repositories own, the release assets it skipped (owned by another repository, no digest yet, owner not decided yet), files withheld for conflicting bytes or served with changed bytes, Go tags that were skipped, refused or moved and the
 state of the sum.golang.org verifier, and npm tarballs that changed
 upstream. It shows what the
-running process has seen; restarts clear the moved-tag and changed-archive
-lists until those are seen again. The logs are the lasting record. Lines
+running process has seen; restarts clear the moved-tag, changed-archive and
+changed GitHub release file lists until those are seen again (provenance
+records stay). The logs are the lasting record. Lines
 worth an alert:
 
 | Message | Level | Means |
@@ -377,6 +384,11 @@ worth an alert:
 | `pypi git: a rebuilt sdist differs from its release record; not written` | warn | Rebuilding a stored release's missing sdist gave other bytes. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
 | `pypi git: repairing a release failed` | error | A stored release lacks its sdist and couldn't be built again. |
+| `pypi github index failed` | error | A whole pass failed, for example a rate limit, an unreachable GitHub or a failed App authentication; the previous index stays served. |
+| `pypi github: hashing an asset failed` | warn | An asset without a GitHub digest couldn't be downloaded and hashed, or its download sent nothing for two minutes; it stays unlisted and is tried again on the next pass. |
+| `pypi github: asset changed upstream; serving the new bytes` | warn | A file's SHA256 differs from the first one recorded for its filename (deleted and uploaded again). |
+| `pypi github: ignoring a corrupt pin` | warn | An owner or digest pin in the state store doesn't parse; it is ignored (see [A name's owner in a GitHub source](#a-names-owner-in-a-github-source)). |
+| `pypi github: name unavailable: its owner pin is corrupt` | warn | Once per pass for each name whose owner pin doesn't parse; that name answers `502` until the pin is deleted. |
 | `goproxy git: pass failed` | error | A whole Go index pass failed. |
 | `goproxy git: sync failed; indexing the local mirror` | warn | A remote is unreachable. |
 | `goproxy git: tag moved upstream; serving the stored version` | warn | A tag was force-pushed. The stored version keeps the first commit. |
@@ -395,6 +407,136 @@ path, `pyproject.toml` or workspace over the caps in the
 appear on the status page only, not in the logs. A refusal is remembered
 for the commit until restart; a fixed repository needs a new tag, and with
 it a new version, anyway.
+
+## PyPI release assets
+
+A `github` source in the PyPI ecosystem serves the wheels and sdists attached
+to GitHub releases. tspackages reads them through a GitHub App and hosts
+nothing. The [PyPI sources](../README.md#pypi-sources) section of the README lists
+its keys.
+
+### App registration
+
+1. In the organisation's settings, register a GitHub App. Give it the
+   repository permissions `contents: read` and `metadata: read` and nothing
+   else. Turn webhooks off: the source polls.
+2. Generate a private key for the App and save the PEM file on the
+   tspackages host, for example as `/etc/tspackages/github-app.pem`, readable
+   by the service user only.
+3. Install the App on the organisation, on all repositories or on a
+   selection. The installation decides what tspackages can see; changing it
+   in GitHub needs no change to the config.
+4. Note the App ID (the App's settings page) and the installation ID (the
+   number at the end of the installation's settings URL).
+
+```yaml
+ecosystems:
+  pypi:
+    sources:
+      - name: releases
+        type: github
+        claims: ["acme-*"]
+        url: https://api.github.com/         # default
+        app_id: 123456
+        installation_id: 7890123
+        private_key: ${file:/etc/tspackages/github-app.pem}
+        poll_interval: 5m                    # default
+```
+
+`claims` are required. `private_key` is a PEM RSA key, and tspackages
+refuses to start when it doesn't parse. `remotes`, `credentials` and the
+other keys of the other source types are config errors here. The source
+fetches from `api.github.com`, `release-assets.githubusercontent.com` and
+`objects.githubusercontent.com`, and from no other host. The App key is a
+long-lived credential on the node: keep it out of the config file with
+`${file:}` and protect it as you protect the S3 keys.
+
+### What is served
+
+Every `poll_interval`, and at start, the source lists the repositories the
+installation grants and their releases. A file is listed when it belongs to a
+published release (not a draft), is `uploaded`, has a name that parses as a
+wheel or sdist filename, and belongs to a claimed project. Pre-releases are
+listed; PEP 440 decides whether pip installs them. Wheels and sdists of
+unclaimed names are only counted, in the source's health line. Other
+assets, such as binaries and checksums, are ignored without a trace. Files appear without
+`requires-python` or `core-metadata`, so pip and uv download a wheel to read
+its metadata.
+
+Each download goes through the relay: tspackages fetches the asset with its
+installation token, which never reaches the download host, streams it to
+every waiting client and caches it only if the SHA256 matched. A file that
+is deleted on GitHub leaves the index at the next pass and is no longer
+served, cached or not. Two releases of the owning repository that attach a
+file of the same name with different bytes make that file unavailable and
+the status page lists it; with equal bytes the newer release's asset is
+used. A file served with bytes other than those first recorded for its
+filename is served, logged and listed on the status page.
+
+Until the first pass has succeeded since start, a claimed name answers `502`
+rather than `404`, so a later source can't answer for it. A failed pass keeps
+the previous index. A pass that hits GitHub's rate limit waits until the
+limit resets, for at most an hour, and the last index stays served meanwhile.
+Every list request is conditional, and a `304` doesn't count against the
+limit.
+
+The source's health line on the status page shows when the served index was
+published, the installation ID and how many repositories it grants (not
+their names, which may be private), the assets waiting to be hashed and the
+number of unclaimed wheels and sdists skipped. A pass that fails because
+the App's token exchange failed shows `GitHub App authentication failed`:
+check `app_id`, `installation_id` and the key.
+
+Publishing authority is GitHub's. Whoever can create a release in the
+repository that owns a name publishes that project; tspackages has no upload
+for this source and decides nothing about who may publish.
+
+### Name owners
+
+The first repository seen publishing a claimed name owns it, and the choice
+is pinned in the state store by the repository's numeric ID, so a renamed or
+transferred repository keeps its names. Within one pass, the repository with
+the oldest asset of that name that has a usable digest (GitHub's or a pin)
+wins, and the lower repository ID breaks a tie. Assets without a digest
+don't count, but they hold the choice back: while another repository has an
+asset of that name without a digest that is older (or as old, with a lower
+repository ID), the name has no owner, its assets are listed as
+`owner not decided yet` and it answers `502` until hashing has run. Then
+the owner is decided as usual. Assets of an owned name in other
+repositories are skipped, never downloaded, and listed on the status page
+as `owned by <repository>`. The status page's
+"GitHub release names" table shows each name and its owner.
+
+### Assets without a GitHub digest
+
+GitHub reports a SHA256 for assets uploaded since 2025. For an older asset
+the source downloads it once, computes the SHA256, and pins it in the state
+store by asset ID: trust on first use, as for a git tag pin. The pin holds
+the digest, not the bytes, and every later download must match. A pass
+publishes its index before it downloads these assets and publishes it again
+once they are hashed, so names with digests are served meanwhile. Until its
+asset is hashed, the status page lists it as skipped with the reason
+`no digest yet`, the source's health line counts the assets waiting to be
+hashed, and a name whose only assets wait for their hash answers `502`. A
+download that sends nothing for two minutes is abandoned and tried again on
+the next pass. The first pass after enabling the source may download every
+old asset once. A replaced asset has a new asset ID and is hashed again.
+
+### Servers on the tailnet
+
+GitHub Enterprise Server (GHES) is supported when it runs on the tailnet. Set `url`
+to `https://<ghes-host>/api/v3/`. tspackages reaches the API host and the
+hosts in `fetch_hosts` through its own tailnet node, so:
+
+- the tailnet policy must let tspackages' node reach the GitHub Enterprise
+  Server host (an `acl` or `grant` from `tag:registry` to the host on `tcp:443`);
+- a GitHub Enterprise Server with subdomain isolation serves assets from
+  another name, such as `media.<ghes-host>`: list it in `fetch_hosts`;
+- the host must resolve to a Tailscale address (`100.64.0.0/10` or
+  `fd7a:115c:a1e0::/48`). A private address outside the tailnet stays
+  unreachable, as for every other source.
+
+`fetch_hosts` is an error for `https://api.github.com/`.
 
 ## Go
 
@@ -932,6 +1074,25 @@ The archive under
 is shared by every tag and branch that points at it, and is built again
 while one does.
 
+### A name's owner in a GitHub source
+
+To move a name to another repository, delete its owner pin in the state
+store, `pypi-github/<esc(source)>/owners/<esc(name)>.json`, with `name` the
+normalised project name and `esc` the helper from
+[Removing a bad publish](#removing-a-bad-publish). Or find the object by
+listing `pypi-github/<esc(source)>/owners/` and reading each JSON's `name`
+and `repo` fields. The next pass, in at most `poll_interval`, pins the first
+repository seen again (the one whose listed asset is oldest). No restart is
+needed. The old owner's files leave the index at that pass; a lock file that
+pins one of their hashes fails if the new owner's file has other bytes.
+
+A pin that doesn't parse is logged as `pypi github: ignoring a corrupt pin`
+on every pass; delete it the same way. A corrupt owner pin makes its name
+answer `502` (logged once per pass as
+`pypi github: name unavailable: its owner pin is corrupt`) while the other
+names are served. A corrupt digest pin makes its asset wait for its hash,
+which fails, until the pin is deleted.
+
 ### A PyPI release from a git tag
 
 A stored release stays served whatever happens to its tag, and a tag that
@@ -990,6 +1151,9 @@ it can, even with a local mirror; watch for
 `pypi git: indexing a remote failed` and
 `tspackages_git_last_sync_timestamp_seconds{ecosystem="pypi"}` staying at
 `0`, or absent before the first pass ends: alert on `absent()` as well.
+
+A PyPI `github` source answers `502` for its claimed names until its first
+pass has succeeded since start.
 
 To keep that window small and harmless:
 

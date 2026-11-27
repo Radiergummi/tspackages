@@ -200,7 +200,7 @@ func startNPMRegistry(t *testing.T, stores func(*testing.T, string) (config.Stor
 	}
 	rules := `{"read":["*"],"write":["npm:@acme/*","npm:acme-*"]}`
 	ctx, cancel := context.WithCancel(t.Context())
-	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, rules), slog.New(slog.DiscardHandler),
+	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, rules), nil, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true})
 	if err != nil {
 		cancel()
