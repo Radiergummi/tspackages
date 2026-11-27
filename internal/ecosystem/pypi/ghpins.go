@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,8 @@ var errCorruptGHPin = errors.New("pypi: corrupt github pin")
 type ghPins struct {
 	d      storage.Driver
 	prefix string
+	log    *slog.Logger
+	source string
 
 	mu      sync.Mutex
 	owners  map[string]ghOwnerPin  // by key; an operator may delete a pin (Owners drops such entries)
@@ -47,9 +50,11 @@ type ghDigestPin struct {
 	PinnedAt time.Time `json:"pinned_at"`
 }
 
-func newGHPins(d storage.Driver, source string) *ghPins {
+func newGHPins(d storage.Driver, source string, log *slog.Logger) *ghPins {
 	return &ghPins{
 		d:       d,
+		log:     log,
+		source:  source,
 		prefix:  "pypi-github/" + source + "/",
 		owners:  map[string]ghOwnerPin{},
 		digests: map[string]ghDigestPin{},
@@ -105,7 +110,7 @@ func (p *ghPins) Owners(ctx context.Context) (map[string]int64, error) {
 	for _, key := range keys {
 		pin, err := p.readOwner(ctx, key)
 		if err != nil {
-			if ctx.Err() != nil || !errors.Is(err, errCorruptGHPin) {
+			if skip, err := p.skipPin(ctx, key, err); !skip {
 				return nil, err
 			}
 			continue
@@ -156,7 +161,7 @@ func (p *ghPins) Digests(ctx context.Context) (map[int64]string, error) {
 	for _, key := range keys {
 		pin, err := p.readDigest(ctx, key)
 		if err != nil {
-			if ctx.Err() != nil || !errors.Is(err, errCorruptGHPin) {
+			if skip, err := p.skipPin(ctx, key, err); !skip {
 				return nil, err
 			}
 			continue
@@ -191,6 +196,27 @@ func (p *ghPins) list(ctx context.Context, prefix string, forget func(key string
 		}
 	}
 	return keys, nil
+}
+
+// skipPin reports whether a failed read of the pin at key is skipped: a pin
+// an operator deleted since the listing is dropped silently, a corrupt one is
+// logged. Any other error is returned.
+func (p *ghPins) skipPin(ctx context.Context, key string, err error) (bool, error) {
+	if ctx.Err() != nil {
+		return false, err
+	}
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		p.mu.Lock()
+		delete(p.owners, key)
+		delete(p.digests, key)
+		p.mu.Unlock()
+		return true, nil
+	case errors.Is(err, errCorruptGHPin):
+		p.log.Warn("pypi github: ignoring a corrupt pin", "source", p.source, "key", key, "error", err)
+		return true, nil
+	}
+	return false, err
 }
 
 func (p *ghPins) readOwner(ctx context.Context, key string) (ghOwnerPin, error) {

@@ -1,7 +1,10 @@
 package pypi
 
 import (
+	"bytes"
 	"context"
+	"iter"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -15,6 +18,8 @@ import (
 	"github.com/radiergummi/tspackages/internal/storage"
 	"github.com/radiergummi/tspackages/internal/testutil"
 )
+
+var discardLog = slog.New(slog.DiscardHandler)
 
 func fsDriver(t *testing.T) storage.Driver {
 	t.Helper()
@@ -71,7 +76,7 @@ func drivers(t *testing.T, f func(t *testing.T, d storage.Driver)) {
 func TestPinOwnerFirstWins(t *testing.T) {
 	drivers(t, func(t *testing.T, d storage.Driver) {
 		ctx := context.Background()
-		p := newGHPins(d, "gh")
+		p := newGHPins(d, "gh", discardLog)
 		a := githubapp.Repo{ID: 1, FullName: "acme/a"}
 		b := githubapp.Repo{ID: 2, FullName: "acme/b"}
 		if got, err := p.PinOwner(ctx, "acme-lib", a); err != nil || got != 1 {
@@ -81,7 +86,7 @@ func TestPinOwnerFirstWins(t *testing.T) {
 			t.Fatalf("second: %d %v", got, err)
 		}
 		// A fresh instance reads the stored pin, not a cache.
-		owners, err := newGHPins(d, "gh").Owners(ctx)
+		owners, err := newGHPins(d, "gh", discardLog).Owners(ctx)
 		if err != nil || len(owners) != 1 || owners["acme-lib"] != 1 {
 			t.Fatalf("owners: %v %v", owners, err)
 		}
@@ -94,7 +99,7 @@ func TestPinOwnerFirstWins(t *testing.T) {
 func TestPinOwnerAfterOperatorDelete(t *testing.T) {
 	drivers(t, func(t *testing.T, d storage.Driver) {
 		ctx := context.Background()
-		p := newGHPins(d, "gh")
+		p := newGHPins(d, "gh", discardLog)
 		if _, err := p.PinOwner(ctx, "acme-lib", githubapp.Repo{ID: 1, FullName: "acme/a"}); err != nil {
 			t.Fatal(err)
 		}
@@ -117,7 +122,8 @@ func TestPinOwnerCorruptSkipped(t *testing.T) {
 	if _, err := d.Put(ctx, "pypi-github/gh/owners/"+storage.EscapeSegment("bad")+".json", strings.NewReader("{")); err != nil {
 		t.Fatal(err)
 	}
-	p := newGHPins(d, "gh")
+	var logs bytes.Buffer
+	p := newGHPins(d, "gh", slog.New(slog.NewTextHandler(&logs, nil)))
 	if _, err := p.PinOwner(ctx, "good", githubapp.Repo{ID: 3, FullName: "a/b"}); err != nil {
 		t.Fatal(err)
 	}
@@ -125,12 +131,56 @@ func TestPinOwnerCorruptSkipped(t *testing.T) {
 	if err != nil || len(owners) != 1 || owners["good"] != 3 {
 		t.Fatalf("owners: %v %v", owners, err)
 	}
+	if n := strings.Count(logs.String(), "pypi github: ignoring a corrupt pin"); n != 1 || !strings.Contains(logs.String(), "source=gh") {
+		t.Fatalf("want one warning, got %d: %s", n, logs.String())
+	}
+}
+
+// ghostDriver lists a key that Get then reports missing, as when an operator
+// deletes a pin between the listing and the read.
+type ghostDriver struct {
+	storage.Driver
+	ghost string
+}
+
+func (g ghostDriver) List(ctx context.Context, prefix string) iter.Seq2[storage.Info, error] {
+	return func(yield func(storage.Info, error) bool) {
+		if strings.HasPrefix(g.ghost, prefix) && !yield(storage.Info{Key: g.ghost}, nil) {
+			return
+		}
+		for i, err := range g.Driver.List(ctx, prefix) {
+			if !yield(i, err) {
+				return
+			}
+		}
+	}
+}
+
+func TestPinDeletedBetweenListAndRead(t *testing.T) {
+	ctx := context.Background()
+	d := fsDriver(t)
+	p := newGHPins(ghostDriver{d, "pypi-github/gh/owners/" + storage.EscapeSegment("aaa") + ".json"}, "gh", discardLog)
+	if _, err := p.PinOwner(ctx, "zzz", githubapp.Repo{ID: 1, FullName: "a/b"}); err != nil {
+		t.Fatal(err)
+	}
+	owners, err := p.Owners(ctx)
+	if err != nil || len(owners) != 1 || owners["zzz"] != 1 {
+		t.Fatalf("owners: %v %v", owners, err)
+	}
+	p = newGHPins(ghostDriver{d, "pypi-github/gh/digests/7.json"}, "gh", discardLog)
+	if _, err := p.PinDigest(ctx, 8, strings.Repeat("a", 64), 1); err != nil {
+		t.Fatal(err)
+	}
+	digests, err := p.Digests(ctx)
+	if err != nil || len(digests) != 1 || digests[8] != strings.Repeat("a", 64) {
+		t.Fatalf("digests: %v %v", digests, err)
+	}
 }
 
 func TestPinDigestFirstWins(t *testing.T) {
 	drivers(t, func(t *testing.T, d storage.Driver) {
 		ctx := context.Background()
-		p := newGHPins(d, "gh")
+		p := newGHPins(d, "gh", discardLog)
 		a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
 		if got, err := p.PinDigest(ctx, 42, a, 10); err != nil || got != a {
 			t.Fatalf("first: %q %v", got, err)
@@ -138,7 +188,7 @@ func TestPinDigestFirstWins(t *testing.T) {
 		if got, err := p.PinDigest(ctx, 42, b, 10); err != nil || got != a {
 			t.Fatalf("second: %q %v", got, err)
 		}
-		digests, err := newGHPins(d, "gh").Digests(ctx)
+		digests, err := newGHPins(d, "gh", discardLog).Digests(ctx)
 		if err != nil || len(digests) != 1 || digests[42] != a {
 			t.Fatalf("digests: %v %v", digests, err)
 		}
@@ -149,7 +199,7 @@ func TestPinDigestFirstWins(t *testing.T) {
 }
 
 func TestPinDigestInvalidRefused(t *testing.T) {
-	p := newGHPins(fsDriver(t), "gh")
+	p := newGHPins(fsDriver(t), "gh", discardLog)
 	for _, bad := range []string{"", "sha256:" + strings.Repeat("a", 64), strings.Repeat("A", 64), strings.Repeat("a", 63)} {
 		if _, err := p.PinDigest(context.Background(), 1, bad, 1); err == nil {
 			t.Errorf("accepted %q", bad)
