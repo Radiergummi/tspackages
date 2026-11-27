@@ -657,7 +657,8 @@ func (c *remoteConn) RemoteAddr() net.Addr { return c.remote }
 func (c *remoteConn) Close() error         { c.closed = true; return c.Conn.Close() }
 
 // tailnetDial returns a dial func that serves one HTTP answer per connection
-// and records the addresses it was asked for and the conns it returned.
+// and records the addresses it was asked for and the conns it returned. An
+// empty remote gives the conns no remote address.
 func tailnetDial(remote string, addrs *[]string, conns *[]*remoteConn) func(context.Context, string, string) (net.Conn, error) {
 	return func(_ context.Context, _, addr string) (net.Conn, error) {
 		*addrs = append(*addrs, addr)
@@ -669,7 +670,10 @@ func tailnetDial(remote string, addrs *[]string, conns *[]*remoteConn) func(cont
 			}
 			_, _ = io.WriteString(sv, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
 		}()
-		rc := &remoteConn{Conn: cl, remote: net.TCPAddrFromAddrPort(netip.MustParseAddrPort(remote))}
+		rc := &remoteConn{Conn: cl}
+		if remote != "" {
+			rc.remote = net.TCPAddrFromAddrPort(netip.MustParseAddrPort(remote))
+		}
 		*conns = append(*conns, rc)
 		return rc, nil
 	}
@@ -705,7 +709,8 @@ func TestTailnetHostDialsThroughTailnetDial(t *testing.T) {
 }
 
 func TestTailnetDialRejectsNonTailscaleAddress(t *testing.T) {
-	for _, remote := range []string{"10.0.0.5:443", "192.168.1.1:443", "[fd00::1]:443"} {
+	// The 4via6 address reaches 10.0.0.5 behind a subnet router.
+	for _, remote := range []string{"10.0.0.5:443", "192.168.1.1:443", "[fd00::1]:443", "[fd7a:115c:a1e0:b1a:0:7:a00:5]:443", ""} {
 		var addrs []string
 		var conns []*remoteConn
 		c := testClient(Options{

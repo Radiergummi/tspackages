@@ -142,10 +142,16 @@ func (c *Client) dialContext(dialer *net.Dialer) func(ctx context.Context, netwo
 		}
 		// A tsnet dial bypasses net.Dialer.Control, so check the connection
 		// that was actually established.
-		ap, perr := netip.ParseAddrPort(conn.RemoteAddr().String())
+		// A connection without a remote address is refused.
+		remote := conn.RemoteAddr()
+		if remote == nil {
+			conn.Close()
+			return nil, fmt.Errorf("%w: %s has no remote address", ErrForbiddenAddress, addr)
+		}
+		ap, perr := netip.ParseAddrPort(remote.String())
 		if perr != nil || !tailscaleAddr(ap.Addr()) {
 			conn.Close()
-			return nil, fmt.Errorf("%w: %s", ErrForbiddenAddress, conn.RemoteAddr())
+			return nil, fmt.Errorf("%w: %s", ErrForbiddenAddress, remote)
 		}
 		return conn, nil
 	}
@@ -163,9 +169,11 @@ func (c *Client) isTailnetHost(addr string) bool {
 	})
 }
 
+// tailscaleAddr reports a Tailscale node address. 4via6 addresses are not
+// nodes: they reach the IPv4 networks behind subnet routers.
 func tailscaleAddr(a netip.Addr) bool {
 	a = a.Unmap().WithZone("")
-	return cgnat.Contains(a) || tailscaleV6.Contains(a)
+	return cgnat.Contains(a) || (tailscaleV6.Contains(a) && !tailscale4via6.Contains(a))
 }
 
 // control runs on the resolved IP right before connecting, so a hostname that
@@ -223,6 +231,7 @@ func nonUnicast(a netip.Addr) bool {
 
 var (
 	tailscaleV6     = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	tailscale4via6  = netip.MustParsePrefix("fd7a:115c:a1e0:b1a::/64")
 	cgnat           = netip.MustParsePrefix("100.64.0.0/10")
 	thisNetwork     = netip.MustParsePrefix("0.0.0.0/8")
 	benchmark       = netip.MustParsePrefix("198.18.0.0/15")
