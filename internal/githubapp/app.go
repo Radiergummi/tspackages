@@ -134,6 +134,13 @@ func (a *App) jwt() (string, error) {
 	return signing + "." + b64(sig), nil
 }
 
+// ErrAuthFailed wraps a failed exchange of the App's JWT for an
+// installation token.
+var ErrAuthFailed = errors.New("github: App authentication failed")
+
+// InstallationID is the installation the App acts as.
+func (a *App) InstallationID() int64 { return a.installationID }
+
 // installationToken returns the cached token while it has more than
 // tokenRenewBefore left, else a new one.
 func (a *App) installationToken(ctx context.Context) (string, error) {
@@ -145,7 +152,7 @@ func (a *App) installationToken(ctx context.Context) (string, error) {
 	a.token = ""
 	tok, exp, err := a.fetchToken(ctx)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w", ErrAuthFailed, err)
 	}
 	a.token, a.tokenExp = tok, exp
 	return tok, nil

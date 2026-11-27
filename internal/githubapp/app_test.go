@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -253,6 +254,31 @@ func TestTokenNeverInErrors(t *testing.T) {
 	_, err = b.Repositories(t.Context())
 	if err == nil || strings.Contains(err.Error(), "eyJ") || strings.Contains(err.Error(), "Bearer") {
 		t.Errorf("token error = %v", err)
+	}
+}
+
+// TestAuthFailedMarksTokenExchange: only a failed token exchange is
+// ErrAuthFailed; a failing API call after it is not.
+func TestAuthFailedMarksTokenExchange(t *testing.T) {
+	clk := newClock()
+	g := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bad credentials", http.StatusUnauthorized)
+	}))
+	defer g.Close()
+	u, _ := url.Parse(g.URL)
+	b := New(upstream.New(upstream.Options{FetchHosts: []string{u.Hostname()}, AllowPrivateForTesting: true}),
+		g.URL, 123, 7, testKey, clk.now)
+	if b.InstallationID() != 7 {
+		t.Errorf("InstallationID() = %d", b.InstallationID())
+	}
+	if _, err := b.Repositories(t.Context()); !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("failed token exchange: %v", err)
+	}
+	f := newFakeAPI(t, clk, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	if _, err := f.app(t, clk).Repositories(t.Context()); err == nil || errors.Is(err, ErrAuthFailed) {
+		t.Errorf("failed API call: %v", err)
 	}
 }
 
