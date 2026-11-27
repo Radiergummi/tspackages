@@ -233,7 +233,7 @@ func startMavenRegistry(t *testing.T, o mvnOptions) *mvnRegistry {
 		}}},
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, o.rules), slog.New(slog.DiscardHandler),
+	handler, start, err := server.Build(ctx, r.cfg, testutil.NewWho(capName, o.rules), nil, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true})
 	if err != nil {
 		cancel()

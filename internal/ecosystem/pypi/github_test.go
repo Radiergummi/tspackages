@@ -241,7 +241,7 @@ func TestGitHubProjectAndFile(t *testing.T) {
 			t.Fatalf("metadata/provenance: %v", err)
 		}
 	}
-	if h := e.src.Health(ctxBg); len(h) != 1 || !h[0].OK {
+	if h := e.src.Health(ctxBg); len(h) != 1 || !h[0].OK || !strings.HasPrefix(h[0].Detail, "indexed at ") {
 		t.Fatalf("health: %+v", h)
 	}
 }

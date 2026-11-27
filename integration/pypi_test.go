@@ -234,7 +234,7 @@ func startPyRegistry(t *testing.T, rules string) *pyRegistry {
 		rules = `{"read":["*"],"write":["pypi:acme-*"]}`
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, rules), slog.New(slog.DiscardHandler),
+	handler, start, err := server.Build(ctx, cfg, testutil.NewWho(capName, rules), nil, slog.New(slog.DiscardHandler),
 		server.Hooks{AllowPrivateUpstreams: true, AllowFileRemotes: true})
 	if err != nil {
 		cancel()

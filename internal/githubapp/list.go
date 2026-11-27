@@ -160,6 +160,7 @@ func getPage[T any](ctx context.Context, a *App, target string, decode func(io.R
 			return fmt.Errorf("github: %w", err)
 		}
 		defer resp.Body.Close()
+		a.observe(resp.StatusCode)
 		a.noteRate(resp.Header)
 		switch {
 		case resp.StatusCode == http.StatusNotModified && have:

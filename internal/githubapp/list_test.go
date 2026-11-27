@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,5 +177,35 @@ func TestAPIURLWithBasePath(t *testing.T) {
 	}
 	if got.Load() != "/api/v3/repos/o/r/releases" {
 		t.Fatalf("path = %v", got.Load())
+	}
+}
+
+func TestOnResponseSeesEveryStatus(t *testing.T) {
+	clk := newClock()
+	f := newFakeAPI(t, clk, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/installation/repositories" {
+			_, _ = w.Write([]byte(`{"repositories":[]}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	a := f.app(t, clk)
+	var mu sync.Mutex
+	var got []int
+	a.OnResponse(func(status int) {
+		mu.Lock()
+		got = append(got, status)
+		mu.Unlock()
+	})
+	if _, err := a.Repositories(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.OpenAsset(t.Context(), Repo{FullName: "o/r"}, 5, 100); err == nil {
+		t.Fatal("OpenAsset of a missing asset succeeded")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(got, []int{http.StatusCreated, http.StatusOK, http.StatusNotFound}) {
+		t.Fatalf("statuses = %v", got)
 	}
 }

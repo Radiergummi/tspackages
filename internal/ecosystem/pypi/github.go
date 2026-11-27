@@ -89,6 +89,7 @@ type ghServed struct {
 	unavailable map[string]bool   // projects with a conflict or an asset waiting for its hash
 	owners      map[string]string // project -> owning repository's full name
 	backlog     int
+	at          time.Time // when it was published
 }
 
 // NewGitHubSource builds a github source. apiURL is the API base api talks
@@ -143,13 +144,17 @@ func (s *GitHubSource) nextPass(err error) time.Duration {
 	return min(wait+ghRateLimitMargin, ghMaxRateLimitWait)
 }
 
-// pass indexes once and records the outcome for Health.
+// pass indexes once and records the outcome for Health and the metrics.
 func (s *GitHubSource) pass(ctx context.Context) error {
 	err := s.index(ctx)
 	if ctx.Err() == nil {
 		s.hmu.Lock()
 		s.passErr = err
 		s.hmu.Unlock()
+		metrics.ObserveGitHubPass(s.name, err == nil)
+		if remaining, _ := s.api.RateLimit(); remaining >= 0 {
+			metrics.SetGitHubRateLimit(s.name, remaining)
+		}
 	}
 	return err
 }
@@ -201,7 +206,7 @@ func (s *GitHubSource) index(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	served := &ghServed{ghIndex: idx, unavailable: map[string]bool{}, owners: map[string]string{}, backlog: backlog}
+	served := &ghServed{ghIndex: idx, unavailable: map[string]bool{}, owners: map[string]string{}, backlog: backlog, at: s.now()}
 	for _, c := range idx.Conflicts {
 		served.unavailable[c.Package] = true
 	}
@@ -465,9 +470,9 @@ func (s *GitHubSource) Health(context.Context) []metrics.Health {
 	s.hmu.Unlock()
 	st := s.idx.Load()
 	h := metrics.Health{Name: s.name, Ecosystem: "pypi"}
-	kept := "the last index is served"
-	if st == nil {
-		kept = "nothing indexed yet"
+	kept := "nothing indexed yet"
+	if st != nil {
+		kept = "the index of " + st.at.UTC().Format(time.RFC3339) + " is served"
 	}
 	switch rl, limited := errors.AsType[*githubapp.RateLimitError](err); {
 	case limited:
@@ -484,9 +489,9 @@ func (s *GitHubSource) Health(context.Context) []metrics.Health {
 	case st == nil:
 		h.Detail = "not indexed yet"
 	default:
-		h.OK, h.Detail = true, "indexed"
+		h.OK, h.Detail = true, "indexed at "+st.at.UTC().Format(time.RFC3339)
 		if st.backlog > 0 {
-			h.Detail = fmt.Sprintf("indexed; %d assets waiting to be hashed", st.backlog)
+			h.Detail += fmt.Sprintf("; %d assets waiting to be hashed", st.backlog)
 		}
 	}
 	return []metrics.Health{h}

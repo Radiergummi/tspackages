@@ -56,6 +56,19 @@ var (
 		Help: "Unix time of the oldest last successful sync among a git source's remotes (0 while one never synced).",
 	}, []string{"ecosystem", "source"})
 
+	githubRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tspackages_github_api_requests_total",
+		Help: "GitHub API requests answered, by github source and HTTP status code.",
+	}, []string{"source", "status"})
+	githubRateLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tspackages_github_ratelimit_remaining",
+		Help: "GitHub API requests left in the current rate-limit window, as of a github source's last pass.",
+	}, []string{"source"})
+	githubPasses = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tspackages_github_index_passes_total",
+		Help: "Index passes of a github source, by result (ok or error).",
+	}, []string{"source", "result"})
+
 	buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "tspackages_build_info",
 		Help: "Always 1; the labels name the running build.",
@@ -69,6 +82,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		requests, cacheHits, upstreamDuration, gitLastSync, buildInfo,
+		githubRequests, githubRateLimit, githubPasses,
 		prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Name: "tspackages_rate_limited_total",
 			Help: "Requests rejected by the per-identity rate limiter.",
@@ -129,4 +143,24 @@ func SetGitLastSync(ecosystem, source string, t time.Time) {
 		v = float64(t.Unix())
 	}
 	gitLastSync.WithLabelValues(ecosystem, source).Set(v)
+}
+
+// ObserveGitHubRequest counts a GitHub API request of a github source that
+// was answered with status.
+func ObserveGitHubRequest(source string, status int) {
+	githubRequests.WithLabelValues(source, strconv.Itoa(status)).Inc()
+}
+
+// SetGitHubRateLimit sets the remaining GitHub API requests of a github source.
+func SetGitHubRateLimit(source string, remaining int) {
+	githubRateLimit.WithLabelValues(source).Set(float64(remaining))
+}
+
+// ObserveGitHubPass counts an index pass of a github source.
+func ObserveGitHubPass(source string, ok bool) {
+	result := "ok"
+	if !ok {
+		result = "error"
+	}
+	githubPasses.WithLabelValues(source, result).Inc()
 }

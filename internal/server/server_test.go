@@ -3,9 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,14 +62,14 @@ func TestBuildRejectsInvalidConfig(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	_, _, err := Build(ctx, cfg, testutil.NewWho(testCap), quiet, Hooks{})
+	_, _, err := Build(ctx, cfg, testutil.NewWho(testCap), nil, quiet, Hooks{})
 	if err == nil || !strings.Contains(err.Error(), "storage.stores.remote") {
 		t.Fatalf("Build error = %v, want one naming storage.stores.remote", err)
 	}
 }
 
 func TestBuildServes(t *testing.T) {
-	h, _, err := Build(t.Context(), fsConfig(t), testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{})
+	h, _, err := Build(t.Context(), fsConfig(t), testutil.NewWho(testCap, `{"read":["*"]}`), nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +88,7 @@ func TestBuildWiresComposer(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["composer:acme/*"]}`), quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["composer:acme/*"]}`), nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +135,7 @@ func TestBuildWritesSSHKeyFiles(t *testing.T) {
 	if err := os.WriteFile(stray, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, d := range []string{cfg.Storage.WorkDir, keys, filepath.Join(cfg.Storage.WorkDir, "git")} {
@@ -170,7 +176,7 @@ func TestBuildMirrorDirStable(t *testing.T) {
 	got := captureMirrors(t)
 	cfg := gitConfig(t, sshSource)
 	for range 2 {
-		if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+		if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -190,7 +196,7 @@ func TestBuildSharesMirrors(t *testing.T) {
 		config.Source{Name: "b", Type: "git", Claims: []string{"acme/b"}, Remotes: remote},
 		config.Source{Name: "c", Type: "git", Claims: []string{"acme/c"}, Remotes: remote, Token: "t"},
 	)
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(*got) != 2 {
@@ -209,7 +215,7 @@ func TestBuildSharesMirrors(t *testing.T) {
 func TestBuildRejectsPathInSourceName(t *testing.T) {
 	src := sshSource
 	src.Name = "../escape"
-	_, _, err := Build(t.Context(), gitConfig(t, src), testutil.NewWho(testCap), quiet, Hooks{})
+	_, _, err := Build(t.Context(), gitConfig(t, src), testutil.NewWho(testCap), nil, quiet, Hooks{})
 	if err == nil || !strings.Contains(err.Error(), "invalid source name") {
 		t.Fatalf("err = %v", err)
 	}
@@ -218,7 +224,7 @@ func TestBuildRejectsPathInSourceName(t *testing.T) {
 func TestBuildPrunesUnknownMirrorDirs(t *testing.T) {
 	got := captureMirrors(t)
 	cfg := gitConfig(t, sshSource)
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	gitDir := filepath.Join(cfg.Storage.WorkDir, "git")
@@ -232,7 +238,7 @@ func TestBuildPrunesUnknownMirrorDirs(t *testing.T) {
 	if err := os.WriteFile(stray[2], nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(keep); err != nil {
@@ -252,7 +258,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 			t.Fatal(err)
 		}
 		os.Chmod(cfg.Storage.WorkDir, 0o755)
-		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
 			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
 		}
@@ -263,7 +269,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 		if err := os.Symlink(target, cfg.Storage.WorkDir); err != nil {
 			t.Fatal(err)
 		}
-		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), cfg.Storage.WorkDir) {
 			t.Fatalf("err = %v, want one naming %s", err, cfg.Storage.WorkDir)
 		}
@@ -275,7 +281,7 @@ func TestBuildRejectsUnsafeWorkDir(t *testing.T) {
 			t.Fatal(err)
 		}
 		os.Chmod(keys, 0o750)
-		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{})
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{})
 		if err == nil || !strings.Contains(err.Error(), keys) {
 			t.Fatalf("err = %v, want one naming %s", err, keys)
 		}
@@ -286,7 +292,7 @@ func TestBuildAppliesDefaults(t *testing.T) {
 	cfg := fsConfig(t)
 	cfg.Limits = config.Limits{}
 	cfg.Tailscale = config.Tailscale{StateDir: cfg.Tailscale.StateDir}
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Limits.RequestsPerSecond != 50 || cfg.Limits.MaxArtifactBytes != 8<<30 || cfg.Tailscale.Capability != testCap {
@@ -300,7 +306,7 @@ func TestStartReturnsAfterLoopsStop(t *testing.T) {
 	cfg := gitConfig(t, config.Source{Name: "g", Type: "git", Claims: []string{"acme/*"}, Remotes: []string{t.TempDir()}, PollInterval: 10 * time.Millisecond})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, start, err := Build(ctx, cfg, testutil.NewWho(testCap), quiet, Hooks{AllowFileRemotes: true})
+	_, start, err := Build(ctx, cfg, testutil.NewWho(testCap), nil, quiet, Hooks{AllowFileRemotes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +346,7 @@ func TestBuildWiresPyPI(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["pypi:acme-*"]}`), quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"],"write":["pypi:acme-*"]}`), nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +388,7 @@ func TestBuildPyPIKeyFilesDoNotCollide(t *testing.T) {
 	pypiSSH.Claims = []string{"acme-*"}
 	cfg.Ecosystems["pypi"] = config.Ecosystem{Sources: []config.Source{pypiSSH}}
 	got := captureMirrors(t)
-	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), quiet, Hooks{}); err != nil {
+	if _, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{"read":["*"]}`), nil, quiet, Hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	keys := filepath.Join(cfg.Storage.WorkDir, "keys")
@@ -423,7 +429,7 @@ func TestBuildNPM(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["npm:@example/*"]}`), quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["npm:@example/*"]}`), nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +453,7 @@ func TestBuildMaven(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["maven:com.example","maven:com.example.*"],"write":["maven:com.example","maven:com.example.*"]}`), quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["maven:com.example","maven:com.example.*"],"write":["maven:com.example","maven:com.example.*"]}`), nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,5 +466,140 @@ func TestBuildMaven(t *testing.T) {
 	}
 	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/maven/") {
 		t.Fatalf("status page lacks the maven snippet: %d", w.Code)
+	}
+}
+
+// tailnetConn reports a Tailscale address as its remote end, as a tsnet
+// connection to a tailnet host does.
+type tailnetConn struct{ net.Conn }
+
+func (tailnetConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("100.64.0.1"), Port: 443}
+}
+
+// loopbackTailnet dials over loopback but looks like a tailnet dial.
+func loopbackTailnet(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	c, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return tailnetConn{c}, nil
+}
+
+func githubKeyPEM(t *testing.T) string {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}))
+}
+
+// githubFake is a GitHub Enterprise Server API whose App installation sees
+// acme/lib, whose release v1.0.0 carries a claimed wheel and an unclaimed
+// sdist, both with digests.
+func githubFake(t *testing.T) *httptest.Server {
+	t.Helper()
+	sum := strings.Repeat("ab", 32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Ratelimit-Remaining", "4990")
+		w.Header().Set("X-Ratelimit-Reset", "1900000000")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/app/installations/2/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"tok","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		case r.URL.Path == "/api/v3/installation/repositories":
+			io.WriteString(w, `{"repositories":[{"id":10,"full_name":"acme/lib"}]}`)
+		case r.URL.Path == "/api/v3/repos/acme/lib/releases":
+			fmt.Fprintf(w, `[{"id":1,"tag_name":"v1.0.0","created_at":"2026-01-01T00:00:00Z","assets":[
+				{"id":100,"name":"acme_lib-1.0.0-py3-none-any.whl","state":"uploaded","digest":"sha256:%[1]s","size":3,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+				{"id":101,"name":"other_pkg-1.0.0.tar.gz","state":"uploaded","digest":"sha256:%[1]s","size":3,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]}]`, sum)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func githubConfig(t *testing.T, apiURL string) *config.Config {
+	t.Helper()
+	cfg := fsConfig(t)
+	cfg.Ecosystems["pypi"] = config.Ecosystem{Sources: []config.Source{{
+		Name: "gh", Type: "github", URL: apiURL, Claims: []string{"acme-*"},
+		AppID: 1, InstallationID: 2, PrivateKey: githubKeyPEM(t),
+	}}}
+	return cfg
+}
+
+func TestBuildGitHubSource(t *testing.T) {
+	api := githubFake(t)
+	cfg := githubConfig(t, api.URL+"/api/v3/")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["*"]}`), loopbackTailnet, quiet,
+		Hooks{AllowPrivateUpstreams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		w := do(h, "GET", "/pypi/simple/acme-lib/", nil)
+		if w.Code == http.StatusOK && strings.Contains(w.Body.String(), "acme_lib-1.0.0-py3-none-any.whl") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("index = %d %s", w.Code, w.Body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m := do(h, "GET", "/metrics", nil).Body.String()
+	for _, want := range []string{
+		`tspackages_github_index_passes_total{result="ok",source="gh"}`,
+		`tspackages_github_api_requests_total{source="gh",status="201"}`,
+		`tspackages_github_api_requests_total{source="gh",status="200"}`,
+		`tspackages_github_ratelimit_remaining{source="gh"} 4990`,
+	} {
+		if !strings.Contains(m, want) {
+			t.Errorf("/metrics lacks %s", want)
+		}
+	}
+	page := do(h, "GET", "/", nil).Body.String()
+	for _, want := range []string{"acme-lib", "acme/lib", "other-pkg", "other_pkg-1.0.0.tar.gz", "unclaimed", "indexed at "} {
+		if !strings.Contains(page, want) {
+			t.Errorf("status page lacks %q", want)
+		}
+	}
+}
+
+// Uploading a name only a github source claims gets the answer of any
+// claimed name without a storage source.
+func TestUploadToGitHubClaimedName(t *testing.T) {
+	api := githubFake(t)
+	cfg := githubConfig(t, api.URL+"/api/v3/")
+	who := testutil.NewWho(testCap, `{"read":["*"],"write":["pypi:acme-*"]}`)
+	h, _, err := Build(t.Context(), cfg, who, loopbackTailnet, quiet, Hooks{AllowPrivateUpstreams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := "Metadata-Version: 2.1\nName: acme-lib\nVersion: 2.0.0\n"
+	whl := testutil.ZipOf(t, map[string]string{"acme_lib/__init__.py": "", "acme_lib-2.0.0.dist-info/METADATA": meta})
+	body, ct := pypiUpload(t, "acme-lib", "2.0.0", "acme_lib-2.0.0-py3-none-any.whl", whl)
+	r := httptest.NewRequest("POST", "/pypi/legacy/", body)
+	r.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `no storage source claims "acme-lib"`) {
+		t.Fatalf("upload = %d %s", w.Code, w.Body)
+	}
+}
+
+func TestBuildGHESNeedsDialer(t *testing.T) {
+	cfg := githubConfig(t, "https://ghe.example.com/api/v3/")
+	_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap), nil, quiet, Hooks{})
+	if err == nil || err.Error() != `pypi source "gh": GitHub Enterprise Server needs the tailnet dialer` {
+		t.Fatalf("err = %v", err)
 	}
 }

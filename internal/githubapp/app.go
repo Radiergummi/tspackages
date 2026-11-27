@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/radiergummi/tspackages/internal/upstream"
@@ -59,6 +60,8 @@ type App struct {
 	remaining int
 	reset     time.Time
 	pages     map[string]cachedPage
+
+	onResponse atomic.Pointer[func(status int)]
 }
 
 // New returns an App that sends every request through c. apiURL is the API
@@ -169,6 +172,7 @@ func (a *App) fetchToken(ctx context.Context) (string, time.Time, error) {
 		return "", time.Time{}, fmt.Errorf("github: installation token request: %w", err)
 	}
 	defer resp.Body.Close()
+	a.observe(resp.StatusCode)
 	a.noteRate(resp.Header)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return "", time.Time{}, fmt.Errorf("github: installation token request: status %d", resp.StatusCode)
@@ -244,6 +248,16 @@ func (a *App) RateLimit() (remaining int, reset time.Time) {
 	return a.remaining, a.reset
 }
 
+// OnResponse sets f to be called with the status of every answered API
+// request; a downloaded asset counts as 200. f must be safe for concurrent use.
+func (a *App) OnResponse(f func(status int)) { a.onResponse.Store(&f) }
+
+func (a *App) observe(status int) {
+	if f := a.onResponse.Load(); f != nil {
+		(*f)(status)
+	}
+}
+
 func (a *App) noteRate(h http.Header) {
 	rem, err := strconv.Atoi(h.Get("X-Ratelimit-Remaining"))
 	if err != nil {
@@ -299,7 +313,11 @@ func (a *App) OpenAsset(ctx context.Context, r Repo, assetID int64, maxBytes int
 			return err
 		}
 		b, n, _, err := a.c.OpenRequest(req, maxBytes)
+		if err == nil {
+			a.observe(http.StatusOK)
+		}
 		if se, ok := errors.AsType[*upstream.StatusError](err); ok {
+			a.observe(se.Code)
 			switch se.Code {
 			case http.StatusUnauthorized:
 				return errUnauthorized

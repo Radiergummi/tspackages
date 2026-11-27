@@ -38,7 +38,7 @@ func TestOverRealTailnet(t *testing.T) {
 	cfg.Ecosystems["composer"] = config.Ecosystem{Sources: []config.Source{
 		{Name: "hosted", Type: "storage", Claims: []string{"acme/*"}, Store: "main"},
 	}}
-	h, start, err := Build(ctx, cfg, lc, quiet, Hooks{})
+	h, start, err := Build(ctx, cfg, lc, nil, quiet, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
