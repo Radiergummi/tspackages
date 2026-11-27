@@ -68,6 +68,8 @@ func newFakeAPI(t *testing.T, clk *clock, h http.HandlerFunc) *fakeAPI {
 			f.jwts = append(f.jwts, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 			exp := clk.now().Add(f.lifetime)
 			f.mu.Unlock()
+			w.Header().Set("X-Ratelimit-Remaining", "4999")
+			w.Header().Set("X-Ratelimit-Reset", "1700003600")
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"token":      "tok-" + string(rune('0'+n)),
@@ -132,6 +134,32 @@ func TestJWT(t *testing.T) {
 	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if err := rsa.VerifyPKCS1v15(&testKey.PublicKey, crypto.SHA256, sum[:], dec(parts[2])); err != nil {
 		t.Errorf("signature: %v", err)
+	}
+}
+
+// The token endpoint answers with rate-limit headers; recording them must not
+// deadlock the renewal, and RateLimit must not wait on it.
+func TestTokenFetchWithRateHeadersDoesNotDeadlock(t *testing.T) {
+	clk := newClock()
+	f := newFakeAPI(t, clk, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"repositories":[]}`))
+	})
+	a := f.app(t, clk)
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Repositories(t.Context())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("token fetch deadlocked")
+	}
+	if rem, _ := a.RateLimit(); rem != 4999 {
+		t.Errorf("remaining = %d", rem)
 	}
 }
 

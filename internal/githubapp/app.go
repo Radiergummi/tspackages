@@ -49,9 +49,13 @@ type App struct {
 	key            *rsa.PrivateKey
 	now            func() time.Time
 
+	// tokMu guards the token and is held across its renewal request; it is
+	// separate from mu so rate limits and pages never wait on the network.
+	tokMu    sync.Mutex
+	token    string
+	tokenExp time.Time
+
 	mu        sync.Mutex
-	token     string
-	tokenExp  time.Time
 	remaining int
 	reset     time.Time
 	pages     map[string]cachedPage
@@ -130,8 +134,8 @@ func (a *App) jwt() (string, error) {
 // installationToken returns the cached token while it has more than
 // tokenRenewBefore left, else a new one.
 func (a *App) installationToken(ctx context.Context) (string, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.tokMu.Lock()
+	defer a.tokMu.Unlock()
 	if a.token != "" && a.now().Before(a.tokenExp.Add(-tokenRenewBefore)) {
 		return a.token, nil
 	}
@@ -181,11 +185,11 @@ func (a *App) fetchToken(ctx context.Context) (string, time.Time, error) {
 
 // forget drops tok if it is still the cached token.
 func (a *App) forget(tok string) {
-	a.mu.Lock()
+	a.tokMu.Lock()
 	if a.token == tok {
 		a.token = ""
 	}
-	a.mu.Unlock()
+	a.tokMu.Unlock()
 }
 
 // withToken runs fn with an installation token. On a 401 it renews the token
