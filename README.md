@@ -112,7 +112,8 @@ recently read are rendered again when needed.
 
 ## PyPI sources
 
-PyPI has the same three source types and the same resolution rules. Names
+PyPI has the same three source types, a fourth that serves GitHub release
+assets, and the same resolution rules. Names
 are normalised as PEP 503 says (lowercase; runs of `-`, `_` and `.` become
 `-`) before claims, authorization and storage, so `Acme_Utils` and
 `acme.utils` are one package. A claim is `*` or a pattern of `[a-z0-9-]` and
@@ -126,6 +127,7 @@ under two spellings.
 | `git` | `remotes`, `tags`, `ssh_key`, `known_hosts`, `token`, `poll_interval` | Each tag is a release point: every package found at the tagged commit is released at the version its `pyproject.toml` declares, as an sdist tspackages generates (no build runs on the server). |
 | `storage` | `store`, `claims` | Hosts wheels and sdists uploaded with `twine` or `uv publish`. |
 | `registry` | `url` (`https://`, ending in `/simple/`), `fetch_hosts`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to a JSON simple API index (`pypi.org`). |
+| `github` | `url`, `app_id`, `installation_id`, `private_key`, `poll_interval`, `claims`, `fetch_hosts` (GitHub Enterprise Server only) | Serves the wheels and sdists attached to published GitHub releases, through a GitHub App. Nothing is hosted by tspackages. |
 
 For `pypi.org` use `url: https://pypi.org/simple/` and
 `fetch_hosts: [pypi.org, files.pythonhosted.org]`.
@@ -171,6 +173,20 @@ the next source. Files generated at build time but not committed aren't in
 the sdist, and setuptools includes non-Python package data only if
 `MANIFEST.in` or `package-data` lists it. Publish such packages through a
 `storage` source.
+
+The `github` source lists the wheel and sdist assets of the published
+releases in every repository its GitHub App installation can see, and serves
+them through the same index as any other source. CI keeps doing what it
+does (`gh release upload`); only tspackages holds GitHub access. `claims`
+are required, with the rules of a `storage` source's claims, and they must
+not overlap an earlier source's. Each asset is verified against the SHA256
+GitHub reports for it before it is cached or completed. The first
+repository seen publishing a name owns it, and assets of that name in other
+repositories are skipped and reported. Whoever can create a release in the
+owning repository publishes that project, so grant the App only
+repositories that publish packages, and claim narrowly. Setup, GitHub
+Enterprise Server and the operating procedures are in
+[docs/operations.md](docs/operations.md#pypi-release-assets).
 
 ## Go sources
 

@@ -168,6 +168,29 @@ tailnet. Read this before you deploy.
   source is passed through.
 - Upstream file entries without a SHA256 are dropped from served pages, so
   nothing upstream is served unverified.
+- **The `github` source.** A repository the App installation grants can
+  publish any claimed name nobody owns yet, and the first one seen wins and
+  is pinned by repository ID. Grant the App only repositories that publish
+  packages, and claim narrowly. Whoever can create a release in the owning
+  repository publishes that project. A compromised owning repository can add
+  versions or replace assets of its own names; a replacement is served and
+  reported, an addition can't be told from a release. Assets of a name
+  another repository owns are never served.
+- GitHub's reported SHA256 is the declared hash for `github` assets, as
+  PyPI's is for `registry` sources. For older assets without one, the first
+  download is trusted and pinned (trust on first use, as for git tag pins):
+  a tampered download before the first pass would be pinned as genuine. The
+  window is the time between upload and the first pass.
+- The App private key is a long-lived credential on the node, like the S3
+  keys; protect it likewise. Installation tokens are short-lived, scoped to
+  `contents: read` and `metadata: read`, never logged, and sent only to the
+  API host, never to the download host a release asset redirects to.
+- A `github` source for GitHub Enterprise Server dials the API host and the
+  `fetch_hosts` through tspackages' tailnet node and accepts Tailscale
+  addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) for exactly those
+  hosts. Every other private address stays refused, and so does a redirect
+  to any other tailnet address. The tailnet policy decides which hosts the
+  node can reach, so allow only the GitHub Enterprise Server.
 
 ## Go
 

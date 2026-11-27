@@ -8,6 +8,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A PyPI `github` source that serves the wheels and sdists attached to
+  published GitHub releases, through a GitHub App (`contents: read`,
+  `metadata: read`, no webhooks) on github.com or on GitHub Enterprise
+  Server over the tailnet. The first repository seen publishing a name owns
+  it, each download is verified against the SHA256 GitHub reports (older
+  assets are hashed once and pinned), and the status page lists owners,
+  skipped assets, withheld files and changed bytes. New metrics:
+  `tspackages_github_index_passes_total`,
+  `tspackages_github_api_requests_total` and
+  `tspackages_github_ratelimit_remaining`.
 - A Go module proxy at `/go/` (the `GOPROXY` protocol) with a checksum
   database proxy at `/go/sumdb/sum.golang.org/`. Sources: `git`, which
   builds module zips from tagged versions and pseudo-versions of configured

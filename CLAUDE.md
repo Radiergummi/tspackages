@@ -12,7 +12,7 @@ native protocol, assembles each endpoint from ordered sources (`git`,
 identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
-Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
+Roadmap: Composer, PyPI (`storage`, `registry`, `github` release assets and `git` sdists; CI
 uploads with `twine`/`uv publish`), Go (`git` + `registry` + sumdb
 proxy) and npm (`storage` + `registry`; npm and pnpm, CI publishes with a
 dummy `_authToken`) and Maven (`storage` + `registry`; mvn and Gradle,
@@ -69,8 +69,11 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   npm packuments, Maven metadata).
 - `internal/ecosystem/composer` — names, Composer version parsing (port of
   composer/semver), the three sources, the HTTP handler.
+- `internal/githubapp` — GitHub App client: RS256 JWT, installation token
+  cache, conditional paginated listing of repositories and releases, rate
+  limits. Standard library only; requests go through `internal/upstream`.
 - `internal/ecosystem/pypi` — PEP 503 names, PEP 440 versions, filenames,
-  the simple API (HTML + JSON), the three sources, pyproject discovery,
+  the simple API (HTML + JSON), the four sources (`github`: release assets), pyproject discovery,
   PKG-INFO and deterministic sdists, the HTTP handler. Must not import
   `composer` (nor the reverse).
 - `internal/ecosystem/goproxy` — module paths and claims, the GOPROXY
@@ -134,6 +137,17 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   file never changes bytes. Git-generated sdists live in the state store,
   are built once and never regenerated (a change without a version bump is
   reported, not served).
+- PyPI `github` sources need claims (none overlapping an earlier source's)
+  and take no uploads. A name is owned by the first repository seen
+  publishing a servable asset of it, pinned by repository ID at
+  `pypi-github/<source>/owners/<EscapeSegment(name)>.json`; other
+  repositories' assets of it are skipped and reported. An asset is served
+  only with a sha256: GitHub's `digest`, else a pin at
+  `pypi-github/<source>/digests/<asset id>.json` hashed on first use. Before
+  the first successful pass, claimed names are `ErrUnavailable`, never
+  `ErrNotFound`. The installation token goes only to the API host. Tailnet
+  dial and the Tailscale-range address exception apply only to a GHES
+  `url` host and its `fetch_hosts`.
 - Go: claims and `go:` rules are `*` or `/`-separated segments of
   `[a-z0-9._~-]` and `*`, matched against the lowercased decoded module
   path (a claim covers every `/vN` of its module). `git` claims become
