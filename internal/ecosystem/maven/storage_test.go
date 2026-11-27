@@ -585,3 +585,40 @@ func TestRenderedMetaBounded(t *testing.T) {
 		t.Error("metadata over the cap kept")
 	}
 }
+
+// sidecarConflict fails the first sidecar write after a file is replaced,
+// as a concurrent deploy's sidecar write would.
+type sidecarConflict struct {
+	storage.Driver
+	file, sidecar string
+	armed         bool
+}
+
+func (d *sidecarConflict) PutIfMatch(ctx context.Context, key string, r io.Reader, etag string) (storage.Info, error) {
+	switch {
+	case key == d.sidecar && d.armed:
+		d.armed = false
+		return storage.Info{}, storage.ErrPrecondition
+	case key == d.file && etag != "":
+		d.armed = true
+	}
+	return d.Driver.PutIfMatch(ctx, key, r, etag)
+}
+
+func TestSnapshotOverwriteAuditSurvivesRetry(t *testing.T) {
+	const path = "com/matchory/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar"
+	p := mustPath(t, path)
+	d := &sidecarConflict{Driver: fsDriver(t), file: fileKey(p.Coords, p.File), sidecar: sidecarKey(p.Coords, p.File)}
+	e := newStEnv(t, d)
+	e.mustDeploy(t, path, "plain 1")
+	e.mustDeploy(t, path, "plain 2")
+	var previous []string
+	for _, a := range e.audits(t) {
+		if a.Previous != "" {
+			previous = append(previous, a.Previous)
+		}
+	}
+	if want := allDigests("plain 1").SHA256; !slices.Equal(previous, []string{want}) {
+		t.Errorf("audits with Previous = %v, want [%s]", previous, want)
+	}
+}

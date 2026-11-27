@@ -170,8 +170,11 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   in their exact case; a deploy that differs from an existing artifact
   only in case is `409`. A `maven-metadata.xml` path is claimed when
   either reading (artifact level `g:a`, group level `g.a`) matches a
-  claim; reading group-level metadata needs a rule for the whole group
-  (`<group>` or `<group>:*`), and its sources are asked only for callers allowed it. Every key segment from a coordinate or file name goes through
+  claim, or when it sits in a version directory of a claimed artifact;
+  reading group-level metadata needs a rule for the whole group
+  (`<group>` or `<group>:*`), and its sources are asked only for callers
+  allowed it. An unclaimed metadata path is granted by a rule for either
+  reading. Every key segment from a coordinate or file name goes through
   `storage.EscapeSegment`, so coordinate parts are at most 156 bytes, and
   storage accepts file names of at most 153 bytes and `groupId:artifactId`
   of at most 156. Release and timestamped SNAPSHOT files are write-once

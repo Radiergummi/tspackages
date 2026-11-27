@@ -346,7 +346,7 @@ func InspectMetadataUpload(r io.Reader, p Path) (MetadataLevel, error) {
 		}
 		return LevelArtifact, nil
 	case len(doc.Plugins) > 0:
-		if p.Kind != KindArtifactMetadata {
+		if p.Kind != KindArtifactMetadata && p.Kind != KindGroupMetadata {
 			return 0, badRequest("group-level maven-metadata.xml is not accepted in a version directory")
 		}
 		if len(doc.GroupID) > 0 {

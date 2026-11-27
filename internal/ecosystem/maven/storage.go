@@ -279,6 +279,9 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		_, err = s.d.PutIfMatch(wctx, sk, bytes.NewReader(b), sidecarETag)
 		return err
 	}
+	// replaced is the sha256 of the bytes this deploy overwrote, kept when a
+	// lost sidecar write reruns the attempt.
+	var replaced string
 	for attempt := range updateRetries {
 		cur, sInfo, err := s.readSidecar(ctx, sk)
 		noSidecar := errors.Is(err, storage.ErrNotFound)
@@ -326,13 +329,13 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		}
 		if stored == sc.Digests.SHA256 {
 			if current {
-				return cur, "", nil
+				return cur, replaced, nil
 			}
 			err := writeSidecar(fETag, sInfo.ETag)
 			if errors.Is(err, storage.ErrPrecondition) {
 				continue
 			}
-			return sc, "", err
+			return sc, replaced, err
 		}
 		if p.Immutable() {
 			return sidecar{}, "", fmt.Errorf("%s %w", p.File, ErrExists)
@@ -342,6 +345,7 @@ func (s *StorageSource) storeFile(ctx context.Context, c identity.Caller, p Path
 		}
 		info, err = s.d.PutIfMatch(wctx, fk, body, fETag)
 		if err == nil {
+			replaced = stored
 			err = writeSidecar(info.ETag, sInfo.ETag)
 		}
 		if errors.Is(err, storage.ErrPrecondition) {
@@ -603,8 +607,12 @@ func (s *StorageSource) Digests(ctx context.Context, p Path) (Digests, error) {
 // metadata is not served: such a path has no index) and version-level
 // metadata from the SNAPSHOT version's timestamped files.
 func (s *StorageSource) Metadata(ctx context.Context, p Path) ([]byte, error) {
-	if p.Kind == KindVersionMetadata {
+	switch p.Kind {
+	case KindVersionMetadata:
 		return s.versionMetadata(ctx, p)
+	case KindGroupMetadata, KindFile:
+		return nil, fmt.Errorf("%w: %s", resolve.ErrNotFound, p)
+	case KindArtifactMetadata:
 	}
 	return s.artifactMetadata(ctx, p)
 }

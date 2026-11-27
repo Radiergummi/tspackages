@@ -221,6 +221,9 @@ func (h *Maven) route(w http.ResponseWriter, r *http.Request, caller identity.Ca
 		return
 	}
 	e.pkg = p.Coords.Key()
+	if p.Kind == KindGroupMetadata {
+		e.pkg = strings.ToLower(p.Group())
+	}
 	if r.Method == http.MethodPut {
 		h.deploy(w, r, caller, e, p)
 		return
@@ -456,10 +459,19 @@ func (e *readErr) Read(p []byte) (int, error) {
 // artifact level's claiming sources come first, then the group level's,
 // each in config order and once. The group level decides authz only when
 // the artifact level is unclaimed; otherwise its sources are asked only
-// when the caller may also act on the group.
+// when the caller may also act on the group. When neither is claimed, a
+// claim on the artifact whose version directory the path also names keeps
+// it private, and otherwise a rule for either reading grants it.
+// KindGroupMetadata has the group level only.
 func (h *Maven) candidates(p Path, rules []authz.Rule, action authz.Action) (cands []Source, claimed bool, name string, m authz.Matcher) {
 	key := p.Coords.Key()
-	if p.Kind != KindArtifactMetadata {
+	switch p.Kind {
+	case KindArtifactMetadata:
+	case KindGroupMetadata:
+		group := strings.ToLower(p.Group())
+		cands, claimed = resolve.Candidates(h.sources, group, MatchGroup)
+		return cands, claimed, group, groupRule(action)
+	default:
 		cands, claimed = resolve.Candidates(h.sources, key, matchKey)
 		return cands, claimed, key, matchKey
 	}
@@ -482,8 +494,15 @@ func (h *Maven) candidates(p Path, rules []authz.Rule, action authz.Action) (can
 	case len(grp) > 0:
 		return grp, true, group, gm
 	}
+	if dir, ok := p.versionDir(); ok {
+		if cands, claimed = resolve.Candidates(h.sources, dir, matchKey); claimed {
+			return cands, true, dir, matchKey
+		}
+	}
 	cands, _ = resolve.Candidates(h.sources, key, matchKey)
-	return cands, false, key, matchKey
+	return cands, false, key, func(pattern, k string) bool {
+		return matchKey(pattern, k) || gm(pattern, group)
+	}
 }
 
 // groupRule is the matcher of rules for group-level metadata. Reading it

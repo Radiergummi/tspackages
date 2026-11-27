@@ -173,12 +173,13 @@ func TestInspectMetadataUpload(t *testing.T) {
 		p    Path
 		want MetadataLevel
 	}{
-		"artifact":         {readTestdata(t, "artifact-metadata.xml"), artifact, LevelArtifact},
-		"version":          {versionDoc, version, LevelArtifact},
-		"1.1.0 namespace":  {`<metadata xmlns="http://maven.apache.org/METADATA/1.1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/METADATA/1.1.0 https://maven.apache.org/xsd/repository-metadata-1.1.0.xsd"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, LevelArtifact},
-		"plugin group":     {plugin, group, LevelGroup},
-		"plugin group id":  {strings.Replace(plugin, "<plugins>", "<groupId>com.matchory</groupId><plugins>", 1), group, LevelGroup},
-		"plugin group sub": {plugin, mustPath(t, "com/matchory/plugins/maven-metadata.xml"), LevelGroup},
+		"artifact":                 {readTestdata(t, "artifact-metadata.xml"), artifact, LevelArtifact},
+		"version":                  {versionDoc, version, LevelArtifact},
+		"1.1.0 namespace":          {`<metadata xmlns="http://maven.apache.org/METADATA/1.1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/METADATA/1.1.0 https://maven.apache.org/xsd/repository-metadata-1.1.0.xsd"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, LevelArtifact},
+		"plugin group":             {plugin, group, LevelGroup},
+		"plugin group id":          {strings.Replace(plugin, "<plugins>", "<groupId>com.matchory</groupId><plugins>", 1), group, LevelGroup},
+		"plugin group sub":         {plugin, mustPath(t, "com/matchory/plugins/maven-metadata.xml"), LevelGroup},
+		"plugin group one segment": {strings.Replace(plugin, "<plugins>", "<groupId>acme</groupId><plugins>", 1), mustPath(t, "acme/maven-metadata.xml"), LevelGroup},
 	} {
 		got, err := InspectMetadataUpload(strings.NewReader(tc.doc), tc.p)
 		if err != nil || got != tc.want {
@@ -192,17 +193,18 @@ func TestInspectMetadataUpload(t *testing.T) {
 		status int
 		detail string
 	}{
-		"group mismatch":        {strings.Replace(readTestdata(t, "artifact-metadata.xml"), "com.matchory", "com.other", 1), artifact, 400, "groupId"},
-		"artifact mismatch":     {strings.Replace(readTestdata(t, "artifact-metadata.xml"), "<artifactId>lib", "<artifactId>other", 1), artifact, 400, "artifactId"},
-		"no groupId":            {`<metadata><artifactId>lib</artifactId></metadata>`, artifact, 400, "groupId"},
-		"plugin group mismatch": {strings.Replace(plugin, "<plugins>", "<groupId>com.other</groupId><plugins>", 1), group, 400, "groupId"},
-		"project root":          {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), artifact, 400, "metadata"},
-		"neither":               {`<metadata><groupId>com.matchory</groupId></metadata>`, artifact, 400, "artifactId"},
-		"doctype":               {`<!DOCTYPE metadata []>` + plugin, group, 400, "DOCTYPE"},
-		"prefixed groupId":      {`<metadata xmlns:m="urn:m"><groupId>com.other</groupId><m:groupId>com.matchory</m:groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, "element <m:groupId> has a namespace prefix"},
-		"prefixed plugins":      {strings.Replace(strings.Replace(plugin, "<plugins>", `<m:plugins xmlns:m="">`, 1), "</plugins>", "</m:plugins>", 1), group, 400, "element <m:plugins> has a namespace prefix"},
-		"foreign namespace":     {`<metadata xmlns="urn:x"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, `element <metadata> is in namespace "urn:x"`},
-		"too large":             {plugin + strings.Repeat(" ", 1<<20), group, 413, "1 MiB"},
+		"group mismatch":          {strings.Replace(readTestdata(t, "artifact-metadata.xml"), "com.matchory", "com.other", 1), artifact, 400, "groupId"},
+		"artifact mismatch":       {strings.Replace(readTestdata(t, "artifact-metadata.xml"), "<artifactId>lib", "<artifactId>other", 1), artifact, 400, "artifactId"},
+		"no groupId":              {`<metadata><artifactId>lib</artifactId></metadata>`, artifact, 400, "groupId"},
+		"plugin group mismatch":   {strings.Replace(plugin, "<plugins>", "<groupId>com.other</groupId><plugins>", 1), group, 400, "groupId"},
+		"project root":            {pom(`<groupId>com.matchory</groupId><artifactId>lib</artifactId><version>1.0</version>`), artifact, 400, "metadata"},
+		"neither":                 {`<metadata><groupId>com.matchory</groupId></metadata>`, artifact, 400, "artifactId"},
+		"doctype":                 {`<!DOCTYPE metadata []>` + plugin, group, 400, "DOCTYPE"},
+		"prefixed groupId":        {`<metadata xmlns:m="urn:m"><groupId>com.other</groupId><m:groupId>com.matchory</m:groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, "element <m:groupId> has a namespace prefix"},
+		"prefixed plugins":        {strings.Replace(strings.Replace(plugin, "<plugins>", `<m:plugins xmlns:m="">`, 1), "</plugins>", "</m:plugins>", 1), group, 400, "element <m:plugins> has a namespace prefix"},
+		"foreign namespace":       {`<metadata xmlns="urn:x"><groupId>com.matchory</groupId><artifactId>lib</artifactId></metadata>`, artifact, 400, `element <metadata> is in namespace "urn:x"`},
+		"too large":               {plugin + strings.Repeat(" ", 1<<20), group, 413, "1 MiB"},
+		"artifact at one segment": {strings.Replace(readTestdata(t, "artifact-metadata.xml"), "com.matchory", "acme", 1), mustPath(t, "acme/maven-metadata.xml"), 400, "artifactId"},
 	} {
 		_, err := InspectMetadataUpload(strings.NewReader(tc.doc), tc.p)
 		wantRequestError(t, name, err, tc.status, tc.detail)

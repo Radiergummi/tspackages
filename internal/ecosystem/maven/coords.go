@@ -47,12 +47,13 @@ const (
 	KindFile             Kind = iota // an artifact file
 	KindArtifactMetadata             // <group>/<artifact>/maven-metadata.xml
 	KindVersionMetadata              // <group>/<artifact>/<version>-SNAPSHOT/maven-metadata.xml
+	KindGroupMetadata                // <group>/maven-metadata.xml of a one-segment group
 )
 
 // Path is a parsed repository path.
 type Path struct {
 	Kind     Kind
-	Coords   Coords // artifact-level reading; Version is empty for KindArtifactMetadata
+	Coords   Coords // artifact-level reading; Version is empty for metadata but KindVersionMetadata, Artifact for KindGroupMetadata
 	File     string // the file name without a checksum suffix
 	Checksum string // "", "sha1", "md5", "sha256" or "sha512"
 }
@@ -60,9 +61,25 @@ type Path struct {
 // Snapshot reports whether p's version ends in "-SNAPSHOT".
 func (p Path) Snapshot() bool { return IsSnapshot(p.Coords.Version) }
 
-// Group is the group-level reading of a KindArtifactMetadata path:
-// Coords.Group + "." + Coords.Artifact.
-func (p Path) Group() string { return p.Coords.Group + "." + p.Coords.Artifact }
+// Group is the group-level reading of a metadata path: Coords.Group +
+// "." + Coords.Artifact, or Coords.Group alone for KindGroupMetadata.
+func (p Path) Group() string {
+	if p.Kind == KindGroupMetadata {
+		return p.Coords.Group
+	}
+	return p.Coords.Group + "." + p.Coords.Artifact
+}
+
+// versionDir is the "groupId:artifactId" key of the artifact whose version
+// directory a KindArtifactMetadata path also names: com/acme/lib/1.0 is
+// com.acme.lib:1.0 and com.acme.lib.1.0, and a version of com.acme:lib.
+func (p Path) versionDir() (string, bool) {
+	i := strings.LastIndexByte(p.Coords.Group, '.')
+	if p.Kind != KindArtifactMetadata || i < 0 {
+		return "", false
+	}
+	return strings.ToLower(p.Coords.Group[:i] + ":" + p.Coords.Group[i+1:]), true
+}
 
 // Immutable reports whether p is a file that never changes: a release file,
 // or a timestamped SNAPSHOT file. Metadata is never immutable.
@@ -103,8 +120,17 @@ func parsePath(p string) (Path, error) {
 	out.File = last
 	n := len(segs)
 	if last == metadataFile {
-		if n < 3 {
+		switch {
+		case n < 2:
 			return Path{}, errors.New("metadata path too short")
+		case n == 2:
+			// Group-level metadata of a one-segment group.
+			if !groupSegRE.MatchString(segs[0]) {
+				return Path{}, fmt.Errorf("invalid groupId segment %q", segs[0])
+			}
+			out.Kind = KindGroupMetadata
+			out.Coords = Coords{Group: segs[0]}
+			return out, nil
 		}
 		if n >= 4 && strings.HasSuffix(segs[n-2], snapshotSfx) {
 			out.Kind = KindVersionMetadata
@@ -192,7 +218,10 @@ func validateFile(c Coords, name string) error {
 
 // String is the canonical repository path of p, the form ParsePath accepts.
 func (p Path) String() string {
-	dirs := strings.ReplaceAll(p.Coords.Group, ".", "/") + "/" + p.Coords.Artifact
+	dirs := strings.ReplaceAll(p.Coords.Group, ".", "/")
+	if p.Coords.Artifact != "" {
+		dirs += "/" + p.Coords.Artifact
+	}
 	if p.Coords.Version != "" {
 		dirs += "/" + p.Coords.Version
 	}

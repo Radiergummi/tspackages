@@ -744,3 +744,71 @@ func TestMalformedRulesMatchNothing(t *testing.T) {
 		t.Fatalf("log: %s", out)
 	}
 }
+
+func TestVersionDirMetadataStaysPrivate(t *testing.T) {
+	// com/acme/lib/1.0/maven-metadata.xml reads as com.acme.lib:1.0 and
+	// com.acme.lib.1.0, but it sits in the version directory of
+	// com.acme:lib: a claim on that keeps it from the unclaimed registry.
+	for _, claim := range []string{"com.acme", "com.acme:lib"} {
+		st := &fakeDeployer{fakeSource: &fakeSource{name: "hosted", claims: []string{claim}}}
+		reg := registryFake()
+		h := server(t, []Source{st, reg}, readAll)
+		for _, path := range []string{"/maven/com/acme/lib/1.0/maven-metadata.xml", "/maven/com/acme/lib/1.0/maven-metadata.xml.sha1"} {
+			if w := do(h, "GET", path, nil); w.Code != 404 {
+				t.Errorf("%s %s: %d", claim, path, w.Code)
+			}
+		}
+		if n := reg.calls.Load(); n != 0 {
+			t.Errorf("%s: registry asked %d times", claim, n)
+		}
+		// Its authz name is the claimed artifact's.
+		h = server(t, []Source{st, reg}, `{"read":["maven:org.x"]}`)
+		if w := do(h, "GET", "/maven/com/acme/lib/1.0/maven-metadata.xml", nil); w.Code != 403 || problemOf(t, w).Detail != "forbidden: no maven:com.acme:lib read rule" {
+			t.Errorf("%s: unauthorized %d %s", claim, w.Code, w.Body)
+		}
+	}
+}
+
+func TestUnclaimedGroupMetadataTakesGroupRule(t *testing.T) {
+	// org/x/y/maven-metadata.xml is unclaimed under both readings: a rule
+	// for either reading reads it.
+	for _, rule := range []string{"maven:org.x:y", "maven:org.x.y", "maven:org.x.y:*"} {
+		h := server(t, []Source{registryFake()}, `{"read":["`+rule+`"]}`)
+		if w := do(h, "GET", "/maven/org/x/y/maven-metadata.xml", nil); w.Code != 200 {
+			t.Errorf("%s: %d %s", rule, w.Code, w.Body)
+		}
+	}
+	// A rule naming another artifact of the group still doesn't.
+	h := server(t, []Source{registryFake()}, `{"read":["maven:org.x.y:z"]}`)
+	if w := do(h, "GET", "/maven/org/x/y/maven-metadata.xml", nil); w.Code != 403 {
+		t.Errorf("artifact rule in the group: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestOneSegmentGroupMetadata(t *testing.T) {
+	const path = "/maven/acme/maven-metadata.xml"
+	st := &fakeDeployer{fakeSource: &fakeSource{name: "hosted", claims: []string{"acme"}}}
+	reg := registryFake()
+	// A maven-plugin deploy of group acme uploads it.
+	h := server(t, []Source{st, reg}, `{"read":["maven:acme"],"write":["maven:acme:foo-maven-plugin"]}`)
+	if w := do(h, "PUT", path, strings.NewReader("<metadata/>")); w.Code != 201 || len(st.paths) != 1 || st.paths[0].Kind != KindGroupMetadata {
+		t.Fatalf("PUT: %d %s, deployed %v", w.Code, w.Body, st.paths)
+	}
+	if w := do(h, "GET", path, nil); w.Code != 404 {
+		t.Fatalf("GET: %d %s", w.Code, w.Body)
+	}
+	if n := reg.calls.Load(); n != 0 {
+		t.Fatalf("registry asked %d times", n)
+	}
+	// Reading it needs a rule for the whole group.
+	h = server(t, []Source{st, reg}, `{"read":["maven:acme:foo-maven-plugin"]}`)
+	if w := do(h, "GET", path, nil); w.Code != 403 || problemOf(t, w).Detail != "forbidden: no maven:acme read rule" {
+		t.Fatalf("artifact rule: %d %s", w.Code, w.Body)
+	}
+	// Unclaimed, it goes to the registry.
+	reg.meta["junit/maven-metadata.xml"] = "<metadata/>"
+	h = server(t, []Source{st, reg}, readAll)
+	if w := do(h, "GET", "/maven/junit/maven-metadata.xml", nil); w.Code != 200 || reg.calls.Load() != 1 {
+		t.Fatalf("unclaimed: %d, registry asked %d times", w.Code, reg.calls.Load())
+	}
+}

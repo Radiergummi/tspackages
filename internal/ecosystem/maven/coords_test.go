@@ -25,6 +25,8 @@ func TestParsePath(t *testing.T) {
 		{"com/matchory/lib/maven-metadata.xml.md5", Path{Kind: KindArtifactMetadata, Coords: Coords{"com.matchory", "lib", ""}, File: "maven-metadata.xml", Checksum: "md5"}},
 		{"com/matchory/lib/1.0-SNAPSHOT/maven-metadata.xml.sha1", Path{Kind: KindVersionMetadata, Coords: Coords{"com.matchory", "lib", "1.0-SNAPSHOT"}, File: "maven-metadata.xml", Checksum: "sha1"}},
 		{"org/apache/maven/plugins/maven-metadata.xml", Path{Kind: KindArtifactMetadata, Coords: Coords{"org.apache.maven", "plugins", ""}, File: "maven-metadata.xml"}},
+		{"acme/maven-metadata.xml", Path{Kind: KindGroupMetadata, Coords: Coords{"acme", "", ""}, File: "maven-metadata.xml"}},
+		{"acme/maven-metadata.xml.sha1", Path{Kind: KindGroupMetadata, Coords: Coords{"acme", "", ""}, File: "maven-metadata.xml", Checksum: "sha1"}},
 	} {
 		got, err := ParsePath(tc.in)
 		if err != nil {
@@ -68,7 +70,8 @@ func TestParsePath(t *testing.T) {
 		"com/matchory/lib/.hidden/lib-.hidden.jar",
 		"com/matchory/lib/1.0/lib-1.0.ja r",
 		"maven-metadata.xml",
-		"lib/maven-metadata.xml",
+		"acme.x/maven-metadata.xml",
+		"Ac!me/maven-metadata.xml",
 		"com/matchory/lib/maven-metadata.xml.sha1.sha1",
 		"com/matchory/lib/maven-metadata.xml.asc",
 		"com/maven-metadata.xml.sha3",
@@ -134,6 +137,17 @@ func TestImmutable(t *testing.T) {
 		}
 		if got := p.Immutable(); got != want {
 			t.Errorf("%s: Immutable() = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestPathGroup(t *testing.T) {
+	for in, want := range map[string]string{
+		"com/matchory/plugins/maven-metadata.xml": "com.matchory.plugins",
+		"acme/maven-metadata.xml":                 "acme",
+	} {
+		if got := mustPath(t, in).Group(); got != want {
+			t.Errorf("%s: Group() = %q, want %q", in, got, want)
 		}
 	}
 }
