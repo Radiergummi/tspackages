@@ -358,11 +358,12 @@ Metrics:
 The status page has a section per configured ecosystem, with each source's
 health, tags that moved upstream, Composer packages declared by several
 remotes, registry archives whose bytes changed, PyPI git conflicts and
-skipped packages, the names each GitHub release source's repositories own, the release assets it skipped (unclaimed, owned by another repository, no digest yet), files withheld for conflicting bytes or served with changed bytes, Go tags that were skipped, refused or moved and the
+skipped packages, the names each GitHub release source's repositories own, the release assets it skipped (owned by another repository, no digest yet, owner not decided yet), files withheld for conflicting bytes or served with changed bytes, Go tags that were skipped, refused or moved and the
 state of the sum.golang.org verifier, and npm tarballs that changed
 upstream. It shows what the
-running process has seen; restarts clear the moved-tag and changed-archive
-lists until those are seen again. The logs are the lasting record. Lines
+running process has seen; restarts clear the moved-tag, changed-archive and
+changed GitHub release file lists until those are seen again (provenance
+records stay). The logs are the lasting record. Lines
 worth an alert:
 
 | Message | Level | Means |
@@ -383,10 +384,11 @@ worth an alert:
 | `pypi git: a rebuilt sdist differs from its release record; not written` | warn | Rebuilding a stored release's missing sdist gave other bytes. |
 | `pypi git: building a release failed` | error | A release couldn't be generated; it is retried on the next pass. |
 | `pypi git: repairing a release failed` | error | A stored release lacks its sdist and couldn't be built again. |
-| `pypi github index failed` | error | A whole pass failed, for example a rate limit or an unreachable GitHub; the previous index stays served. |
-| `pypi github: hashing an asset failed` | warn | An asset without a GitHub digest couldn't be downloaded and hashed; it stays unlisted and is tried again on the next pass. |
+| `pypi github index failed` | error | A whole pass failed, for example a rate limit, an unreachable GitHub or a failed App authentication; the previous index stays served. |
+| `pypi github: hashing an asset failed` | warn | An asset without a GitHub digest couldn't be downloaded and hashed, or its download sent nothing for two minutes; it stays unlisted and is tried again on the next pass. |
 | `pypi github: asset changed upstream; serving the new bytes` | warn | A file's SHA256 differs from the first one recorded for its filename (deleted and uploaded again). |
 | `pypi github: ignoring a corrupt pin` | warn | An owner or digest pin in the state store doesn't parse; it is ignored (see [A name's owner in a GitHub source](#a-names-owner-in-a-github-source)). |
+| `pypi github: name unavailable: its owner pin is corrupt` | warn | Once per pass for each name whose owner pin doesn't parse; that name answers `502` until the pin is deleted. |
 | `goproxy git: pass failed` | error | A whole Go index pass failed. |
 | `goproxy git: sync failed; indexing the local mirror` | warn | A remote is unreachable. |
 | `goproxy git: tag moved upstream; serving the stored version` | warn | A tag was force-pushed. The stored version keeps the first commit. |
@@ -455,8 +457,9 @@ Every `poll_interval`, and at start, the source lists the repositories the
 installation grants and their releases. A file is listed when it belongs to a
 published release (not a draft), is `uploaded`, has a name that parses as a
 wheel or sdist filename, and belongs to a claimed project. Pre-releases are
-listed; PEP 440 decides whether pip installs them. Other assets, such as
-binaries and checksums, are ignored without a trace. Files appear without
+listed; PEP 440 decides whether pip installs them. Wheels and sdists of
+unclaimed names are only counted, in the source's health line. Other
+assets, such as binaries and checksums, are ignored without a trace. Files appear without
 `requires-python` or `core-metadata`, so pip and uv download a wheel to read
 its metadata.
 
@@ -477,6 +480,13 @@ limit resets, for at most an hour, and the last index stays served meanwhile.
 Every list request is conditional, and a `304` doesn't count against the
 limit.
 
+The source's health line on the status page shows when the served index was
+published, the installation ID and how many repositories it grants (not
+their names, which may be private), the assets waiting to be hashed and the
+number of unclaimed wheels and sdists skipped. A pass that fails because
+the App's token exchange failed shows `GitHub App authentication failed`:
+check `app_id`, `installation_id` and the key.
+
 Publishing authority is GitHub's. Whoever can create a release in the
 repository that owns a name publishes that project; tspackages has no upload
 for this source and decides nothing about who may publish.
@@ -485,10 +495,16 @@ for this source and decides nothing about who may publish.
 
 The first repository seen publishing a claimed name owns it, and the choice
 is pinned in the state store by the repository's numeric ID, so a renamed or
-transferred repository keeps its names. Within one pass, the repository whose
-listed asset of that name is oldest wins, and the lower repository ID breaks
-a tie. Assets of that name in other repositories are skipped and listed on
-the status page as `owned by <repository>`. The status page's
+transferred repository keeps its names. Within one pass, the repository with
+the oldest asset of that name that has a usable digest (GitHub's or a pin)
+wins, and the lower repository ID breaks a tie. Assets without a digest
+don't count, but they hold the choice back: while another repository has an
+asset of that name without a digest that is older (or as old, with a lower
+repository ID), the name has no owner, its assets are listed as
+`owner not decided yet` and it answers `502` until hashing has run. Then
+the owner is decided as usual. Assets of an owned name in other
+repositories are skipped, never downloaded, and listed on the status page
+as `owned by <repository>`. The status page's
 "GitHub release names" table shows each name and its owner.
 
 ### Assets without a GitHub digest
@@ -496,12 +512,15 @@ the status page as `owned by <repository>`. The status page's
 GitHub reports a SHA256 for assets uploaded since 2025. For an older asset
 the source downloads it once, computes the SHA256, and pins it in the state
 store by asset ID: trust on first use, as for a git tag pin. The pin holds
-the digest, not the bytes. It lists the asset from the next index swap on,
-and every later download must match. Until then the status page lists the
-asset as skipped with the reason `no digest yet`, and the source's health
-line counts the assets waiting to be hashed. The first pass after enabling
-the source may download every old asset once. A replaced asset has a new
-asset ID and is hashed again.
+the digest, not the bytes, and every later download must match. A pass
+publishes its index before it downloads these assets and publishes it again
+once they are hashed, so names with digests are served meanwhile. Until its
+asset is hashed, the status page lists it as skipped with the reason
+`no digest yet`, the source's health line counts the assets waiting to be
+hashed, and a name whose only assets wait for their hash answers `502`. A
+download that sends nothing for two minutes is abandoned and tried again on
+the next pass. The first pass after enabling the source may download every
+old asset once. A replaced asset has a new asset ID and is hashed again.
 
 ### Servers on the tailnet
 
@@ -1067,8 +1086,12 @@ repository seen again (the one whose listed asset is oldest). No restart is
 needed. The old owner's files leave the index at that pass; a lock file that
 pins one of their hashes fails if the new owner's file has other bytes.
 
-A pin that doesn't parse is ignored and logged as
-`pypi github: ignoring a corrupt pin`; delete it the same way.
+A pin that doesn't parse is logged as `pypi github: ignoring a corrupt pin`
+on every pass; delete it the same way. A corrupt owner pin makes its name
+answer `502` (logged once per pass as
+`pypi github: name unavailable: its owner pin is corrupt`) while the other
+names are served. A corrupt digest pin makes its asset wait for its hash,
+which fails, until the pin is deleted.
 
 ### A PyPI release from a git tag
 

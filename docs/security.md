@@ -182,14 +182,18 @@ tailnet. Read this before you deploy.
   a tampered download before the first pass would be pinned as genuine. The
   window is the time between upload and the first pass.
 - The App private key is a long-lived credential on the node, like the S3
-  keys; protect it likewise. Installation tokens are short-lived, scoped to
-  `contents: read` and `metadata: read`, never logged, and sent only to the
-  API host, never to the download host a release asset redirects to.
+  keys; protect it likewise. Installation tokens are short-lived and carry
+  the permissions the App is registered with (tspackages requests no
+  narrower scope), so register the App with only `contents: read` and
+  `metadata: read`. Tokens are never logged and are sent only to the API
+  host, never to the download host a release asset redirects to.
 - A `github` source for GitHub Enterprise Server dials the API host and the
   `fetch_hosts` through tspackages' tailnet node and accepts Tailscale
   addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) for exactly those
-  hosts. Every other private address stays refused, and so does a redirect
-  to any other tailnet address. The tailnet policy decides which hosts the
+  hosts. 4via6 addresses (`fd7a:115c:a1e0:b1a::/64`) are refused: they
+  reach the IPv4 networks behind subnet routers, not tailnet nodes. Every
+  other private address stays refused, and so does a redirect to any other
+  tailnet address. The tailnet policy decides which hosts the
   node can reach, so allow only the GitHub Enterprise Server.
 
 ## Go
