@@ -302,7 +302,7 @@ func TestExpansionThroughPointersAndSlices(t *testing.T) {
 func TestProblemsAreAggregatedInOrder(t *testing.T) {
 	body := strings.Replace(base, "SECRET", "x", 1) + `      - {name: a, type: registry, url: "https://a"}
       - {name: a, type: git, claims: ["x/*"], remotes: ["file:///x"]}
-  npm: {sources: []}
+  cargo: {sources: []}
   oci: {sources: []}
 `
 	_, err := Load(writeConfig(t, body))
@@ -310,12 +310,12 @@ func TestProblemsAreAggregatedInOrder(t *testing.T) {
 		t.Fatal("want error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"fetch_hosts is required", "duplicate source name", "unsupported remote scheme", `"npm" is not supported`, `"oci" is not supported`} {
+	for _, want := range []string{"fetch_hosts is required", "duplicate source name", "unsupported remote scheme", `"cargo" is not supported`, `"oci" is not supported`} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing %q in:\n%s", want, msg)
 		}
 	}
-	if strings.Index(msg, `"npm"`) > strings.Index(msg, `"oci"`) {
+	if strings.Index(msg, `"cargo"`) > strings.Index(msg, `"oci"`) {
 		t.Errorf("ecosystem errors not sorted:\n%s", msg)
 	}
 }
@@ -641,8 +641,8 @@ func TestPyPIBranchesRejected(t *testing.T) {
 }
 
 func TestUnsupportedEcosystem(t *testing.T) {
-	body := strings.Replace(pypiConfig("      - {name: r, type: registry, url: 'https://x/simple/', fetch_hosts: [x]}\n"), "pypi:", "npm:", 1)
-	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), `ecosystem "npm" is not supported yet`) {
+	body := strings.Replace(pypiConfig("      - {name: r, type: registry, url: 'https://x/simple/', fetch_hosts: [x]}\n"), "pypi:", "cargo:", 1)
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), `ecosystem "cargo" is not supported yet`) {
 		t.Fatalf("err = %v", err)
 	}
 }

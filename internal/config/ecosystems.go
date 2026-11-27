@@ -47,6 +47,20 @@ var ecosystems = map[string]ecosystemRules{
 		overlap:    goClaimsOverlap,
 		source:     goSource,
 	},
+	"maven": {
+		types:      []string{"registry", "storage"},
+		validClaim: func(c string) bool { return c == "*" || mavenClaimRe.MatchString(c) },
+		hint:       `use "*", "<group>" or "<group>:<artifact>" in lowercase; a group is dotted [a-z0-9_-] segments and may end in ".*"`,
+		overlap:    func(a, b string) bool { return a == "*" || b == "*" || mavenOverlap(a, b) },
+		source:     noGitSource("maven"),
+	},
+	"npm": {
+		types:      []string{"registry", "storage"},
+		validClaim: func(c string) bool { return validClaim("npm", c) },
+		hint:       `use "*", "@<scope>/<name>" or "<name>" in lowercase [a-z0-9._*-]`,
+		overlap:    func(a, b string) bool { return claimsOverlap("npm", a, b) },
+		source:     noGitSource("npm"),
+	},
 }
 
 // SupportedEcosystems returns the ecosystems with validation rules, sorted.
@@ -89,6 +103,28 @@ func pypiSource(s Source, _ []Source, opts ValidateOptions, add func(string, ...
 		if u, err := url.Parse(s.URL); s.URL != "" && err == nil && u.Host != "" &&
 			!strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/simple") {
 			add("url %q must point at a simple index (ending in /simple/)", s.URL)
+		}
+	}
+}
+
+// noGitSource checks a source of an ecosystem without git sources: a
+// registry url ends in "/", and no git-only key is set.
+func noGitSource(eco string) func(Source, []Source, ValidateOptions, func(string, ...any)) {
+	return func(s Source, _ []Source, _ ValidateOptions, add func(string, ...any)) {
+		if s.Type == "registry" && s.URL != "" && !strings.HasSuffix(s.URL, "/") {
+			add("url %q must end in a trailing /", s.URL)
+		}
+		if len(s.Remotes) > 0 {
+			add("remotes is not supported for " + eco)
+		}
+		if len(s.Branches) > 0 {
+			add("branches is not supported for " + eco)
+		}
+		if len(s.Tags) > 0 {
+			add("tags is not supported for " + eco)
+		}
+		if len(s.Modules) > 0 {
+			add("modules is not supported for " + eco)
 		}
 	}
 }

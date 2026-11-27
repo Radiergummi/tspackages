@@ -43,8 +43,8 @@ func makeTarGz(t testing.TB, entries ...tarEntry) []byte {
 	return buf.Bytes()
 }
 
-func wantPKGINFO(name string) bool {
-	return strings.HasSuffix(name, "/PKG-INFO") && strings.Count(name, "/") == 1
+func wantPKGINFO(e Entry) bool {
+	return strings.HasSuffix(e.Name, "/PKG-INFO") && strings.Count(e.Name, "/") == 1
 }
 
 func TestInspectTarGz(t *testing.T) {
@@ -112,5 +112,28 @@ func TestCountingReaderPauseAtLimit(t *testing.T) {
 	b, err := io.ReadAll(c)
 	if !errors.Is(err, errOverLimit) || len(b) > 4 {
 		t.Fatalf("read %q, err %v", b, err)
+	}
+}
+
+func TestInspectTarGzEntries(t *testing.T) {
+	data := makeTarGz(t,
+		tarEntry{name: "package/", typ: tar.TypeDir},
+		tarEntry{name: "package/package.json", body: "0123456789"},
+		tarEntry{name: "package/lib/a.js", body: "abcde"},
+	)
+	var seen []Entry
+	got, err := InspectTarGz(bytes.NewReader(data), testLimits, func(e Entry) bool {
+		seen = append(seen, e)
+		return e.Name == "package/package.json"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSeen := []Entry{{Name: "package/package.json", Size: 10}, {Name: "package/lib/a.js", Size: 5}}
+	if len(seen) != len(wantSeen) || seen[0] != wantSeen[0] || seen[1] != wantSeen[1] {
+		t.Errorf("want saw %v, want %v", seen, wantSeen)
+	}
+	if len(got) != 1 || string(got["package/package.json"]) != "0123456789" {
+		t.Errorf("InspectTarGz = %v", got)
 	}
 }

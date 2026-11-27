@@ -13,8 +13,10 @@ identity (WhoIs + an app capability in tailnet grants). Clients hold no
 registry credentials.
 
 Roadmap: Composer, PyPI (`storage`, `registry` and `git` sdists; CI
-uploads with `twine`/`uv publish`) and Go (`git` + `registry` + sumdb
-proxy) ship; then npm, OCI and Maven.
+uploads with `twine`/`uv publish`), Go (`git` + `registry` + sumdb
+proxy) and npm (`storage` + `registry`; npm and pnpm, CI publishes with a
+dummy `_authToken`) and Maven (`storage` + `registry`; mvn and Gradle,
+no `<server>` or `credentials` entry) ship; OCI is next.
 
 The design spec and the milestone-1 plan live in `docs/superpowers/`, which the
 owner's global gitignore excludes. They exist only in the owner's local
@@ -24,7 +26,8 @@ checkout. If they are missing, this file and the code are the source of truth.
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, fmt-check, vet, race tests
-make integration   # real Composer/pip/uv/twine/go end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go (S3 variant: TSP_TEST_S3_ENDPOINT)
+make integration   # real Composer/pip/uv/twine/go/npm/pnpm/mvn/gradle end-to-end; need composer 2.x, git, python3 with pip, uv, twine, go, node with npm and pnpm, a JDK, mvn, gradle and gpg (S3 variant: TSP_TEST_S3_ENDPOINT)
+make maven-seed    # once, with network: the local repository the mvn tests' fake Central serves (TSP_TEST_MAVEN_SEED; missing: skip, fail under CI=true)
 make tailnet       # real tsnet nodes + in-process testcontrol: WhoIs, grants, startup and shutdown
 make vuln          # govulncheck; reachable findings fail unless VULN_IGNORE lists them
 make build         # ./tspackages with version and commit stamped in
@@ -62,6 +65,8 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
 - `internal/relay` — one upstream fetch per artifact, streamed to every
   waiting client from a temp file, cached only after its digest matched.
 - `internal/flight` — per-key single-flight shared by the ecosystems.
+- `internal/lru` — in-memory cache bounded by total value size (rendered
+  npm packuments, Maven metadata).
 - `internal/ecosystem/composer` — names, Composer version parsing (port of
   composer/semver), the three sources, the HTTP handler.
 - `internal/ecosystem/pypi` — PEP 503 names, PEP 440 versions, filenames,
@@ -73,9 +78,21 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   pseudo-versions, on-demand sync), the `registry` source, the
   sum.golang.org verifier and the client-facing sumdb proxy. Must not
   import `composer` or `pypi` (nor the reverse).
+- `internal/ecosystem/npm` — names and claims, strict SemVer, request
+  paths, the streamed packument rewrite and publish inspection, the
+  `storage` source (dist-tags, precedence claims) and the `registry`
+  source (tarballs, keys, attestations), the HTTP handler. Must not import
+  `composer`, `pypi` or `goproxy` (nor the reverse).
+- `internal/ecosystem/maven` — coordinates, layout paths and claims, the
+  `ComparableVersion` port, the safe XML reader, checksums, deploy
+  inspection (POM, `.module`, metadata), the `storage` source (write-once
+  release and timestamped SNAPSHOT files, generated metadata) and the `registry`
+  source (files verified by the upstream's `.sha1`, metadata passed
+  through), the HTTP handler. Must not import `composer`, `pypi`,
+  `goproxy` or `npm` (nor the reverse).
 - `internal/testutil` — test-only helpers (git, zips, fake WhoIs).
-- `integration/` — end-to-end tests with real Composer, pip, uv, twine and
-  the go command (`-tags integration`).
+- `integration/` — end-to-end tests with real Composer, pip, uv, twine,
+  the go command, npm, pnpm, mvn and Gradle (`-tags integration`).
 
 ## Invariants — do not break
 
@@ -131,6 +148,45 @@ S3 tests run only with `TSP_TEST_S3_ENDPOINT` pointing at a MinIO
   request. The one exception to "served git versions stay served":
   a pseudo-version whose commit is gone from the mirror becomes
   unavailable.
+- npm: claims and `npm:` rules are `*`, `@<scope>/<name>` or an unscoped
+  `<name>` of `[a-z0-9._-]` and `*` (a `*` matches within one part),
+  matched against the lowercased name; storage accepts only names that are
+  already lowercase. Every key segment from a name or version goes through
+  `storage.EscapeSegment`, so names and versions are at most 156 raw bytes
+  (`MaxSegment`). A storage version's metadata is built from the tarball's
+  `package/package.json` through `npm.PublishableFields`, never from the
+  publish body, except the informational `gitHead`, `_nodeVersion` and
+  `_npmVersion` (strings of at most 256 bytes). A version is claimed with its sha256 (`~claim`) and its
+  precedence without build metadata (`~precedence`), so other bytes, or
+  `1.0.0+a` next to `1.0.0+b`, are `409`. Registry tarballs are verified
+  by SHA-512 (or SHA-1 when that is all a version declares) before
+  caching; versions without either are dropped. Never answer `401`: npm
+  turns it into an OTP or login prompt; deny is `403`.
+- Maven: claims and `maven:` rules are `*`, `<group>` or
+  `<group>:<artifact>`, the group dotted segments of `[a-z0-9_-]` whose
+  last may be `*` (one or more trailing segments, so `com.acme.*` doesn't
+  cover `com.acme`), the artifact `[a-z0-9._-]` and `*`, matched against
+  the lowercased `groupId:artifactId`. Coordinates are stored and served
+  in their exact case; a deploy that differs from an existing artifact
+  only in case is `409`. A `maven-metadata.xml` path is claimed when
+  either reading (artifact level `g:a`, group level `g.a`) matches a
+  claim, or when it sits in a version directory of a claimed artifact;
+  reading group-level metadata needs a rule for the whole group
+  (`<group>` or `<group>:*`), and its sources are asked only for callers
+  allowed it. An unclaimed metadata path is granted by a rule for either
+  reading. Every key segment from a coordinate or file name goes through
+  `storage.EscapeSegment`, so coordinate parts are at most 156 bytes, and
+  storage accepts file names of at most 153 bytes and `groupId:artifactId`
+  of at most 156. Release and timestamped SNAPSHOT files are write-once
+  (same bytes `201`, other bytes `409`: they are served immutable), and a
+  version is listed once its POM is stored; other SNAPSHOT files may be
+  overwritten. Provenance is kept per file. Uploaded checksums and `maven-metadata.xml`
+  are checked and discarded: tspackages serves its own, generated from
+  the bytes it serves. Registry files are verified against the upstream's
+  `.sha1` before caching; without one, a missing file is `404`, a
+  signature is streamed uncached and anything else is `502`. A `404` has a
+  plain-text body (Maven reads a problem+json `404` as a transfer error);
+  other errors are problem+json. Never answer `401`; deny is `403`.
 - One instance per `work_dir` (flock) and per tsnet state dir.
 
 ## Conventions

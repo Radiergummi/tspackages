@@ -276,22 +276,28 @@ func (c *Client) GetAccept(ctx context.Context, rawURL, accept string) (*http.Re
 // beyond maxBytes fails with ErrTooLarge from Read. The caller must close the
 // body.
 func (c *Client) Open(ctx context.Context, rawURL string, maxBytes int64) (io.ReadCloser, int64, error) {
+	body, size, _, err := c.OpenWithHeader(ctx, rawURL, maxBytes)
+	return body, size, err
+}
+
+// OpenWithHeader is Open that also returns the response headers.
+func (c *Client) OpenWithHeader(ctx context.Context, rawURL string, maxBytes int64) (io.ReadCloser, int64, http.Header, error) {
 	if maxBytes <= 0 {
-		return nil, 0, fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
+		return nil, 0, nil, fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
 	}
 	resp, err := c.Get(ctx, rawURL)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		resp.Body.Close()
-		return nil, 0, &StatusError{Code: resp.StatusCode, URL: redactURL(resp.Request.URL)}
+		return nil, 0, nil, &StatusError{Code: resp.StatusCode, URL: redactURL(resp.Request.URL)}
 	}
 	if resp.ContentLength > maxBytes {
 		resp.Body.Close()
-		return nil, 0, ErrTooLarge
+		return nil, 0, nil, ErrTooLarge
 	}
-	return &cappedBody{rc: resp.Body, left: maxBytes}, resp.ContentLength, nil
+	return &cappedBody{rc: resp.Body, left: maxBytes}, resp.ContentLength, resp.Header, nil
 }
 
 // cappedBody fails with ErrTooLarge once more than its limit has been read.

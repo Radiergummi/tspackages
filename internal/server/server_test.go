@@ -414,3 +414,51 @@ func TestBuildersCoverEveryEcosystem(t *testing.T) {
 		t.Fatalf("builders = %v, config.SupportedEcosystems = %v", names, want)
 	}
 }
+
+func TestBuildNPM(t *testing.T) {
+	cfg := fsConfig(t)
+	cfg.Ecosystems["npm"] = config.Ecosystem{Sources: []config.Source{
+		{Name: "hosted", Type: "storage", Claims: []string{"@example/*"}, Store: "main"},
+		{Name: "npmjs", Type: "registry", URL: "https://registry.npmjs.org/", FetchHosts: []string{"registry.npmjs.org"}},
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["npm:@example/*"]}`), quiet, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	if w := do(h, "GET", "/npm/@example%2fx", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("claimed missing package = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "POST", "/-/npm/v1/oidc/token/exchange/package/x", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("oidc exchange at the root = %d", w.Code)
+	}
+	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/npm/") {
+		t.Fatalf("status page lacks the npm snippet: %d", w.Code)
+	}
+}
+
+func TestBuildMaven(t *testing.T) {
+	cfg := fsConfig(t)
+	cfg.Ecosystems["maven"] = config.Ecosystem{Sources: []config.Source{
+		{Name: "hosted", Type: "storage", Claims: []string{"com.example", "com.example.*"}, Store: "main"},
+		{Name: "central", Type: "registry", URL: "https://repo.maven.apache.org/maven2/", FetchHosts: []string{"repo.maven.apache.org"}},
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["maven:com.example","maven:com.example.*"],"write":["maven:com.example","maven:com.example.*"]}`), quiet, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	if w := do(h, "GET", "/maven/com/example/x/maven-metadata.xml", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("claimed missing artifact = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "PUT", "/maven//com/example/x/1.0/x-1.0.jar", strings.NewReader("x")); w.Code != http.StatusCreated {
+		t.Fatalf("PUT with a doubled slash = %d %s, want 201", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/maven/") {
+		t.Fatalf("status page lacks the maven snippet: %d", w.Code)
+	}
+}

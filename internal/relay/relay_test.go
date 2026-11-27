@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -717,5 +718,68 @@ func TestOnCommitSeesTempFile(t *testing.T) {
 	r.Wait() // the temp file is deleted after the background cache write
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temp file still there: %v", err)
+	}
+}
+
+func sha512Hex(b []byte) string {
+	s := sha512.Sum512(b)
+	return hex.EncodeToString(s[:])
+}
+
+func TestSHA512Verified(t *testing.T) {
+	r, _, _ := newRelay(t)
+	data := []byte("npm tarball")
+	var calls atomic.Int32
+	var got Result
+	onCommit := func(_ context.Context, res Result) error { got = res; return nil }
+	rc, _, _, err := r.Open(context.Background(), "k", Digest{SHA512: sha512Hex(data)}, bytesFetch(data, &calls), onCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || !bytes.Equal(b, data) {
+		t.Fatalf("read %q, %v", b, err)
+	}
+	if got.SHA512 != sha512Hex(data) || got.SHA256 == "" {
+		t.Fatalf("onCommit saw %+v", got)
+	}
+}
+
+// TestSHA512OnlyWhenWanted: a download that declares no SHA-512 is not
+// hashed with it.
+func TestSHA512OnlyWhenWanted(t *testing.T) {
+	r, _, _ := newRelay(t)
+	data := []byte("go module zip")
+	var calls atomic.Int32
+	var got Result
+	onCommit := func(_ context.Context, res Result) error { got = res; return nil }
+	rc, _, _, err := r.Open(context.Background(), "k", Digest{SHA256: digestOf(data).SHA256}, bytesFetch(data, &calls), onCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if got.SHA512 != "" || got.SHA1 == "" || got.SHA256 != digestOf(data).SHA256 {
+		t.Fatalf("onCommit saw %+v", got)
+	}
+}
+
+func TestSHA512Mismatch(t *testing.T) {
+	r, cache, _ := newRelay(t)
+	var calls atomic.Int32
+	want := Digest{SHA512: hex.EncodeToString(make([]byte, 64))}
+	rc, _, _, err := r.Open(context.Background(), "k", want, bytesFetch([]byte("payload"), &calls), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(rc); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("read err = %v", err)
+	}
+	rc.Close()
+	if _, _, err := cache.Get(context.Background(), "k"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("cached after mismatch: %v", err)
 	}
 }

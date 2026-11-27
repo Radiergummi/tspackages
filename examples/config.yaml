@@ -84,3 +84,25 @@ ecosystems:
         type: registry
         url: https://proxy.golang.org
         fetch_hosts: [proxy.golang.org, sum.golang.org]   # sum.golang.org is required
+
+  npm:
+    sources:
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["@example/*"]
+      - name: npmjs
+        type: registry
+        url: https://registry.npmjs.org/
+        fetch_hosts: [registry.npmjs.org]
+
+  maven:
+    sources:
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["com.example", "com.example.*"]
+      - name: central
+        type: registry
+        url: https://repo.maven.apache.org/maven2/
+        fetch_hosts: [repo.maven.apache.org]

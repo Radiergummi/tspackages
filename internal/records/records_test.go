@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -141,5 +142,144 @@ func TestProvenanceDigests(t *testing.T) {
 	}
 	if got, err := s.ProvenanceDigests(ctx, "composer", "x/y", "1"); err != nil || len(got) != 0 {
 		t.Fatalf("unknown version: %v %v", got, err)
+	}
+}
+
+func TestAuditDistTag(t *testing.T) {
+	s, d := newStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	for _, a := range []Audit{
+		{Action: "dist-tag", Ecosystem: "npm", Package: "@a/b", Tag: "beta", Previous: "1.0.0", Version: "1.1.0", Time: at},
+		{Action: "publish", Ecosystem: "npm", Package: "@a/b", Version: "1.0.0", SHA256: sum, Time: at},
+	} {
+		if err := s.PutAudit(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := 0
+	for info, err := range d.List(ctx, "audit/2026/01/02/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, _, err := d.Get(ctx, info.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a Audit
+		if err := json.Unmarshal(raw, &a); err != nil {
+			t.Fatal(err)
+		}
+		hasTag := strings.Contains(string(raw), `"tag"`) || strings.Contains(string(raw), `"previous"`)
+		switch a.Action {
+		case "dist-tag":
+			if a.Tag != "beta" || a.Previous != "1.0.0" || a.Version != "1.1.0" {
+				t.Fatalf("dist-tag = %+v", a)
+			}
+		case "publish":
+			if hasTag {
+				t.Fatalf("publish record has tag keys: %s", raw)
+			}
+		}
+		seen++
+	}
+	if seen != 2 {
+		t.Fatalf("records = %d", seen)
+	}
+}
+
+func TestFileField(t *testing.T) {
+	s, d := newStore(t)
+	ctx := context.Background()
+	p := Provenance{Ecosystem: "maven", Package: "com.acme:lib", Version: "1.0", File: "lib-1.0.jar", Source: "central", SHA256: sum}
+	if err := s.PutProvenance(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.FileProvenance(ctx, "maven", "com.acme:lib", "1.0", "lib-1.0.jar")
+	if err != nil || len(got) != 1 || got[0].File != "lib-1.0.jar" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	// A record written without a file (every earlier ecosystem) has no key.
+	other := strings.Repeat("d", 64)
+	if err := s.PutProvenance(ctx, Provenance{Ecosystem: "npm", Package: "a", Version: "1.0.0", SHA256: other}); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := d.Get(ctx, provPrefix("npm", "a", "1.0.0")+other+".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(rc)
+	rc.Close()
+	if strings.Contains(string(raw), `"file"`) {
+		t.Fatalf("record without file has the key: %s", raw)
+	}
+	at := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+	if err := s.PutAudit(ctx, Audit{Action: "publish", Ecosystem: "maven", Package: "com.acme:lib", Version: "1.0", File: "lib-1.0.pom", SHA256: sum, Time: at}); err != nil {
+		t.Fatal(err)
+	}
+	for info, err := range d.List(ctx, "audit/2026/01/03/") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, _, err := d.Get(ctx, info.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a Audit
+		err = json.NewDecoder(rc).Decode(&a)
+		rc.Close()
+		if err != nil || a.File != "lib-1.0.pom" {
+			t.Fatalf("audit = %+v, %v", a, err)
+		}
+	}
+}
+
+// TestFileProvenanceKeyedByFile: files of one version with the same bytes
+// each keep their record, and FileProvenance lists one file's records only.
+func TestFileProvenanceKeyedByFile(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	other := strings.Repeat("d", 64)
+	for _, p := range []Provenance{
+		{File: "lib-1.0-sources.jar", SHA256: sum},
+		{File: "lib-1.0-javadoc.jar", SHA256: sum},
+		{File: "lib-1.0-javadoc.jar", SHA256: other},
+		{File: strings.Repeat("Ä", 200), SHA256: sum}, // longer than a key segment once escaped
+	} {
+		p.Ecosystem, p.Package, p.Version, p.Source = "maven", "com.acme:lib", "1.0", "central"
+		if err := s.PutProvenance(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for file, want := range map[string][]string{
+		"lib-1.0-sources.jar":    {sum},
+		"lib-1.0-javadoc.jar":    {sum, other},
+		strings.Repeat("Ä", 200): {sum},
+		"lib-1.0.jar":            nil,
+	} {
+		got, err := s.FileProvenance(ctx, "maven", "com.acme:lib", "1.0", file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sums []string
+		for _, p := range got {
+			if p.File != file {
+				t.Errorf("%s: record for %s", file, p.File)
+			}
+			sums = append(sums, p.SHA256)
+		}
+		slices.Sort(sums)
+		if !slices.Equal(sums, want) {
+			t.Errorf("%s: sha256s = %v, want %v", file[:min(len(file), 20)], sums, want)
+		}
+	}
+	// File records are not version-level records.
+	if d, err := s.ProvenanceDigests(ctx, "maven", "com.acme:lib", "1.0"); err != nil || len(d) != 0 {
+		t.Errorf("ProvenanceDigests = %v, %v", d, err)
 	}
 }

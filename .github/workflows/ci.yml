@@ -38,9 +38,13 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       TSP_TEST_S3_ENDPOINT: http://localhost:9000
+      TSP_TEST_MAVEN_SEED: ${{ github.workspace }}/.maven-seed
+      # The pinned mvn (see the install step); it fetches the seed, so it
+      # is part of the seed's cache key.
+      MAVEN_VERSION: 3.10.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,8 +62,47 @@ jobs:
       # Pinned: the PyPI tests judge protocol conformance by these clients.
       # Bump deliberately.
       - run: python -m pip install uv==0.12.21 twine==7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.x"
+      # Pinned: the npm tests judge protocol conformance by these clients.
+      # Bump deliberately. Exact versions, like the pip line above, so no
+      # lockfile is needed.
+      - run: npm install -g npm@11.20.0 pnpm@12.21.0 # zizmor: ignore[adhoc-packages]
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      # Pinned: the Maven tests judge protocol conformance by these clients.
+      # Bump deliberately. The published builds, pinned by digest; they go
+      # first on PATH, ahead of the runner's own.
+      - env:
+          MAVEN_SHA256: 8ba13121794243e604dbca50439f6ae649ce602675a167129556fd502947b249
+          GRADLE_VERSION: 9.9.2
+          GRADLE_SHA256: 971fcd7150ca4ba04852c0b2ca0d2d0ab9468e14b03473eab19528809914c76b
+        run: |
+          curl -fsSL -o maven.tar.gz \
+            "https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.tar.gz"
+          echo "$MAVEN_SHA256  maven.tar.gz" | sha256sum -c -
+          curl -fsSL -o gradle.zip "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip"
+          echo "$GRADLE_SHA256  gradle.zip" | sha256sum -c -
+          tar -xzf maven.tar.gz -C "$RUNNER_TEMP"
+          unzip -q gradle.zip -d "$RUNNER_TEMP"
+          rm maven.tar.gz gradle.zip
+          echo "$RUNNER_TEMP/apache-maven-$MAVEN_VERSION/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/gradle-$GRADLE_VERSION/bin" >> "$GITHUB_PATH"
+      # The plugins and dependencies the mvn tests' fake upstream serves,
+      # fetched from Maven Central once per seed POM.
+      - id: maven-seed
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .maven-seed
+          key: maven-seed-${{ env.MAVEN_VERSION }}-${{ hashFiles('integration/testdata/maven/seed/**/pom.xml') }}
+      - if: steps.maven-seed.outputs.cache-hit != 'true'
+        run: make maven-seed
       - uses: ./.github/actions/minio
-      - run: go test -tags integration ./integration/...
+      # Below the job's timeout, so a hang prints its goroutine dump.
+      - run: go test -timeout 25m -tags integration ./integration/...
 
   lint-go:
     runs-on: ubuntu-latest

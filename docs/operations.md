@@ -352,8 +352,9 @@ Metrics:
 The status page has a section per configured ecosystem, with each source's
 health, tags that moved upstream, Composer packages declared by several
 remotes, registry archives whose bytes changed, PyPI git conflicts and
-skipped packages, and Go tags that were skipped, refused or moved and the
-state of the sum.golang.org verifier. It shows what the
+skipped packages, Go tags that were skipped, refused or moved and the
+state of the sum.golang.org verifier, and npm tarballs that changed
+upstream. It shows what the
 running process has seen; restarts clear the moved-tag and changed-archive
 lists until those are seen again. The logs are the lasting record. Lines
 worth an alert:
@@ -363,6 +364,7 @@ worth an alert:
 | `relay: download failed` with `relay: digest mismatch` in `error` | warn | An upstream archive didn't match its declared hash. Nothing was cached, and the client's transfer was broken off short of its `Content-Length`. |
 | `relay: download failed` with `relay: cache` in `error` | warn | A verified archive reached the client but couldn't be cached; the next request fetches it again. |
 | `composer dist changed upstream; serving the new bytes` | warn | A registry archive differs from the bytes first seen for that version and reference. |
+| `npm tarball changed upstream; serving the new bytes` | warn | A registry tarball differs from the bytes first seen for that version. |
 | `composer git: tag moved upstream; serving the pinned commit` | warn | A tag was force-pushed. The pin keeps the first commit. |
 | `composer package declared by several remotes; not served` | error | Two remotes of one git source declare the same package. |
 | `composer git: serving pinned versions only` | warn | A remote can't be indexed, so only its pinned versions are served. |
@@ -381,9 +383,9 @@ worth an alert:
 | `goproxy git: tag version skipped`, `goproxy git: tag version refused` | warn | A tag isn't served; `reason` says why (see [Size refusals](#size-refusals)). |
 | `goproxy git: stored version refused`, `goproxy git: pseudo-version refused` | warn | A rebuild gave another `h1:` than the record, or the commit is gone; the version answers `502`. |
 | `go checksum database misbehaved` | error | sum.golang.org contradicted the stored tree head; registry fetches fail until restart (see [The checksum database](#the-checksum-database)). |
-| `composer upstream unhealthy`, `pypi upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
+| `composer upstream unhealthy`, `pypi upstream unhealthy`, `npm upstream unhealthy` | warn | A registry upstream fails; `stale` says whether cached metadata is served. |
 | `left symlinks out of a git archive` | warn | A git-built archive lacks the listed symlinks. |
-| `composer source failed`, `pypi source failed`, `go source failed` | error | A request ended in `5xx`. |
+| `composer source failed`, `pypi source failed`, `go source failed`, `npm request failed` | error | A request ended in `5xx`. |
 | `not ready` | warn | `/readyz` failed. |
 
 PyPI git conflicts (a release changed without a version bump, divergent
@@ -487,6 +489,275 @@ The next lookup stores a new tree head. Do this only once you are sure
 sum.golang.org itself isn't the problem: deleting the object also forgets
 the tree head a real fork would be checked against.
 
+## npm
+
+### Client setup
+
+Each project (or each user's `~/.npmrc`) needs two lines, and no others for
+the registry:
+
+```ini
+registry=https://<hostname>.<tailnet>.ts.net/npm/
+//<hostname>.<tailnet>.ts.net/npm/:_authToken=tailscale
+```
+
+npm refuses to publish without a token for the registry, so the second line
+holds a dummy one. tspackages strips it and never checks it; the caller's
+grant decides. pnpm reads the same `.npmrc`. Don't add
+`@scope:registry=` lines that point elsewhere: that scope then bypasses
+tspackages and its claims.
+
+Lockfiles written against registry.npmjs.org install unchanged: npm swaps
+the `resolved` host for the configured registry (its `replace-registry-host`
+setting, `npmjs` by default; don't set it to `never`), and pnpm lockfiles
+carry no URLs for registry packages. A lockfile written against tspackages
+names tspackages' host in `resolved`.
+
+pnpm holds back versions younger than its `minimumReleaseAge` and, when an
+install picks a just-published private version anyway, adds it to
+`minimumReleaseAgeExclude` in `pnpm-workspace.yaml`. To keep that file
+stable, exclude your private scopes up front:
+
+```yaml
+# pnpm-workspace.yaml
+minimumReleaseAgeExclude:
+  - "@acme/*"
+```
+
+### Publishing from CI
+
+Give the CI node's tag `write` on its own package (`npm:@acme/sdk`), put the
+two `.npmrc` lines in place and publish. Set the registry in `package.json`
+so a publish from a laptop with another configuration can't go to
+registry.npmjs.org:
+
+```json
+"publishConfig": {"registry": "https://<hostname>.<tailnet>.ts.net/npm/"}
+```
+
+`npm publish --registry https://<hostname>.<tailnet>.ts.net/npm/` does the
+same for one run. `pnpm publish` works the same way. Publishing the same
+bytes again succeeds; other bytes for an existing version fail with `E409`
+and `version already exists`, also with `--force`. A publish under the
+`latest` tag of a version lower than the current `latest` succeeds but
+leaves `latest` where it was, and npm prints `latest stayed at <version>`.
+`npm dist-tag add` and `rm` work on names a `storage` source serves; `latest`
+can't be removed. `npm deprecate` and `npm unpublish` fail with `E405`.
+Each tag move is audited as a `dist-tag` record before it's written, with
+an `attempt` ID; a `dist-tag-commit` record with the same ID follows once
+the write took effect. A `dist-tag` record whose attempt has no commit
+most likely lost a concurrent write and changed nothing; after a crash or
+a failed commit record (logged as an error) the move may still have taken
+effect, so check the package's dist-tags.
+
+`npm publish --provenance` works where npm can get an OIDC token (GitHub
+Actions with `id-token: write`). The bundle is stored and recorded in the
+provenance records but not served, so `npm audit signatures` doesn't find
+it. npm's trusted-publishing token exchange, sent to the host root, gets a
+`404`, which npm ignores.
+
+### npm audit
+
+`/npm/-/npm/v1/security/advisories/bulk` answers `404`. Forwarding it would
+send every dependency name in the tree, private ones included, to
+registry.npmjs.org. `npm install` and `npm ci` carry on and mention the
+failure only with `--loglevel verbose`. `npm audit` fails with `audit
+endpoint returned an error`. No vulnerability report comes through
+tspackages; audit public dependencies with a tool that doesn't send private
+names, and set `audit=false` in `.npmrc` to skip the request.
+
+### Revalidation and rate limits
+
+Packuments carry `Cache-Control: no-cache` and an `ETag`, so a fresh
+publish is visible at once. The cost: every install sends a conditional
+request per package and gets a `304`, even with a warm npm cache, about
+1,000 requests for a tree of 1,000 packages. Tarballs come from npm's cache
+(`npm config get cache`) or pnpm's store. Size `requests_per_second` and
+`burst` for your largest install from one node. npm retries a `429` twice,
+waiting at least 10 seconds each time (`fetch-retries`,
+`fetch-retry-mintimeout`), so a limit that is too tight makes installs slow
+before it fails them.
+
+## Maven
+
+### Client setup
+
+tspackages must be the client's only repository. Maven and Gradle both
+treat a `403` as "try the next repository": with Maven Central next to
+tspackages, a caller without a read rule for a private artifact would get
+a public artifact with the same coordinates from there. tspackages itself
+never asks an upstream for claimed coordinates; keeping clients from
+asking is the client configuration's job.
+
+For Maven, `~/.m2/settings.xml` (the status page shows it with the host
+filled in):
+
+```xml
+<settings>
+  <mirrors>
+    <mirror>
+      <id>tspackages</id>
+      <mirrorOf>*</mirrorOf>
+      <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+    </mirror>
+  </mirrors>
+  <profiles>
+    <profile>
+      <id>tspackages</id>
+      <repositories>
+        <repository>
+          <id>tspackages</id>
+          <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+          <snapshots><enabled>true</enabled></snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>tspackages</activeProfile>
+  </activeProfiles>
+</settings>
+```
+
+`<mirrorOf>*</mirrorOf>` sends every repository to tspackages, including
+the ones POMs declare and plugin repositories. A mirror of Central takes
+Central's policy, which turns SNAPSHOT versions off, so the profile adds a
+repository with SNAPSHOT versions on that the mirror also covers. Without SNAPSHOT
+dependencies, the mirror alone is enough.
+
+For Gradle, in `build.gradle.kts`, or in `settings.gradle.kts` under
+`dependencyResolutionManagement`:
+
+```kotlin
+repositories {
+    maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") }
+}
+```
+
+Neither client needs a `<server>` entry or a `credentials` block: without
+one they send no `Authorization` header, and tspackages strips any that
+arrives. Nothing answers `401`, so neither client prompts for a password.
+
+### Deploying from CI
+
+A deploy reads as well as writes: both clients fetch `maven-metadata.xml`
+before they upload theirs, and Maven aborts on anything but a `200` or
+`404` there. Give the CI node's tag both rules for its own artifacts:
+
+```hujson
+"app": {"github.com/radiergummi/tspackages": [
+  {"read": ["maven:com.acme:lib"], "write": ["maven:com.acme:lib"]}
+]}
+```
+
+Its builds also read their plugins and dependencies through tspackages,
+so in practice the CI tag reads `*`. In `pom.xml`:
+
+```xml
+<distributionManagement>
+  <repository>
+    <id>tspackages</id>
+    <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+  </repository>
+  <snapshotRepository>
+    <id>tspackages</id>
+    <url>https://<hostname>.<tailnet>.ts.net/maven/</url>
+  </snapshotRepository>
+</distributionManagement>
+```
+
+and run `mvn deploy`. For Gradle's `maven-publish`, in `build.gradle.kts`:
+
+```kotlin
+publishing {
+    repositories {
+        maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") }
+    }
+}
+```
+
+and run `gradle publish`. Signatures from Gradle's `signing` plugin or
+`maven-gpg-plugin` (`.asc`) are stored and served like any file.
+
+- Deploying the same bytes again succeeds; other bytes for a file of a
+  release fail the build with `409`, and the stored file stays. Maven's
+  jars carry build timestamps, so a second `mvn deploy` of a release
+  without `project.build.outputTimestamp` fails. Bump the version.
+- A POM whose `groupId`, `artifactId` or `version` holds a `${…}` property
+  is refused with `400 unresolved property … deploy a flattened POM`. With
+  CI-friendly versions (`${revision}`), deploy through the
+  `flatten-maven-plugin`.
+- Uploaded checksums must match the file (`400 checksum mismatch`), and
+  uploaded `maven-metadata.xml` must name the deployed artifact. Both are
+  then discarded; tspackages serves its own.
+- A `maven-plugin` deploys like any artifact. Storage sources serve no
+  group-level `maven-metadata.xml`, so a private plugin doesn't resolve by
+  its prefix (`mvn foo:goal`); call it by its coordinates,
+  `mvn com.acme:foo-maven-plugin:1.0:goal`.
+- A release version is listed once its POM is stored, before the deploy
+  has uploaded everything. A build that resolves it in that moment gets a
+  `404` for the jar, which Maven remembers for a day (`mvn -U` retries).
+  Resolve after the deploy job ends.
+
+### SNAPSHOT versions
+
+Each SNAPSHOT deploy adds timestamped files (`lib-1.0-20261123.101010-3.jar`)
+and the version's `maven-metadata.xml` points at the newest. They are kept
+without limit; there is no retention. Timestamped files are written once:
+two deploys of one SNAPSHOT version at the same moment may pick the same
+build number, and the later one then fails with `409` (run it again for
+a new build number).
+
+Consumers need the profile from [Client setup](#client-setup-2). Maven
+looks for a newer SNAPSHOT once a day (`mvn -U` forces it), Gradle every
+24 hours (`--refresh-dependencies`).
+
+### Gradle plugins
+
+The Gradle Plugin Portal isn't proxied. A plugin's marker artifact lives
+in a group named after the plugin ID, so the portal can't be a claimed
+source, and Maven Central is the one unclaimed source. Keep the portal for
+public plugins and send your own groups only to tspackages, in
+`settings.gradle.kts`:
+
+```kotlin
+pluginManagement {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = uri("https://<hostname>.<tailnet>.ts.net/maven/") } }
+            filter { includeGroupByRegex("com\\.acme(\\..*)?") }
+        }
+        gradlePluginPortal()
+    }
+}
+```
+
+Public plugins then come from the portal directly, not through tspackages.
+
+### Upstream files without a checksum
+
+Files from a `registry` source are verified against the upstream's
+`<file>.sha1` before they are cached. Maven Central publishes none for
+many signature files (`.asc`): those are fetched from the upstream on every
+request, up to 64KiB, served without checksum headers and never cached.
+Clients check signatures against the signer's key, not a digest. Any other
+file without an upstream `.sha1` answers `502 upstream declares no checksum
+for <file>`.
+
+### Cold cache and rate limits
+
+A file that isn't cached yet costs two upstream fetches, its `.sha1` and
+then the file, and a Maven build's plugins alone are a few hundred files.
+At the default `upstream_fetches_per_second` of 10 per node, the first
+`mvn deploy` of a small project on an empty cache spends about a minute
+waiting for the limiter. Raise the limit for CI nodes that build against a
+cold cache. A release file's `.sha1` is fetched once and kept, so later
+builds of release dependencies make no upstream request, even with a
+fresh `~/.m2`. SNAPSHOT files' `.sha1`, files the upstream lacks and
+`maven-metadata.xml` are fetched again after `metadata_ttl`. Files and
+`maven-metadata.xml` carry `X-Checksum-Sha1` and `X-Checksum-Md5`, so
+Maven doesn't request the checksum files.
+
 ## Removing a bad publish
 
 tspackages has no delete or yank: published bytes never change, so lock files
@@ -515,7 +786,8 @@ Before you do:
 
 Names in keys are normalised: Composer's `<vendor>/<name>` is in lowercase;
 a PyPI name is normalised as PEP 503 says (lowercase; runs of `-`, `_` and
-`.` become `-`, so `Acme_Utils` is `acme-utils`). Some segments are then
+`.` become `-`, so `Acme_Utils` is `acme-utils`); an npm name is in
+lowercase, scope included (`@Acme/X` is `@acme/x`). Some segments are then
 encoded as lowercase base32hex without padding. This computes one (Python
 3.10 or later):
 
@@ -562,6 +834,81 @@ Leave the release's claim files (`<dir>/~sdist` and
 `<dir>/<esc(~wheel-<tags>)>`). They hold the filename: the same filename can
 be uploaded again, but a corrected file under another filename can't take
 that version's sdist or wheel. Publish a new version.
+
+### An upload to an npm storage source
+
+Every segment is encoded, the name as a whole with its scope and slash:
+`esc @acme/x` is `81gm6rb55ts0`, `esc 1.0.0` is `64n30bhg`. With `<pkg>`
+for `npm/<esc(name)>` and `<dir>` for `<pkg>/<esc(version)>` (the version
+as published, build metadata included):
+
+1. If a dist-tag points at the version (`npm view <name> dist-tags`), move
+   it first: `npm dist-tag add <name>@<other-version> latest`, and
+   `npm dist-tag rm <name> <tag>` for other tags. A tag left on a removed
+   version disappears from the packument; without `latest`,
+   `npm install <name>` fails.
+2. Delete `<dir>/package.json`, the version's record.
+3. Delete `<pkg>/index.json`.
+4. Delete `<dir>/package.tgz` and, where present, `<dir>/package.sigstore`.
+
+Between the second and the third step, reads of the package fail with
+`502`. After it, reads rebuild the index from the remaining
+`package.json` records, scanning the package on every read until its next
+publish writes a new index. Check that
+`/npm/<name>/-/<base>-<version>.tgz` (`<base>` without the scope) answers
+`404` and that `npm view <name> versions` no longer lists it. No restart is
+needed.
+
+If the tags weren't moved first, delete `<pkg>/dist-tags.json` as well:
+`latest` then falls back to the highest remaining release, the status page
+reports the lost document, and the next tag change (a publish or
+`npm dist-tag add`) writes it afresh, holding only the fallback `latest`
+and that change. Re-add the other tags.
+
+Leave `<dir>/~claim`, `<dir>/~tagged` and the `~precedence` claim, which
+sits under the version without build metadata (`<pkg>/<esc(1.0.0)>/` for
+`1.0.0+a`). The claim holds the SHA256 of the tarball: the same bytes can be
+published again, but other bytes for that version, or a version differing
+from it only in build metadata, are refused with `409`. Publish a new
+version.
+
+### A deploy to a Maven storage source
+
+Maven keys keep the exact case: every segment is the encoded `groupId`,
+`artifactId`, version or file name as deployed (`esc com.acme` is
+`cdnmqbj1cdmma`, `esc lib` is `dhkm4`, `esc 1.0` is `64n30`). With `<art>`
+for `maven/<esc(groupId)>/<esc(artifactId)>` and `<dir>` for
+`<art>/<esc(version)>`, to remove a whole version:
+
+1. Delete `<dir>/~pom`, the version's claim.
+2. Delete `<art>/index.json`.
+3. Delete everything under `<dir>/files/`: each file and its `.json`
+   record.
+
+After the second step, reads rebuild the artifact's `maven-metadata.xml`
+from the remaining `~pom` claims, scanning the artifact on every read until
+its next deploy writes a new index. Check that the version is gone from
+`/maven/<group path>/<artifactId>/maven-metadata.xml` and that the jar's
+URL answers `404`. No restart is needed. Nothing then stops the same
+version from being deployed again, but Maven and Gradle keep a release they
+downloaded for good: publish the fix as a new version.
+
+To drop one bad build of a SNAPSHOT, delete its timestamped files and
+their `.json` records under `<dir>/files/`; the version's
+`maven-metadata.xml` is built from the records that remain.
+
+`maven/~case/<esc(lowercased groupId:artifactId)>` holds the case in which
+an artifact was first deployed, and refuses a deploy of it in another
+case. Leave it while files remain under that spelling. A first deploy
+reserves it even when it fails, so a mistyped first deploy can block the
+right spelling. Delete the entry once nothing remains under
+`maven/<esc(groupId)>/<esc(artifactId)>/` for the reserved spelling.
+
+A release file stored without its `.json` record (a deploy interrupted
+between the two writes) isn't served, but blocks a deploy of other bytes
+under its name with `409`. To unblock it, delete the orphan file under
+`<dir>/files/`, then deploy again. The same bytes again complete the
+interrupted deploy without that.
 
 ### A Composer version from a git tag
 
@@ -652,11 +999,15 @@ To keep that window small and harmless:
   so a large cache in S3 or a large `fs` store slows the start. Then the
   first git index pass runs.
 - **Keep client caches.** Composer keeps downloaded archives in its cache
-  directory and installs from a lock file without fetching them again. Every
-  tspackages response carries `Cache-Control: private, no-store`, so don't
-  count on a client's HTTP cache.
+  directory and installs from a lock file without fetching them again, and
+  npm and pnpm keep tarballs by their integrity. npm packuments and version
+  documents carry `Cache-Control: no-cache` (checked again on every use) and
+  npm tarballs `private, max-age=31536000, immutable`; every other
+  tspackages response carries `private, no-store`, so don't count on a
+  client's HTTP cache.
 - **Cache in CI.** Persist Composer's cache directory between runs
-  (`composer config cache-dir`). pip's cache is mostly an HTTP cache, which
+  (`composer config cache-dir`), and npm's cache or pnpm's store
+  (`npm config get cache`, `pnpm store path`). pip's cache is mostly an HTTP cache, which
   `no-store` keeps empty. For Python builds that must not depend on the registry, keep a wheelhouse
   (`pip download -d wheelhouse`, then `pip install --no-index --find-links
   wheelhouse`).

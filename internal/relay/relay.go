@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,13 +27,14 @@ import (
 
 // Digest is the expected digest of an artifact, as hex; empty fields are not
 // checked.
-type Digest struct{ SHA1, SHA256 string }
+type Digest struct{ SHA1, SHA256, SHA512 string }
 
-// Result is what a completed download observed.
+// Result is what a completed download observed. SHA512 is computed only
+// when the download's Digest declares one.
 type Result struct {
-	SHA1, SHA256 string
-	Size         int64
-	Path         string // the completed temp file; readable only while onCommit runs, "" on cache hits
+	SHA1, SHA256, SHA512 string
+	Size                 int64
+	Path                 string // the completed temp file; readable only while onCommit runs, "" on cache hits
 }
 
 // Fetch opens the upstream artifact, returning its body and declared size
@@ -73,7 +75,8 @@ type Relay struct {
 // sameDigest reports whether a and b expect the same bytes: every field
 // equal, ignoring case. A field set on one side only makes them differ.
 func sameDigest(a, b Digest) bool {
-	return strings.EqualFold(a.SHA1, b.SHA1) && strings.EqualFold(a.SHA256, b.SHA256)
+	return strings.EqualFold(a.SHA1, b.SHA1) && strings.EqualFold(a.SHA256, b.SHA256) &&
+		strings.EqualFold(a.SHA512, b.SHA512)
 }
 
 // Evict removes key from the cache unless it holds, or is about to hold,
@@ -93,7 +96,7 @@ func (r *Relay) Evict(ctx context.Context, key string, want Digest) error {
 			return err
 		}
 		dl.mu.Lock()
-		keep := dl.err == nil && check(want, dl.res) == nil
+		keep := dl.err == nil && check(computed(want, dl.res), dl.res) == nil
 		dl.mu.Unlock()
 		if keep {
 			return nil
@@ -183,7 +186,7 @@ func (r *Relay) Open(ctx context.Context, key string, want Digest, fetch Fetch, 
 				return nil, 0, false, err
 			}
 			dl.mu.Lock()
-			stale := dl.err == nil && check(want, dl.res) != nil
+			stale := dl.err == nil && check(computed(want, dl.res), dl.res) != nil
 			dl.mu.Unlock()
 			if stale {
 				if err := r.cache.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -293,10 +296,10 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	close(dl.ready)
 
 	path := dl.file.Name()
-	h1, h256 := sha1.New(), sha256.New()
+	h1, h256, h512 := sha1.New(), sha256.New(), sha512For(want)
 	var stalled atomic.Bool
 	timer := time.AfterFunc(r.idle, func() { stalled.Store(true); cancel() })
-	res, err := dl.copy(body, h1, h256, func() { timer.Reset(r.idle) })
+	res, err := dl.copy(body, h1, h256, h512, func() { timer.Reset(r.idle) })
 	timer.Stop()
 	body.Close()
 	if err != nil && stalled.Load() {
@@ -348,9 +351,26 @@ func (r *Relay) run(ctx context.Context, dl *download, want Digest, fetch Fetch,
 	}
 }
 
-// copy writes body to the temp file and the hashes, waking readers after
-// every chunk.
-func (dl *download) copy(body io.Reader, h1, h256 hash.Hash, progress func()) (Result, error) {
+// sha512For returns a SHA-512 hash when want declares one, else nil: no
+// other caller needs it, and it is the costliest of the three.
+func sha512For(want Digest) hash.Hash {
+	if want.SHA512 == "" {
+		return nil
+	}
+	return sha512.New()
+}
+
+// sumHex is h's sum as hex, or "" for a nil h.
+func sumHex(h hash.Hash) string {
+	if h == nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// copy writes body to the temp file and the hashes (h512 may be nil),
+// waking readers after every chunk.
+func (dl *download) copy(body io.Reader, h1, h256, h512 hash.Hash, progress func()) (Result, error) {
 	buf := make([]byte, 256<<10)
 	var total int64
 	for {
@@ -362,6 +382,9 @@ func (dl *download) copy(body io.Reader, h1, h256 hash.Hash, progress func()) (R
 			}
 			h1.Write(buf[:n])
 			h256.Write(buf[:n])
+			if h512 != nil {
+				h512.Write(buf[:n])
+			}
 			total += int64(n)
 			dl.mu.Lock()
 			dl.written = total
@@ -369,12 +392,22 @@ func (dl *download) copy(body io.Reader, h1, h256 hash.Hash, progress func()) (R
 			dl.mu.Unlock()
 		}
 		if errors.Is(rerr, io.EOF) {
-			return Result{SHA1: hex.EncodeToString(h1.Sum(nil)), SHA256: hex.EncodeToString(h256.Sum(nil)), Size: total}, nil
+			return Result{SHA1: hex.EncodeToString(h1.Sum(nil)), SHA256: hex.EncodeToString(h256.Sum(nil)), SHA512: sumHex(h512), Size: total}, nil
 		}
 		if rerr != nil {
 			return Result{}, rerr
 		}
 	}
+}
+
+// computed is want without the SHA-512 when got has none: a download that
+// declared no SHA-512 didn't compute one, and a cache read expecting it
+// verifies it itself.
+func computed(want Digest, got Result) Digest {
+	if got.SHA512 == "" {
+		want.SHA512 = ""
+	}
+	return want
 }
 
 func check(want Digest, got Result) error {
@@ -383,6 +416,9 @@ func check(want Digest, got Result) error {
 	}
 	if want.SHA1 != "" && !strings.EqualFold(want.SHA1, got.SHA1) {
 		return fmt.Errorf("%w: sha1 want %s, got %s", ErrDigestMismatch, want.SHA1, got.SHA1)
+	}
+	if want.SHA512 != "" && !strings.EqualFold(want.SHA512, got.SHA512) {
+		return fmt.Errorf("%w: sha512 want %s, got %s", ErrDigestMismatch, want.SHA512, got.SHA512)
 	}
 	return nil
 }
@@ -501,7 +537,7 @@ func (r *Relay) verifying(rc io.ReadCloser, key string, want Digest, size int64)
 	if want == (Digest{}) {
 		return rc
 	}
-	v := &verifier{rc: rc, relay: r, key: key, want: want, size: size, h1: sha1.New(), h256: sha256.New(), on: true}
+	v := &verifier{rc: rc, relay: r, key: key, want: want, size: size, h1: sha1.New(), h256: sha256.New(), h512: sha512For(want), on: true}
 	if _, ok := rc.(io.Seeker); ok {
 		return &seekingVerifier{v}
 	}
@@ -509,14 +545,14 @@ func (r *Relay) verifying(rc io.ReadCloser, key string, want Digest, size int64)
 }
 
 type verifier struct {
-	rc       io.ReadCloser
-	relay    *Relay
-	key      string
-	want     Digest
-	size     int64
-	h1, h256 hash.Hash
-	n        int64
-	on       bool
+	rc             io.ReadCloser
+	relay          *Relay
+	key            string
+	want           Digest
+	size           int64
+	h1, h256, h512 hash.Hash
+	n              int64
+	on             bool
 }
 
 func (v *verifier) Read(p []byte) (int, error) {
@@ -532,6 +568,9 @@ func (v *verifier) Read(p []byte) (int, error) {
 	n, err := v.rc.Read(p)
 	v.h1.Write(p[:n])
 	v.h256.Write(p[:n])
+	if v.h512 != nil {
+		v.h512.Write(p[:n])
+	}
 	v.n += int64(n)
 	last := n > 0 && v.n == v.size
 	if last || errors.Is(err, io.EOF) {
@@ -547,7 +586,7 @@ func (v *verifier) Read(p []byte) (int, error) {
 
 // check compares what was read with want, dropping the entry on a mismatch.
 func (v *verifier) check() error {
-	got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), Size: v.n}
+	got := Result{SHA1: hex.EncodeToString(v.h1.Sum(nil)), SHA256: hex.EncodeToString(v.h256.Sum(nil)), SHA512: sumHex(v.h512), Size: v.n}
 	err := check(v.want, got)
 	if err != nil {
 		if derr := v.relay.cache.Delete(context.Background(), v.key); derr != nil {

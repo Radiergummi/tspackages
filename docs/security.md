@@ -217,3 +217,156 @@ tailnet. Read this before you deploy.
   archives over 500MiB, and `go.mod` or `LICENSE` files over 16MiB are
   refused and reported. Builds run in a queue of 2 workers with a 10-minute
   limit each, so a push can't block other modules.
+
+## npm
+
+- Names are lowercased before claim matching, authorization and routing,
+  so `@Acme/x` can't slip past an `@acme/*` claim. Claims and `npm:` rules
+  accept `*`, `@<scope>/<name>` or an unscoped `<name>` of `[a-z0-9._-]`
+  and `*`; anything else is a config error, or a rule that grants nothing.
+  A `*` inside a pattern matches within one part, so `acme*` doesn't cover
+  `@acme/x`. Prefer scoped names for private packages: an unscoped private
+  name is one typo away from a public one.
+- Configure clients with tspackages as their only `registry=` and no
+  `@scope:registry=` lines that point elsewhere. A scope sent to another
+  registry is outside tspackages' claims.
+- **Private names never reach registry.npmjs.org.** A claimed name is looked
+  up only on its claiming sources. `npm audit` would send every dependency
+  name, private ones included, so `/-/npm/v1/security/advisories/bulk`
+  answers `404` instead of being forwarded.
+- **Served metadata comes from the tarball.** A storage version's manifest
+  is built from the `package/package.json` inside the published tarball,
+  through an allowlist of fields; of the publish body, only `gitHead`,
+  `_nodeVersion` and `_npmVersion` are kept. A publish whose URL, body and
+  tarball names or versions disagree, or whose declared `integrity` or
+  `shasum` doesn't match the tarball, is rejected.
+- A published version never changes bytes. The same bytes published again
+  succeed; other bytes for an existing version, or a version that differs
+  from an existing one only in build metadata (`1.0.0+a`, `1.0.0+b`), are
+  `409`. There is no unpublish and no deprecate (`405`).
+- **No response is a `401`.** npm turns a `401` into a one-time password or
+  web login prompt. A caller without a matching rule gets `403` with
+  `forbidden: no npm:<name> read rule` (or `write`), and an upstream `401`
+  becomes a `502`. The `_authToken` clients send is stripped and ignored.
+- Upstream tarballs are checked against the version's declared `integrity`
+  before they are cached, by SHA-512 when it declares one and otherwise by
+  SHA-1 (an `integrity` with only `sha1`, or a hex `shasum`). Versions with neither
+  are dropped from served packuments. Old versions that declare only SHA-1
+  are therefore verified by SHA-1 alone, which trusts the upstream not to
+  serve a crafted collision. A tarball whose SHA256 differs from the first
+  one recorded for its version is served, logged at warn and listed on the
+  status page.
+- Tarball URLs from upstream must be on the source's `fetch_hosts`, or the
+  version is dropped. Served `dist.tarball` URLs point at tspackages and
+  carry no source.
+- No package code runs on the server. Lifecycle scripts and
+  `bundleDependencies` are stored as published. Publish-time provenance
+  bundles (`--provenance`) are stored and recorded, not served; a
+  `registry` source passes `dist.attestations` and the signing keys through.
+
+Upstream packuments and publish bodies aren't held whole in memory: they
+are parsed as streams, one version object at a time. A storage source's
+packument is rendered in memory, full and abbreviated, once per change and
+shared by concurrent reads; past 64MiB either way, reads of the package
+fail and the status page names it. The caps:
+
+| Parser | Input | Caps |
+|---|---|---|
+| Names and paths | request paths | names of at most 156 bytes (one escaped storage key segment), fixed segment counts |
+| Versions | publish, request paths | strict SemVer 2.0.0, 156 bytes |
+| dist-tags | publish body, `npm dist-tag` | 64 bytes of `[a-z0-9._-]`, not a version or range; 100 tags per package |
+| Upstream packument | registry source | 256MiB, 200,000 versions, 4MiB per version, nesting 64, keys of 1KiB |
+| Upstream `dist-tags`, `time` | registry source | `dist-tags` 2MiB and 1,000 entries, `time` 32MiB; over either, the packument fails |
+| Storage packument | storage source | 64MiB rendered, full and abbreviated, 4MiB per version |
+| Publish body | client | `max_upload_bytes` × 4/3 + 2MiB, one version, one tarball of at most `max_upload_bytes`, a provenance bundle of at most 1MiB |
+| `package.json` | published tarball | 1MiB, nesting 64 |
+| Tarball | publish | the `archive` limits of every upload |
+| `integrity` | upstream, client | 1KiB, `sha512` and `sha1` only |
+
+## Maven
+
+- Coordinates are case-sensitive, but claims and `maven:` rules match the
+  lowercased `groupId:artifactId`, so `com.Acme:lib` can't slip past a
+  `com.acme` claim. Claims and rules accept `*`, `<group>` or
+  `<group>:<artifact>`: the group dotted segments of `[a-z0-9_-]` whose
+  last segment may be `*`, the artifact `[a-z0-9._-]` and `*`; anything
+  else is a config error, or a rule that grants nothing. `com.acme.*`
+  doesn't cover `com.acme`. A storage source refuses a deploy whose
+  coordinates differ from an existing artifact's only in case (`409`).
+- Configure clients with tspackages as their only repository (Maven
+  `<mirrorOf>*</mirrorOf>`, a single Gradle `maven { }` repository, or
+  `exclusiveContent` for private groups). Both clients try the next
+  repository after a `403`, so a second repository with the same
+  coordinates would serve a denied caller the public artifact.
+- **Private coordinates never reach an upstream.** A claimed artifact is
+  looked up only on its claiming sources, through files, POMs, checksums
+  and metadata alike. A `maven-metadata.xml` path names either an
+  artifact (`com/acme/lib`: `com.acme:lib`) or a group (`com.acme.lib`);
+  it counts as claimed when either reading matches a claim, or when it
+  sits in a version directory of a claimed artifact
+  (`com/acme/lib/1.0/maven-metadata.xml` under a `com.acme:lib` claim).
+  Group-level metadata lists a group's plugins, so reading it needs a rule
+  for the whole group (`maven:com.acme.lib`, `maven:com.acme.lib:*`,
+  `maven:com.acme.*`); when both readings are claimed, the group level's
+  sources are asked only for a caller that may read the group too. An
+  unclaimed path is granted by a rule for either reading. A one-segment
+  group's `acme/maven-metadata.xml` has only the group reading. Upstream
+  URLs are built only from a parsed and re-serialized path.
+- **Checksums describe the bytes served.** tspackages generates `.sha1`,
+  `.md5`, `.sha256`, `.sha512` and the `X-Checksum-Sha1`, `X-Checksum-Md5`
+  and `ETag` headers from the bytes it stores or verified; uploaded
+  checksums are compared with the file (`400` on a mismatch) and
+  discarded. Uploaded `maven-metadata.xml` is checked for the deployed
+  coordinates and discarded; tspackages serves metadata it generates from
+  stored POMs. Checksums of uploaded metadata are checked for form only,
+  since the metadata they describe is gone by the time they arrive.
+- A release file never changes bytes. The same bytes deployed again
+  succeed; other bytes are `409`. Timestamped SNAPSHOT files
+  (`lib-1.0-20261123.101010-3.jar`) are served immutable, so they are
+  written once the same way. Other SNAPSHOT files may be overwritten, and
+  each overwrite is audited with the replaced SHA256. There is no delete
+  (`405`).
+- **Deployed POMs bind their coordinates.** A POM's `groupId`,
+  `artifactId` and `version` (or its parent's) must equal the path's, and
+  a `${…}` in them is refused. Elements with a namespace prefix or a
+  namespace other than Maven's are refused, since Maven's own reader
+  ignores them and could see other coordinates than tspackages. A
+  `.module` file must name the same coordinates, and its files must be in
+  the same version directory. Everything else (jars, sources, signatures)
+  is stored as uploaded, without inspection.
+- **No response is a `401`.** A caller without a matching rule gets `403`
+  with `forbidden: no maven:<groupId>:<artifactId> read rule` (or `write`),
+  and an upstream `401` becomes a `502`. Clients need no `<server>` entry or
+  `credentials`, and any `Authorization` header is stripped. A deploy
+  needs a read rule as well as a write rule, because both clients read
+  `maven-metadata.xml` while they deploy; write still doesn't imply read.
+- Upstream files are verified against the upstream's `<file>.sha1` by the
+  relay before they are cached: by SHA-1 alone, which trusts the upstream
+  not to serve a crafted collision. A file whose SHA256 differs from the
+  first one recorded for it is served, logged at warn and listed on the
+  status page. Without an upstream `.sha1`, a missing file is `404`, any
+  other file `502`, except signatures (`.asc`, `.sigstore`,
+  `.sigstore.json`), for which Maven Central often publishes no checksum,
+  are streamed uncached and unverified, up to 64KiB, without
+  checksum headers. A signature is checked by the client against its
+  signer's key; tspackages can't vouch for one.
+- No XML document can expand, recurse or load anything. POMs and
+  `maven-metadata.xml`, uploaded or upstream, are refused with a DTD, an
+  entity declaration or a processing instruction other than the XML
+  declaration, before they are decoded. Upstream metadata is passed
+  through byte for byte once it has been checked.
+- No artifact code runs on the server, and no plugin or build either.
+
+Uploads are spooled to disk before inspection, and XML and JSON are read
+whole only up to their caps. The caps:
+
+| Parser | Input | Caps |
+|---|---|---|
+| Paths | request paths | segments and coordinate parts of at most 156 bytes, a `groupId` of at most 156, classifiers 64, extensions 32 |
+| Storage keys | deploys to a storage source | file names of at most 153 bytes, `groupId:artifactId` of at most 156 (each is one escaped key segment) |
+| XML (POM, `maven-metadata.xml`) | deploys, upstream metadata | 1MiB uploaded, 4MiB upstream; depth 32, 10,000 elements, no DTD, entities or processing instructions |
+| `.module` JSON | deploys | 1MiB, nesting 32 |
+| Checksum files | deploys, upstream `.sha1` | 1KiB, first line |
+| Signatures | deploys, upstream without `.sha1` | 64KiB |
+| Other files | deploys, upstream | `max_upload_bytes`, `max_artifact_bytes` |
+| Version ordering | generated metadata | versions of at most 156 bytes |

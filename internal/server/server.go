@@ -15,6 +15,7 @@ import (
 	"github.com/radiergummi/tspackages/internal/archive"
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/ecosystem"
+	"github.com/radiergummi/tspackages/internal/ecosystem/maven"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/identity"
 	"github.com/radiergummi/tspackages/internal/limits"
@@ -70,7 +71,7 @@ type built struct {
 var builders = []struct {
 	name  string
 	build func(sh *shared, e config.Ecosystem) (built, error)
-}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}}
+}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}, {"npm", buildNPM}, {"maven", buildMaven}}
 
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}
@@ -168,7 +169,7 @@ func Build(ctx context.Context, cfg *config.Config, who identity.Whoiser, log *s
 		Moved: pinStore.Moved, Sections: sections, Ready: stores.ready,
 	}).Mount(mux)
 
-	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(mux))
+	handler := identity.Middleware(who, peercap.Cap(cfg.Tailscale.Capability), log)(limiter.Middleware()(maven.CollapseSlashes(mux)))
 	start := func(ctx context.Context) {
 		var wg sync.WaitGroup
 		for _, run := range loops {

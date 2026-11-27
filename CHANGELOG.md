@@ -15,6 +15,36 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   against sum.golang.org before caching. The status page lists the `go env`
   settings (`GONOSUMDB` from the git sources), skipped, refused and moved
   tags, and the checksum database's state.
+- An npm registry at `/npm/` for npm 11 and pnpm 12: packuments (full and
+  abbreviated), tarballs, `npm publish`, `pnpm publish` and `npm dist-tag`.
+  Sources: `storage`, whose version metadata comes from the `package.json`
+  inside the published tarball (packuments of at most 64MiB), and
+  `registry` for `registry.npmjs.org` pass-through. Clients need only `registry=` and a placeholder
+  `_authToken` in `.npmrc`; lockfiles written against registry.npmjs.org
+  install unchanged. Unpublish and deprecate answer `405`, and `npm audit`
+  gets `404` so private names never reach registry.npmjs.org. Each
+  dist-tag move is audited before it's written, with an `attempt` ID that
+  a `dist-tag-commit` record confirms once the write took effect. The
+  status page lists the `.npmrc` settings and upstream tarballs that
+  changed.
+- The relay verifies SHA-512 digests: npm tarballs from a `registry`
+  source are checked against the declared `integrity` (SHA-512, or SHA-1
+  for old versions that declare nothing else) before they are cached.
+- A Maven repository at `/maven/` for Maven 3 and Gradle 9: artifacts,
+  POMs, `.module` files, signatures, checksums and `maven-metadata.xml`,
+  `mvn deploy` and Gradle's `maven-publish`, releases and SNAPSHOT versions.
+  Sources: `storage`, which writes release and timestamped SNAPSHOT files
+  once, generates
+  `maven-metadata.xml` and the `.sha1`, `.md5`, `.sha256` and `.sha512`
+  files, and checks uploaded checksums and POM coordinates; and `registry`
+  for Maven Central pass-through, whose files are checked against the
+  upstream's `.sha1` before they are cached (a release file's `.sha1` is
+  fetched once, as is a timestamped SNAPSHOT file's). Clients need one
+  mirror and no `<server>` entry or `credentials`. Reading group-level
+  `maven-metadata.xml` (a group's plugin list) needs a rule for the whole
+  group, `maven:<group>` or `maven:<group>:*`. The status page lists the
+  `settings.xml`, `distributionManagement` and Gradle settings, and
+  upstream release and timestamped files that changed.
 
 ### Changed
 
