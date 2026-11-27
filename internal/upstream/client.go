@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ var (
 	ErrDigestMismatch   = errors.New("upstream digest mismatch")
 	ErrUserinfo         = errors.New("upstream url must not contain userinfo")
 	ErrSchemeNotAllowed = errors.New("upstream scheme not allowed")
+	ErrTailnetDialer    = errors.New("upstream tailnet host has no tailnet dialer")
 )
 
 const (
@@ -75,12 +77,19 @@ type Options struct {
 	// AllowPrivateForTesting permits the http scheme and loopback/private
 	// addresses. For tests only; never set it from configuration.
 	AllowPrivateForTesting bool
+	// TailnetHosts are dialled through TailnetDial instead of the system
+	// network. Entries match like FetchHosts. The connection's remote address
+	// must be in a Tailscale range, else it is closed and refused.
+	TailnetHosts []string
+	TailnetDial  func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 type Client struct {
 	hosts        []string
 	creds        map[string]config.Credential
 	allowPrivate bool
+	tailnetHosts []string
+	tailnetDial  func(ctx context.Context, network, addr string) (net.Conn, error)
 	http         *http.Client
 }
 
@@ -88,6 +97,8 @@ func New(o Options) *Client {
 	c := &Client{
 		hosts:        o.FetchHosts,
 		allowPrivate: o.AllowPrivateForTesting,
+		tailnetHosts: o.TailnetHosts,
+		tailnetDial:  o.TailnetDial,
 	}
 	c.creds = make(map[string]config.Credential, len(o.Credentials))
 	for h, cr := range o.Credentials {
@@ -103,7 +114,7 @@ func New(o Options) *Client {
 			// No proxy: it would connect on our behalf and bypass the
 			// dial-time address check.
 			Proxy:                 nil,
-			DialContext:           dialer.DialContext,
+			DialContext:           c.dialContext(dialer),
 			ForceAttemptHTTP2:     true,
 			TLSHandshakeTimeout:   timeout,
 			ResponseHeaderTimeout: timeout,
@@ -113,6 +124,48 @@ func New(o Options) *Client {
 		CheckRedirect: c.checkRedirect,
 	}
 	return c
+}
+
+// dialContext sends tailnet hosts through TailnetDial and everything else
+// through dialer, whose control hook checks the resolved address.
+func (c *Client) dialContext(dialer *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !c.isTailnetHost(addr) {
+			return dialer.DialContext(ctx, network, addr)
+		}
+		if c.tailnetDial == nil {
+			return nil, fmt.Errorf("%w: %s", ErrTailnetDialer, addr)
+		}
+		conn, err := c.tailnetDial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// A tsnet dial bypasses net.Dialer.Control, so check the connection
+		// that was actually established.
+		ap, perr := netip.ParseAddrPort(conn.RemoteAddr().String())
+		if perr != nil || !tailscaleAddr(ap.Addr()) {
+			conn.Close()
+			return nil, fmt.Errorf("%w: %s", ErrForbiddenAddress, conn.RemoteAddr())
+		}
+		return conn, nil
+	}
+}
+
+// isTailnetHost reports whether addr (host:port) is listed in TailnetHosts,
+// by host or by host:port.
+func (c *Client) isTailnetHost(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(c.tailnetHosts, func(h string) bool {
+		return strings.EqualFold(h, host) || strings.EqualFold(h, addr)
+	})
+}
+
+func tailscaleAddr(a netip.Addr) bool {
+	a = a.Unmap().WithZone("")
+	return cgnat.Contains(a) || tailscaleV6.Contains(a)
 }
 
 // control runs on the resolved IP right before connecting, so a hostname that
@@ -169,6 +222,7 @@ func nonUnicast(a netip.Addr) bool {
 }
 
 var (
+	tailscaleV6     = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 	cgnat           = netip.MustParsePrefix("100.64.0.0/10")
 	thisNetwork     = netip.MustParsePrefix("0.0.0.0/8")
 	benchmark       = netip.MustParsePrefix("198.18.0.0/15")
@@ -227,8 +281,19 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	return c.GetAccept(ctx, rawURL, "")
 }
 
-// GetAccept is Get with an Accept header ("" sends none).
+// GetAccept is Get with an Accept header ("" sends none). It adds the
+// credentials configured for the URL's exact host.
 func (c *Client) GetAccept(ctx context.Context, rawURL, accept string) (*http.Response, error) {
+	req, err := c.newGet(ctx, rawURL, accept)
+	if err != nil {
+		return nil, err
+	}
+	return c.Do(req)
+}
+
+// newGet builds a checked GET request carrying the host's configured
+// credentials.
+func (c *Client) newGet(ctx context.Context, rawURL, accept string) (*http.Request, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		// The parse error quotes the whole URL; keep only its cause.
@@ -254,6 +319,17 @@ func (c *Client) GetAccept(ctx context.Context, rawURL, accept string) (*http.Re
 		case cr.Username != "" || cr.Password != "":
 			req.SetBasicAuth(cr.Username, cr.Password)
 		}
+	}
+	return req, nil
+}
+
+// Do sends req as built: the caller sets its own headers, and the static
+// per-host credentials are not added. The URL must pass the scheme, allowlist
+// and userinfo checks, and redirects drop Authorization. The caller must close
+// the response body.
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if err := c.checkURL(req.URL); err != nil {
+		return nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -285,7 +361,22 @@ func (c *Client) OpenWithHeader(ctx context.Context, rawURL string, maxBytes int
 	if maxBytes <= 0 {
 		return nil, 0, nil, fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
 	}
-	resp, err := c.Get(ctx, rawURL)
+	req, err := c.newGet(ctx, rawURL, "")
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return c.OpenRequest(req, maxBytes)
+}
+
+// OpenRequest is Do with the status and size handling of Open: a non-2xx
+// answer is a *StatusError, a declared size above maxBytes is ErrTooLarge, and
+// the body fails with ErrTooLarge from Read once it exceeds maxBytes. It
+// returns the declared size and the response headers.
+func (c *Client) OpenRequest(req *http.Request, maxBytes int64) (io.ReadCloser, int64, http.Header, error) {
+	if maxBytes <= 0 {
+		return nil, 0, nil, fmt.Errorf("maxBytes must be positive, got %d", maxBytes)
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, 0, nil, err
 	}

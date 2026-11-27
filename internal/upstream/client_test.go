@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -560,6 +561,192 @@ func TestOpenWithHeader(t *testing.T) {
 	_, _, _, err = c.OpenWithHeader(ctx, s.URL+"/missing?X-Amz-Signature=secret", 10)
 	var se *StatusError
 	if !errors.Is(err, resolve.ErrNotFound) || !errors.As(err, &se) || strings.Contains(se.URL, "secret") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDoSendsCallerHeaders(t *testing.T) {
+	var gotAuth, gotAccept string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotAccept = r.Header.Get("Authorization"), r.Header.Get("Accept")
+	}))
+	defer s.Close()
+	c := testClient(Options{
+		FetchHosts:  []string{"127.0.0.1"},
+		Credentials: map[string]config.Credential{strings.TrimPrefix(s.URL, "http://"): {Bearer: "static"}},
+	})
+	req, _ := http.NewRequest(http.MethodGet, s.URL, nil)
+	req.Header.Set("Authorization", "Bearer mine")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotAuth != "Bearer mine" || gotAccept != "application/vnd.github+json" {
+		t.Fatalf("auth=%q accept=%q", gotAuth, gotAccept)
+	}
+
+	bad, _ := http.NewRequest(http.MethodGet, "http://other.test/x", nil)
+	if _, err := c.Do(bad); !errors.Is(err, ErrHostNotAllowed) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDoRedirectDropsAuthorization(t *testing.T) {
+	var gotAuth string
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	defer b.Close()
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, b.URL, http.StatusFound)
+	}))
+	defer a.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+	req, _ := http.NewRequest(http.MethodGet, a.URL, nil)
+	req.Header.Set("Authorization", "Bearer mine")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotAuth != "" {
+		t.Fatalf("redirect carried Authorization %q", gotAuth)
+	}
+}
+
+func TestOpenRequestCapsBody(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/declared" {
+			w.Header().Set("Content-Length", "11")
+		}
+		if r.URL.Path == "/chunked" {
+			w.(http.Flusher).Flush() // no Content-Length
+		}
+		_, _ = w.Write([]byte("12345678901"))
+	}))
+	defer s.Close()
+	c := testClient(Options{FetchHosts: []string{"127.0.0.1"}})
+
+	req, _ := http.NewRequest(http.MethodGet, s.URL+"/chunked", nil)
+	rc, _, _, err := c.OpenRequest(req, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.ReadAll(rc)
+	rc.Close()
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("read err = %v", err)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, s.URL+"/declared", nil)
+	if _, _, _, err := c.OpenRequest(req, 10); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("declared err = %v", err)
+	}
+}
+
+// remoteConn reports a chosen remote address, as a tsnet connection would.
+type remoteConn struct {
+	net.Conn
+	remote net.Addr
+	closed bool
+}
+
+func (c *remoteConn) RemoteAddr() net.Addr { return c.remote }
+func (c *remoteConn) Close() error         { c.closed = true; return c.Conn.Close() }
+
+// tailnetDial returns a dial func that serves one HTTP answer per connection
+// and records the addresses it was asked for and the conns it returned.
+func tailnetDial(remote string, addrs *[]string, conns *[]*remoteConn) func(context.Context, string, string) (net.Conn, error) {
+	return func(_ context.Context, _, addr string) (net.Conn, error) {
+		*addrs = append(*addrs, addr)
+		cl, sv := net.Pipe()
+		go func() {
+			defer sv.Close()
+			if _, err := http.ReadRequest(bufio.NewReader(sv)); err != nil {
+				return
+			}
+			_, _ = io.WriteString(sv, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+		}()
+		rc := &remoteConn{Conn: cl, remote: net.TCPAddrFromAddrPort(netip.MustParseAddrPort(remote))}
+		*conns = append(*conns, rc)
+		return rc, nil
+	}
+}
+
+func TestTailnetHostDialsThroughTailnetDial(t *testing.T) {
+	var addrs []string
+	var conns []*remoteConn
+	c := testClient(Options{
+		FetchHosts:   []string{"ghe.example", "127.0.0.1"},
+		TailnetHosts: []string{"GHE.example"},
+		TailnetDial:  tailnetDial("100.101.102.103:443", &addrs, &conns),
+	})
+	resp, err := c.Get(context.Background(), "http://ghe.example/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(addrs) != 1 || addrs[0] != "ghe.example:80" {
+		t.Fatalf("dialled %v", addrs)
+	}
+
+	s := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer s.Close()
+	resp, err = c.Get(context.Background(), s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(addrs) != 1 {
+		t.Fatalf("a non-tailnet host used TailnetDial: %v", addrs)
+	}
+}
+
+func TestTailnetDialRejectsNonTailscaleAddress(t *testing.T) {
+	for _, remote := range []string{"10.0.0.5:443", "192.168.1.1:443", "[fd00::1]:443"} {
+		var addrs []string
+		var conns []*remoteConn
+		c := testClient(Options{
+			FetchHosts:   []string{"ghe.example"},
+			TailnetHosts: []string{"ghe.example"},
+			TailnetDial:  tailnetDial(remote, &addrs, &conns),
+		})
+		_, err := c.Get(context.Background(), "http://ghe.example/x")
+		if !errors.Is(err, ErrForbiddenAddress) {
+			t.Fatalf("%s: err = %v", remote, err)
+		}
+		if len(conns) != 1 || !conns[0].closed {
+			t.Fatalf("%s: connection not closed", remote)
+		}
+	}
+
+	var addrs []string
+	var conns []*remoteConn
+	c := testClient(Options{
+		FetchHosts:   []string{"ghe.example"},
+		TailnetHosts: []string{"ghe.example"},
+		TailnetDial:  tailnetDial("[fd7a:115c:a1e0::1]:443", &addrs, &conns),
+	})
+	resp, err := c.Get(context.Background(), "http://ghe.example/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+}
+
+func TestTailnetHostWithoutDialer(t *testing.T) {
+	c := testClient(Options{FetchHosts: []string{"ghe.example"}, TailnetHosts: []string{"ghe.example"}})
+	if _, err := c.Get(context.Background(), "http://ghe.example/x"); !errors.Is(err, ErrTailnetDialer) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTailnetAddressStillForbiddenForOtherHosts(t *testing.T) {
+	c := New(Options{FetchHosts: []string{"100.64.0.1"}})
+	_, err := c.Get(context.Background(), "https://100.64.0.1/x")
+	if !errors.Is(err, ErrForbiddenAddress) {
 		t.Fatalf("err = %v", err)
 	}
 }
