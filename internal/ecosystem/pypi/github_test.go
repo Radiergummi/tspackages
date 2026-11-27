@@ -34,6 +34,8 @@ type fakeGH struct {
 	listErr  error
 	openErr  error
 	reset    time.Time
+	gate     chan struct{}  // non-nil: asset bodies block until it is closed
+	stall    map[int64]bool // these bodies send a byte, then nothing until ctx is done
 }
 
 func newFakeGH() *fakeGH {
@@ -55,7 +57,7 @@ func (f *fakeGH) Releases(_ context.Context, r githubapp.Repo) ([]githubapp.Rele
 	return append([]githubapp.Release(nil), f.releases[r.ID]...), nil
 }
 
-func (f *fakeGH) OpenAsset(_ context.Context, _ githubapp.Repo, id, _ int64) (io.ReadCloser, int64, error) {
+func (f *fakeGH) OpenAsset(ctx context.Context, _ githubapp.Repo, id, _ int64) (io.ReadCloser, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.opens[id]++
@@ -66,10 +68,35 @@ func (f *fakeGH) OpenAsset(_ context.Context, _ githubapp.Repo, id, _ int64) (io
 	if !ok {
 		return nil, 0, &upstream.StatusError{Code: 404, URL: "/assets"}
 	}
-	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
+	if f.stall[id] {
+		return io.NopCloser(io.MultiReader(bytes.NewReader(b[:1]), ctxReader{ctx})), int64(len(b)), nil
+	}
+	var r io.Reader = bytes.NewReader(b)
+	if f.gate != nil {
+		r = io.MultiReader(gateReader{f.gate}, r)
+	}
+	return io.NopCloser(r), int64(len(b)), nil
+}
+
+// ctxReader blocks until ctx is done.
+type ctxReader struct{ ctx context.Context }
+
+func (c ctxReader) Read([]byte) (int, error) {
+	<-c.ctx.Done()
+	return 0, c.ctx.Err()
+}
+
+// gateReader blocks until gate is closed, then is empty.
+type gateReader struct{ gate chan struct{} }
+
+func (g gateReader) Read([]byte) (int, error) {
+	<-g.gate
+	return 0, io.EOF
 }
 
 func (f *fakeGH) RateLimit() (int, time.Time) { return 0, f.reset }
+
+func (f *fakeGH) InstallationID() int64 { return 42 }
 
 func (f *fakeGH) openCount(id int64) int {
 	f.mu.Lock()
@@ -279,10 +306,8 @@ func TestGitHubHashesOldAssets(t *testing.T) {
 	e := newGHEnv(t)
 	e.api.publish(repoA, 1, "v1.0.0", 10, wheel1, bodyOne, false, t0)
 	e.mustPass(t)
-	if p, err := e.src.Project(ctxBg, "acme-lib"); err == nil {
-		t.Fatalf("an unhashed asset is listed: %+v", p)
-	} else if errors.Is(err, resolve.ErrNotFound) {
-		t.Fatalf("a name waiting for its hash is a miss: %v", err)
+	if p, err := e.src.Project(ctxBg, "acme-lib"); err != nil || len(p.Files) != 1 || p.Files[0].SHA256 != sha256Hex(bodyOne) {
+		t.Fatalf("the pass that hashed the asset does not list it: %+v, %v", p, err)
 	}
 	if n := e.api.openCount(10); n != 1 {
 		t.Fatalf("the pass opened the asset %d times", n)

@@ -18,7 +18,7 @@ type ghFile struct {
 }
 
 // GitHubSkip reports an asset left out of the index for a reason worth
-// showing: "unclaimed", "owned by <repo>" or "no digest yet".
+// showing: "owned by <repo>", "no digest yet" or "owner not decided yet".
 type GitHubSkip struct{ Repo, Release, Asset, Package, Reason string }
 
 // GitHubConflict reports a filename that two releases of the owning
@@ -41,6 +41,7 @@ type ghIndex struct {
 	Skipped   []GitHubSkip
 	Conflicts []GitHubConflict
 	NeedHash  []ghPending
+	Unclaimed int // wheels and sdists of names no claim covers
 }
 
 type ghCandidate struct {
@@ -55,8 +56,11 @@ type ghCandidate struct {
 // digests (a pin by asset ID) is used only when GitHub reports none. owners
 // maps a project to the ID of the repository that owns it; names without an
 // entry go to the repository whose counting asset is earliest (ties: lower
-// repository ID) and are returned for the caller to pin. The inputs are
-// read-only and the result does not depend on map order.
+// repository ID) and are returned for the caller to pin, unless an asset
+// without a digest from another repository is older (or as old, from a
+// lower repository ID): such a name has no owner until that asset is hashed,
+// and none of its files are listed. The inputs are read-only and the result
+// does not depend on map order.
 func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release, owners map[string]int64, digests map[int64]string) (ghIndex, map[string]githubapp.Repo) {
 	idx := ghIndex{Projects: map[string][]ghFile{}}
 	names := map[int64]string{}
@@ -85,14 +89,19 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 				}
 				skip := GitHubSkip{Repo: repo.FullName, Release: rel.Tag, Asset: a.Name, Package: pkg}
 				if !ghClaimed(claims, pkg) {
-					skip.Reason = "unclaimed"
-					idx.Skipped = append(idx.Skipped, skip)
+					idx.Unclaimed++
 					continue
 				}
 				c := ghCandidate{repo: repo, release: rel, asset: a, pkg: pkg}
 				sum, ok := strings.CutPrefix(a.Digest, "sha256:")
 				if !ok || !ghHex64(sum) {
 					sum = strings.TrimPrefix(digests[a.ID], "sha256:")
+				}
+				if id, ok := owners[pkg]; !ghHex64(sum) && ok && id != repo.ID {
+					// Never served, so never hashed.
+					skip.Reason = "owned by " + ghRepoName(names, id)
+					idx.Skipped = append(idx.Skipped, skip)
+					continue
 				}
 				if !ghHex64(sum) {
 					idx.NeedHash = append(idx.NeedHash, ghPending{Repo: repo, Asset: a, Package: pkg})
@@ -126,6 +135,12 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 			owner[pkg] = id
 			continue
 		}
+		if slices.ContainsFunc(idx.NeedHash, func(p ghPending) bool {
+			return p.Package == pkg && p.Repo.ID != c.repo.ID && (p.Asset.CreatedAt.Before(c.asset.CreatedAt) ||
+				(p.Asset.CreatedAt.Equal(c.asset.CreatedAt) && p.Repo.ID < c.repo.ID))
+		}) {
+			continue // an older asset may win once hashed
+		}
 		owner[pkg] = c.repo.ID
 		decided[pkg] = c.repo
 	}
@@ -133,13 +148,13 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 	byFile := map[[2]string][]ghCandidate{}
 	var keys [][2]string
 	for _, c := range cands {
-		if owner[c.pkg] != c.repo.ID {
-			who, ok := names[owner[c.pkg]]
-			if !ok {
-				who = fmt.Sprintf("repository %d", owner[c.pkg])
+		if id, ok := owner[c.pkg]; !ok || id != c.repo.ID {
+			reason := "owner not decided yet"
+			if ok {
+				reason = "owned by " + ghRepoName(names, id)
 			}
 			idx.Skipped = append(idx.Skipped, GitHubSkip{
-				Repo: c.repo.FullName, Release: c.release.Tag, Asset: c.asset.Name, Package: c.pkg, Reason: "owned by " + who,
+				Repo: c.repo.FullName, Release: c.release.Tag, Asset: c.asset.Name, Package: c.pkg, Reason: reason,
 			})
 			continue
 		}
@@ -179,6 +194,15 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 		idx.Projects[k[0]] = append(idx.Projects[k[0]], best.file)
 	}
 	return idx, decided
+}
+
+// ghRepoName is the full name of the listed repository id, else
+// "repository <id>".
+func ghRepoName(names map[int64]string, id int64) string {
+	if n, ok := names[id]; ok {
+		return n
+	}
+	return fmt.Sprintf("repository %d", id)
 }
 
 // ghParseAsset returns the normalised project name and canonical version of

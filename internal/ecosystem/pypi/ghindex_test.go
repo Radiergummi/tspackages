@@ -36,6 +36,7 @@ func TestBuildGHIndex(t *testing.T) {
 		wantNeed   []int64
 		wantOwners map[string]string
 		wantConf   []GitHubConflict
+		wantUncl   int
 	}{
 		{
 			name:   "filtering",
@@ -58,7 +59,7 @@ func TestBuildGHIndex(t *testing.T) {
 				}(),
 			}},
 			wantFiles:  map[string][]string{"acme-lib": {"acme_lib-1.0rc1-py3-none-any.whl=" + hexB}},
-			wantSkips:  []string{"requests/unclaimed"},
+			wantUncl:   1,
 			wantOwners: map[string]string{"acme-lib": "o/a"},
 		},
 		{
@@ -74,7 +75,8 @@ func TestBuildGHIndex(t *testing.T) {
 				"acme_lib-1.1-py3-none-any.whl=" + hexC,
 				"acme_lib-1.2-py3-none-any.whl=" + hexA,
 			}},
-			wantSkips:  []string{"acme-lib/no digest yet", "other/unclaimed"},
+			wantSkips:  []string{"acme-lib/no digest yet"},
+			wantUncl:   1,
 			wantNeed:   []int64{1},
 			wantOwners: map[string]string{"acme-lib": "o/a"},
 		},
@@ -115,16 +117,76 @@ func TestBuildGHIndex(t *testing.T) {
 			wantOwners: map[string]string{"acme-lib": "o/a"},
 		},
 		{
-			name:   "non-counting asset never decides the owner",
+			name:   "newer asset without a digest does not hold the owner back",
 			claims: []string{"*"},
 			repos: map[githubapp.Repo][]githubapp.Release{
-				repoA: {rel(1, "v1", at(1), asset(1, whl, "", at(1)))},
+				repoA: {rel(1, "v1", at(1), asset(1, whl, "", at(10)))},
 				repoB: {rel(2, "v1", at(1), asset(2, whl, "sha256:"+hexB, at(9)))},
 			},
 			wantFiles:  map[string][]string{"acme-lib": {whl + "=" + hexB}},
 			wantSkips:  []string{"acme-lib/no digest yet"},
 			wantNeed:   []int64{1},
 			wantOwners: map[string]string{"acme-lib": "o/b"},
+		},
+		{
+			// 2023 without a digest, 2026 with one: no owner until hashed.
+			name:   "older asset without a digest holds the owner back",
+			claims: []string{"*"},
+			repos: map[githubapp.Repo][]githubapp.Release{
+				repoA: {rel(1, "v1", at(1), asset(1, whl, "", time.Date(2023, 5, 1, 0, 0, 0, 0, time.UTC)))},
+				repoB: {rel(2, "v1", at(1), asset(2, whl, "sha256:"+hexB, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)))},
+			},
+			wantFiles: map[string][]string{},
+			wantSkips: []string{"acme-lib/no digest yet", "acme-lib/owner not decided yet"},
+			wantNeed:  []int64{1},
+		},
+		{
+			name:   "as old, from a lower repository ID, without a digest holds the owner back",
+			claims: []string{"*"},
+			repos: map[githubapp.Repo][]githubapp.Release{
+				repoA: {rel(1, "v1", at(1), asset(1, whl, "", at(9)))},
+				repoB: {rel(2, "v1", at(1), asset(2, whl, "sha256:"+hexB, at(9)))},
+			},
+			wantFiles: map[string][]string{},
+			wantSkips: []string{"acme-lib/no digest yet", "acme-lib/owner not decided yet"},
+			wantNeed:  []int64{1},
+		},
+		{
+			name:    "older asset once hashed owns",
+			claims:  []string{"*"},
+			digests: map[int64]string{1: hexA},
+			repos: map[githubapp.Repo][]githubapp.Release{
+				repoA: {rel(1, "v1", at(1), asset(1, whl, "", time.Date(2023, 5, 1, 0, 0, 0, 0, time.UTC)))},
+				repoB: {rel(2, "v1", at(1), asset(2, whl, "sha256:"+hexB, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)))},
+			},
+			wantFiles:  map[string][]string{"acme-lib": {whl + "=" + hexA}},
+			wantSkips:  []string{"acme-lib/owned by o/a"},
+			wantOwners: map[string]string{"acme-lib": "o/a"},
+		},
+		{
+			name:   "older asset without a digest of the same repository decides nothing else",
+			claims: []string{"*"},
+			repos: map[githubapp.Repo][]githubapp.Release{
+				repoB: {
+					rel(1, "v0", at(1), asset(1, "acme_lib-0.9-py3-none-any.whl", "", at(1))),
+					rel(2, "v1", at(9), asset(2, whl, "sha256:"+hexB, at(9))),
+				},
+			},
+			wantFiles:  map[string][]string{"acme-lib": {whl + "=" + hexB}},
+			wantSkips:  []string{"acme-lib/no digest yet"},
+			wantNeed:   []int64{1},
+			wantOwners: map[string]string{"acme-lib": "o/b"},
+		},
+		{
+			name:   "asset without a digest of a name owned elsewhere",
+			claims: []string{"*"},
+			owners: map[string]int64{"acme-lib": 2},
+			repos: map[githubapp.Repo][]githubapp.Release{
+				repoA: {rel(1, "v1", at(1), asset(1, whl, "", at(1)))},
+				repoB: {rel(2, "v1", at(1), asset(2, whl, "sha256:"+hexB, at(9)))},
+			},
+			wantFiles: map[string][]string{"acme-lib": {whl + "=" + hexB}},
+			wantSkips: []string{"acme-lib/owned by o/b"},
 		},
 		{
 			name:   "existing owner wins over older asset",
@@ -199,6 +261,9 @@ func TestBuildGHIndex(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotOwners, want) {
 				t.Errorf("new owners = %v, want %v", gotOwners, want)
+			}
+			if idx.Unclaimed != tc.wantUncl {
+				t.Errorf("unclaimed = %d, want %d", idx.Unclaimed, tc.wantUncl)
 			}
 			if !reflect.DeepEqual(idx.Conflicts, tc.wantConf) {
 				t.Errorf("conflicts = %v, want %v", idx.Conflicts, tc.wantConf)

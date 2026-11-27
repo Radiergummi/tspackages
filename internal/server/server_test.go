@@ -567,10 +567,48 @@ func TestBuildGitHubSource(t *testing.T) {
 		}
 	}
 	page := do(h, "GET", "/", nil).Body.String()
-	for _, want := range []string{"acme-lib", "acme/lib", "other-pkg", "other_pkg-1.0.0.tar.gz", "unclaimed", "indexed at "} {
+	for _, want := range []string{"acme-lib", "acme/lib", "indexed at ", "installation 2, 1 repositories granted", "1 unclaimed assets skipped"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("status page lacks %q", want)
 		}
+	}
+	if strings.Contains(page, "other_pkg-1.0.0.tar.gz") {
+		t.Error("status page lists an unclaimed asset")
+	}
+}
+
+// TestGitHubStatusFiltersByReadRules: the github tables' rows are shown only
+// to callers who may read their package.
+func TestGitHubStatusFiltersByReadRules(t *testing.T) {
+	api := githubFake(t)
+	cfg := githubConfig(t, api.URL+"/api/v3/")
+	who := whoByAddr{
+		"192.0.2.1:1": testutil.NewWho(testCap, `{"read":["pypi:acme-*"]}`),
+		"192.0.2.2:1": testutil.NewWho(testCap, `{"read":["pypi:other-*"]}`),
+	}
+	h, start, err := Build(t.Context(), cfg, who, loopbackTailnet, quiet, Hooks{AllowPrivateUpstreams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startLoops(t, start)
+	page := func(addr string) func() *httptest.ResponseRecorder {
+		return func() *httptest.ResponseRecorder {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = addr
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			return w
+		}
+	}
+	eventually(t, "the owner row shown to the acme reader", page("192.0.2.1:1"), func(w *httptest.ResponseRecorder) bool {
+		return strings.Contains(w.Body.String(), "acme/lib")
+	})
+	other := page("192.0.2.2:1")().Body.String()
+	if !strings.Contains(other, "GitHub release names") || !strings.Contains(other, "indexed at ") {
+		t.Fatalf("other reader's page lacks the github tables or the health row:\n%s", other)
+	}
+	if strings.Contains(other, "acme-lib") || strings.Contains(other, "acme/lib") {
+		t.Errorf("other reader sees the acme rows:\n%s", other)
 	}
 }
 

@@ -33,7 +33,12 @@ type GitHubAPI interface {
 	Releases(ctx context.Context, r githubapp.Repo) ([]githubapp.Release, error)
 	OpenAsset(ctx context.Context, r githubapp.Repo, assetID, maxBytes int64) (io.ReadCloser, int64, error)
 	RateLimit() (remaining int, reset time.Time)
+	InstallationID() int64
 }
+
+// ghHashIdle is how long a hash download may send nothing before it is
+// abandoned; the relay allows a download as long.
+const ghHashIdle = 2 * time.Minute
 
 // ghHashConcurrency bounds the downloads a pass makes to hash assets that
 // GitHub reports no digest for.
@@ -54,6 +59,7 @@ type GitHubSource struct {
 	poll        time.Duration
 	maxArtifact int64
 	log         *slog.Logger
+	hashIdle    time.Duration                        // replaced in tests
 	now         func() time.Time                     // replaced in tests
 	after       func(time.Duration) <-chan time.Time // replaced in tests
 
@@ -86,9 +92,10 @@ var _ Source = (*GitHubSource)(nil)
 // ghServed is the index a pass published.
 type ghServed struct {
 	ghIndex
-	unavailable map[string]bool   // projects with a conflict or an asset waiting for its hash
+	unavailable map[string]bool   // projects with a conflict, an asset waiting for its hash or a corrupt owner pin
 	owners      map[string]string // project -> owning repository's full name
 	backlog     int
+	repos       int       // repositories the installation is granted
 	at          time.Time // when it was published
 }
 
@@ -102,7 +109,7 @@ func NewGitHubSource(name string, claims []string, api GitHubAPI, apiURL string,
 	return &GitHubSource{
 		name: name, claims: claims, api: api, apiURL: strings.TrimRight(apiURL, "/") + "/",
 		pins: newGHPins(state, name, log), relay: rl, rec: rec, poll: poll, maxArtifact: maxArtifact, log: log,
-		now: time.Now, after: time.After, seen: map[[3]string]bool{},
+		hashIdle: ghHashIdle, now: time.Now, after: time.After, seen: map[[3]string]bool{},
 	}
 }
 
@@ -159,10 +166,11 @@ func (s *GitHubSource) pass(ctx context.Context) error {
 	return err
 }
 
-// index lists the releases, decides and pins new owners, hashes assets
-// without a digest and publishes the index. A failure before the index is
-// built keeps the previous one. A rate limit hit while hashing is returned
-// after the index is published.
+// index lists the releases, decides and pins new owners and publishes the
+// index; then it hashes the assets without a digest and publishes the index
+// again with their digests. A failure before the index is built keeps the
+// previous one. A rate limit hit while hashing is returned after the second
+// index is published.
 func (s *GitHubSource) index(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,13 +194,49 @@ func (s *GitHubSource) index(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read digest pins: %w", err)
 	}
+	corrupt := map[string]bool{}
+	idx, err := s.decide(ctx, listed, owners, digests, corrupt)
+	if err != nil {
+		return err
+	}
+	todo := ghHashTodo(idx.NeedHash, owners)
+	s.publish(idx, listed, owners, corrupt, len(todo))
+	if len(todo) == 0 {
+		return nil
+	}
+
+	pinned, backlog, hashErr := s.hashPending(ctx, todo)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	maps.Copy(digests, pinned)
+	idx, err = s.decide(ctx, listed, owners, digests, corrupt)
+	if err != nil {
+		return err
+	}
+	s.publish(idx, listed, owners, corrupt, backlog)
+	return hashErr
+}
+
+// decide builds the index and pins the owners it decides, adding them to
+// owners. A name whose owner pin is corrupt goes to corrupt (logged the first
+// time) and is withheld by publish.
+func (s *GitHubSource) decide(ctx context.Context, listed map[githubapp.Repo][]githubapp.Release, owners map[string]int64, digests map[int64]string, corrupt map[string]bool) (ghIndex, error) {
 	idx, decided := buildGHIndex(s.claims, listed, owners, digests)
 	lost := false
 	for _, name := range sortedKeys(decided) {
+		if corrupt[name] {
+			continue
+		}
 		repo := decided[name]
 		id, err := s.pins.PinOwner(ctx, name, repo)
+		if errors.Is(err, errCorruptGHPin) {
+			corrupt[name] = true
+			s.log.Warn("pypi github: name unavailable: its owner pin is corrupt", "source", s.name, "package", name, "error", err)
+			continue
+		}
 		if err != nil {
-			return fmt.Errorf("pin owner of %s: %w", name, err)
+			return ghIndex{}, fmt.Errorf("pin owner of %s: %w", name, err)
 		}
 		owners[name] = id
 		lost = lost || id != repo.ID
@@ -201,12 +245,20 @@ func (s *GitHubSource) index(ctx context.Context) error {
 		// Another writer pinned a name first: its pin decides.
 		idx, _ = buildGHIndex(s.claims, listed, owners, digests)
 	}
-	backlog, hashErr := s.hashPending(ctx, idx.NeedHash, owners)
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
+	return idx, nil
+}
 
-	served := &ghServed{ghIndex: idx, unavailable: map[string]bool{}, owners: map[string]string{}, backlog: backlog, at: s.now()}
+// publish serves idx; backlog is the number of assets waiting for a hash.
+func (s *GitHubSource) publish(idx ghIndex, listed map[githubapp.Repo][]githubapp.Release, owners map[string]int64, corrupt map[string]bool, backlog int) {
+	served := &ghServed{
+		ghIndex: idx, unavailable: map[string]bool{}, owners: map[string]string{},
+		backlog: backlog, repos: len(listed), at: s.now(),
+	}
+	served.Projects = maps.Clone(idx.Projects)
+	for name := range corrupt {
+		delete(served.Projects, name)
+		served.unavailable[name] = true
+	}
 	for _, c := range idx.Conflicts {
 		served.unavailable[c.Package] = true
 	}
@@ -220,22 +272,14 @@ func (s *GitHubSource) index(ctx context.Context) error {
 		names[r.ID] = r.FullName
 	}
 	for name, id := range owners {
-		who, ok := names[id]
-		if !ok {
-			who = "repository " + strconv.FormatInt(id, 10)
-		}
-		served.owners[name] = who
+		served.owners[name] = ghRepoName(names, id)
 	}
 	s.idx.Store(served)
-	return hashErr
 }
 
-// hashPending downloads the assets without a digest once, hashes them and
-// pins the digest, skipping those of names another repository owns (they are
-// never served). It returns how many are still without a pin. A rate limit
-// stops the remaining downloads and is returned; other failures are logged
-// and retried by the next pass.
-func (s *GitHubSource) hashPending(ctx context.Context, pending []ghPending, owners map[string]int64) (int, error) {
+// ghHashTodo returns the assets without a digest worth hashing, once each:
+// not those of names another repository owns (they are never served).
+func ghHashTodo(pending []ghPending, owners map[string]int64) []ghPending {
 	var todo []ghPending
 	seen := map[int64]bool{}
 	for _, p := range pending {
@@ -245,16 +289,26 @@ func (s *GitHubSource) hashPending(ctx context.Context, pending []ghPending, own
 		seen[p.Asset.ID] = true
 		todo = append(todo, p)
 	}
-	var left atomic.Int64
-	left.Store(int64(len(todo)))
+	return todo
+}
+
+// hashPending downloads the assets in todo once, hashes them and pins their
+// digests. It returns the pinned digests by asset ID and how many are still
+// without a pin. A rate limit stops the remaining downloads and is returned;
+// other failures are logged and retried by the next pass.
+func (s *GitHubSource) hashPending(ctx context.Context, todo []ghPending) (map[int64]string, int, error) {
+	var mu sync.Mutex
+	pinned := map[int64]string{}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(ghHashConcurrency)
 	for _, p := range todo {
 		g.Go(func() error {
-			err := s.hashAsset(gctx, p)
+			sum, err := s.hashAsset(gctx, p)
 			switch {
 			case err == nil:
-				left.Add(-1)
+				mu.Lock()
+				pinned[p.Asset.ID] = sum
+				mu.Unlock()
 			case errors.Is(err, githubapp.ErrRateLimited):
 				return err
 			case gctx.Err() == nil:
@@ -268,24 +322,52 @@ func (s *GitHubSource) hashPending(ctx context.Context, pending []ghPending, own
 	if err != nil {
 		err = fmt.Errorf("hash assets: %w", err)
 	}
-	return int(left.Load()), err
+	return pinned, len(todo) - len(pinned), err
 }
 
-// hashAsset streams an asset through sha256 and pins the digest. Nothing is
-// cached: the bytes are unverified until pinned.
-func (s *GitHubSource) hashAsset(ctx context.Context, p ghPending) error {
-	body, _, err := s.api.OpenAsset(ctx, p.Repo, p.Asset.ID, s.maxArtifact)
-	if err != nil {
-		return err
-	}
-	defer body.Close()
+// errHashStalled is a hash download that sent nothing for s.hashIdle.
+var errHashStalled = errors.New("download stalled")
+
+// hashAsset streams an asset through sha256, pins the digest and returns the
+// pinned one. Nothing is cached: the bytes are unverified until pinned. A
+// download that sends nothing for s.hashIdle is abandoned, as the relay
+// abandons a stalled upstream.
+func (s *GitHubSource) hashAsset(ctx context.Context, p ghPending) (string, error) {
+	dctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stalled atomic.Bool
+	timer := time.AfterFunc(s.hashIdle, func() { stalled.Store(true); cancel() })
+	defer timer.Stop()
 	h := sha256.New()
-	n, err := io.Copy(h, body)
-	if err != nil {
-		return err
+	n, err := func() (int64, error) {
+		body, _, err := s.api.OpenAsset(dctx, p.Repo, p.Asset.ID, s.maxArtifact)
+		if err != nil {
+			return 0, err
+		}
+		defer body.Close()
+		return io.Copy(h, ghIdleReader{body, func() { timer.Reset(s.hashIdle) }})
+	}()
+	if err != nil && stalled.Load() {
+		return "", errHashStalled
 	}
-	_, err = s.pins.PinDigest(ctx, p.Asset.ID, hex.EncodeToString(h.Sum(nil)), n)
-	return err
+	if err != nil {
+		return "", err
+	}
+	return s.pins.PinDigest(ctx, p.Asset.ID, hex.EncodeToString(h.Sum(nil)), n)
+}
+
+// ghIdleReader calls progress after every read that returned bytes.
+type ghIdleReader struct {
+	r        io.Reader
+	progress func()
+}
+
+func (r ghIdleReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.progress()
+	}
+	return n, err
 }
 
 // files returns the indexed files of name.
@@ -463,7 +545,10 @@ func (s *GitHubSource) Backlog() int {
 	return 0
 }
 
-// Health reports the last pass.
+// Health reports the last pass, the installation and the number of
+// repositories it is granted, the hashing backlog and the number of
+// unclaimed assets skipped. Repository names are left out: they may be
+// private.
 func (s *GitHubSource) Health(context.Context) []metrics.Health {
 	s.hmu.Lock()
 	err := s.passErr
@@ -484,14 +569,23 @@ func (s *GitHubSource) Health(context.Context) []metrics.Health {
 		if !reset.IsZero() {
 			h.Detail = "rate limited until " + reset.UTC().Format(time.RFC3339) + "; " + kept
 		}
+	case errors.Is(err, githubapp.ErrAuthFailed):
+		h.Detail = "GitHub App authentication failed; " + kept
 	case err != nil:
 		h.Detail = "indexing failed; " + kept
 	case st == nil:
 		h.Detail = "not indexed yet"
 	default:
 		h.OK, h.Detail = true, "indexed at "+st.at.UTC().Format(time.RFC3339)
+	}
+	h.Detail += "; installation " + strconv.FormatInt(s.api.InstallationID(), 10)
+	if st != nil {
+		h.Detail += fmt.Sprintf(", %d repositories granted", st.repos)
 		if st.backlog > 0 {
 			h.Detail += fmt.Sprintf("; %d assets waiting to be hashed", st.backlog)
+		}
+		if st.Unclaimed > 0 {
+			h.Detail += fmt.Sprintf("; %d unclaimed assets skipped", st.Unclaimed)
 		}
 	}
 	return []metrics.Health{h}
