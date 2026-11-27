@@ -9,3 +9,5 @@
 /.vale/styles/*
 !/.vale/styles/Tspackages/
 !/.vale/styles/config/
+# The Vale binary `make lint-docs` fetches.
+/.vale/bin/

@@ -62,8 +62,27 @@ build:
 DOCS := $(wildcard docs/*.md) README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md
 VALE_FLAGS ?=
 
-lint-docs: .vale/styles/.synced
-	vale $(VALE_FLAGS) $(DOCS)
+# The Vale release lint-docs runs, by SHA-256 per platform. Dictionaries change
+# between releases, so a Vale from PATH could pass words CI's fails.
+VALE_VERSION := 3.22.0
+VALE_PLATFORM := $(shell uname -s)_$(shell uname -m)
+VALE_ASSET_Linux_x86_64   := Linux_64-bit=52f5cd0314a1b7384cac6aa102a68193977312f6ba9c9f3ae001b5deec8e3a10
+VALE_ASSET_Linux_aarch64  := Linux_arm64=18f57dfe023e804159b2bb307f00274d801d426c518a8a0cc25d4f98bf035e73
+VALE_ASSET_Darwin_x86_64  := macOS_64-bit=e54a94b86d45f8bdd751f31ad3d06d6ae04da1154e720a006ed0f2e03a675fff
+VALE_ASSET_Darwin_arm64   := macOS_arm64=7dea014d6586101f6f695105f2e8825b7297236df0af9e68e193bcb4e4d25f7e
+VALE_ASSET := $(VALE_ASSET_$(VALE_PLATFORM))
+VALE := .vale/bin/vale-$(VALE_VERSION)
+
+lint-docs: $(VALE) .vale/styles/.synced
+	$(VALE) $(VALE_FLAGS) $(DOCS)
+
+$(VALE):
+	@set -e; asset='$(VALE_ASSET)'; \
+	[ -n "$$asset" ] || { echo "no pinned Vale build for $(VALE_PLATFORM)" >&2; exit 1; }; \
+	tgz=$$(mktemp); \
+	curl -fsSL -o "$$tgz" "https://github.com/vale-cli/vale/releases/download/v$(VALE_VERSION)/vale_$(VALE_VERSION)_$${asset%=*}.tar.gz"; \
+	echo "$${asset##*=}  $$tgz" | sha256sum -c - >/dev/null || { echo "checksum mismatch: Vale $(VALE_VERSION)" >&2; rm -f "$$tgz"; exit 1; }; \
+	mkdir -p $(@D); tar -xzf "$$tgz" -C $(@D) vale; rm -f "$$tgz"; mv $(@D)/vale $@
 
 # The style packages .vale.ini names, by URL and SHA-256. Fetched here rather
 # than by `vale sync`, which checks nothing it downloads.

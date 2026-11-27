@@ -28,8 +28,9 @@ that. A change must keep them, or update them in the same pull request:
 
 You need Go (the version in `go.mod`), git, and for the integration test
 Composer 2.x. `make check` runs what CI runs, and needs
-[golangci-lint](https://golangci-lint.run), [actionlint](https://github.com/rhysd/actionlint),
-[zizmor](https://zizmor.sh) and [Vale](https://vale.sh):
+[golangci-lint](https://golangci-lint.run), [actionlint](https://github.com/rhysd/actionlint)
+and [zizmor](https://zizmor.sh); it fetches the pinned [Vale](https://vale.sh) release
+itself:
 
 ```sh
 make check         # lint, formatting, vet and the race-enabled tests
