@@ -346,7 +346,7 @@ Metrics:
   oldest last successful sync among a git source's remotes, `0` until every
   remote has synced at least once. Alert when it falls more than a few poll intervals behind.
 - `tspackages_github_index_passes_total{source,result}`,
-  `tspackages_github_api_requests_total{source,code}` and
+  `tspackages_github_api_requests_total{source,status}` and
   `tspackages_github_ratelimit_remaining{source}`: the passes of a PyPI
   `github` source by `ok` or `error`, its GitHub API requests by status and
   the requests left in the rate-limit window as of its last pass. Alert on
