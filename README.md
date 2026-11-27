@@ -6,7 +6,7 @@ from sources (another registry, its own storage, or a git remote). Every
 request is authorized by Tailscale identity, so clients hold no registry
 credentials.
 
-Composer, PyPI, Go, npm and Maven ship today. OCI follows. Read
+Composer, PyPI, Go, npm, Maven and apt ship today. OCI follows. Read
 [docs/security.md](docs/security.md) before you deploy, and
 [docs/operations.md](docs/operations.md) for backups, upgrades and monitoring.
 
@@ -313,6 +313,58 @@ file and checks the ones clients upload. Deleting answers `405`. See
 [docs/operations.md](docs/operations.md#maven) for deploys, SNAPSHOT
 versions and Gradle plugins.
 
+## apt sources
+
+`/apt/<source>/` serves one apt repository per source: `dists/<suite>/`
+with signed `InRelease`, `Release` and `Release.gpg`, the `Packages`
+indexes and `pool/`. apt has `storage` and `registry` sources; there is no
+`git` source. Each source is its own repository, and a client lists one
+line or stanza per source.
+
+```yaml
+ecosystems:
+  apt:
+    signing_key: ${file:/etc/tspackages/apt-signing.asc}
+    sources:
+      - {name: hosted, type: storage, store: main, claims: ["acme-*"]}
+      - name: debian
+        type: registry
+        url: https://deb.debian.org/debian/
+        fetch_hosts: [deb.debian.org]
+        keyring: /usr/share/keyrings/debian-archive-keyring.gpg
+        suites: [bookworm, bookworm-updates]
+        components: [main]
+        architectures: [amd64, arm64]
+```
+
+| Type | Keys | Does |
+|------|------|------|
+| `storage` | `store`, `claims` | Hosts uploaded `.deb` files in suites and components named in the upload URL, and generates and signs their indexes. |
+| `registry` | `url` (`https://`, ending in `/`), `fetch_hosts`, `keyring`, `suites`, `components`, `architectures`, `credentials`, `download_credentials`, `metadata_ttl` | Pass-through to an upstream apt repository. Takes no claims. The upstream's `Release` is checked against `keyring` and served unchanged, and files are checked against the hashes it lists before they are cached. Only the configured suites, components and architectures are served. |
+
+A storage claim is a pattern of `[a-z0-9+.-]` and `*` matched against the
+package name; it can't be a bare `*`. Claims are public: `/apt/preferences`
+lists them, so don't put a secret product name into one.
+`signing_key` is the armored private key that signs the generated
+repositories, required when a `storage` source exists, with an optional
+`signing_key_passphrase`. It must be a legacy (v4) Ed25519 or an RSA key of
+3072 bits or more. `keyring` is the path of an armored or binary OpenPGP
+public keyring, read at startup.
+
+apt merges the versions of every repository it knows, so tspackages can't
+keep a private name from being shadowed by a public one on the server. The
+generated preferences file does it on the client: it pins every claimed
+name to the claiming source and blocks it everywhere else. Clients need it
+(see [Client setup](#apt)). On a `registry` source, a name that a `storage`
+source claims is `404` and is never fetched upstream.
+
+A file is written once, keyed by package name, version without epoch and
+architecture: the same bytes again succeed (`201`, which also adds the file
+to another suite), other bytes are `409`. Deleting answers `405`. Indexes
+are generated for each caller and list only the packages the caller may
+read. See [docs/operations.md](docs/operations.md#apt) for the signing key
+and uploads.
+
 ## Client setup
 
 ### Composer
@@ -443,6 +495,40 @@ deploying. The status page shows the full snippets, including SNAPSHOT
 consumers, `distributionManagement` and Gradle's `publishing`; see also
 [docs/operations.md](docs/operations.md#maven).
 
+### apt
+
+Install the key and the pins, and add one stanza per source (the status
+page shows them with the host filled in). Each `storage` source needs the
+suite you upload to:
+
+```sh
+curl -fsSL https://registry.<tailnet>.ts.net/apt/key.asc -o /etc/apt/keyrings/tspackages.asc
+curl -fsSL https://registry.<tailnet>.ts.net/apt/preferences -o /etc/apt/preferences.d/tspackages.pref
+```
+
+```
+# /etc/apt/sources.list.d/tspackages.sources
+Types: deb
+URIs: https://registry.<tailnet>.ts.net/apt/hosted/
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/tspackages.asc
+```
+
+A `registry` source is the same stanza with the upstream's suites and
+components, and `Signed-By` pointing to the upstream's keyring (for
+Debian, `/usr/share/keyrings/debian-archive-keyring.gpg`): tspackages
+serves the upstream's own signed `Release`. A client without the
+preferences file isn't **protected** against a claimed name being
+shadowed by another repository. Upload a package with:
+
+```sh
+curl -fT acme-tool_1.0_amd64.deb https://registry.<tailnet>.ts.net/apt/hosted/stable/main/
+```
+
+Neither needs credentials. See
+[docs/operations.md](docs/operations.md#apt).
+
 ## Tailnet policy
 
 Humans read; each publishing repo gets its own CI tag with write on its own
@@ -474,12 +560,26 @@ when it leaves a request denied. `read` covers metadata and
 downloads, `write` covers publishing. Capabilities from several grants are
 unioned. The capability name is configurable (`tailscale.capability`).
 
+apt reads per package. A `storage` source's indexes need any `apt:` read
+rule and list only the packages the caller's rules match; a download needs
+a rule for its package, and answers `404` otherwise. On a `registry`
+source, any `apt:` read rule covers indexes and downloads. Machines that
+install public packages need only that, not `apt:*`, which would also open
+every hosted package. An upload needs a write rule for the package name:
+
+```hujson
+{"read": ["apt:acme-*"], "write": ["apt:acme-tool"]}
+```
+
+A write rule doesn't allow reading, and it covers every suite: rules that
+name a suite don't exist yet.
+
 ## Development
 
 ```sh
 make check         # golangci-lint, actionlint, zizmor, Vale, gofmt, vet, race tests
 make maven-seed    # once: the plugins the mvn tests need, from Maven Central
-make integration   # end-to-end with real Composer, pip, uv, twine, go, npm, pnpm, mvn and Gradle
+make integration   # end-to-end with real Composer, pip, uv, twine, go, npm, pnpm, mvn, Gradle and apt (Linux)
 make tailnet       # real tsnet nodes against an in-process control server
 make vuln          # govulncheck, failing on reachable findings
 ```

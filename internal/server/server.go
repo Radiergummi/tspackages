@@ -71,7 +71,7 @@ type built struct {
 var builders = []struct {
 	name  string
 	build func(sh *shared, e config.Ecosystem) (built, error)
-}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}, {"npm", buildNPM}, {"maven", buildMaven}}
+}{{"composer", buildComposer}, {"pypi", buildPyPI}, {"go", buildGo}, {"npm", buildNPM}, {"maven", buildMaven}, {"apt", buildAPT}}
 
 // onMirror is called for every mirror Build creates. Replaced in tests.
 var onMirror = func(*gitmirror.Mirror) {}

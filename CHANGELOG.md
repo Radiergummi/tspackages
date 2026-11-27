@@ -46,6 +46,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `settings.xml`, `distributionManagement` and Gradle settings, and
   upstream release and timestamped files that changed.
 
+- apt repositories at `/apt/<source>/`: hosted `.deb` uploads with
+  per-caller signed indexes, and verified pass-through of upstream apt
+  repositories. Clients install the key from `/apt/key.asc` and the pins
+  from `/apt/preferences`, which keep claimed names on their repository.
+  The status page lists the client setup, the signing key's fingerprint
+  and upstream files that changed.
+
 ### Changed
 
 - The status page has a section per ecosystem, each with its client

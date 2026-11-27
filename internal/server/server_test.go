@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/radiergummi/tspackages/internal/config"
 	"github.com/radiergummi/tspackages/internal/gitmirror"
 	"github.com/radiergummi/tspackages/internal/testutil"
@@ -460,5 +461,78 @@ func TestBuildMaven(t *testing.T) {
 	}
 	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/maven/") {
 		t.Fatalf("status page lacks the maven snippet: %d", w.Code)
+	}
+}
+
+func TestBuildAPT(t *testing.T) {
+	priv, _ := testutil.PGPKey(t, "apt")
+	// A binary keyring that ends in 0x0a, which ${file:} expansion would trim.
+	var bin []byte
+	for bin == nil || bin[len(bin)-1] != '\n' {
+		_, pub := testutil.PGPKey(t, "upstream")
+		blk, err := armor.Decode(strings.NewReader(pub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bin, err = io.ReadAll(blk.Body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keyringPath := filepath.Join(t.TempDir(), "keyring.gpg")
+	if err := os.WriteFile(keyringPath, bin, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fsConfig(t)
+	cfg.Ecosystems["apt"] = config.Ecosystem{
+		SigningKey: priv,
+		Sources: []config.Source{
+			{Name: "hosted", Type: "storage", Claims: []string{"example-*"}, Store: "main"},
+			{Name: "debian", Type: "registry", URL: "https://deb.debian.org/debian/", FetchHosts: []string{"deb.debian.org"},
+				Keyring: keyringPath, Suites: []string{"bookworm"}, Components: []string{"main"}, Architectures: []string{"amd64"}},
+		},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	h, start, err := Build(ctx, cfg, testutil.NewWho(testCap, `{"read":["apt:example-*"]}`), quiet, Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go start(ctx)
+	if w := do(h, "GET", "/apt/key.asc", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET /apt/key.asc = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/apt/hosted/") {
+		t.Fatalf("status page lacks the apt snippet: %d", w.Code)
+	}
+
+	cfg = fsConfig(t)
+	cfg.Ecosystems["apt"] = config.Ecosystem{
+		SigningKey: "not a key",
+		Sources:    []config.Source{{Name: "hosted", Type: "storage", Claims: []string{"example-*"}, Store: "main"}},
+	}
+	_, _, err = Build(ctx, cfg, testutil.NewWho(testCap, `{}`), quiet, Hooks{})
+	if err == nil || !strings.Contains(err.Error(), "ecosystems.apt.signing_key") {
+		t.Fatalf("bad signing key: err = %v", err)
+	}
+}
+
+func TestBuildAPTBadKeyring(t *testing.T) {
+	priv, _ := testutil.PGPKey(t, "apt")
+	for name, path := range map[string]string{"missing": filepath.Join(t.TempDir(), "none"), "garbage": func() string {
+		p := filepath.Join(t.TempDir(), "k")
+		if err := os.WriteFile(p, []byte("not a keyring"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}()} {
+		cfg := fsConfig(t)
+		cfg.Ecosystems["apt"] = config.Ecosystem{SigningKey: priv, Sources: []config.Source{
+			{Name: "debian", Type: "registry", URL: "https://deb.debian.org/debian/", FetchHosts: []string{"deb.debian.org"},
+				Keyring: path, Suites: []string{"bookworm"}, Components: []string{"main"}, Architectures: []string{"amd64"}},
+		}}
+		_, _, err := Build(t.Context(), cfg, testutil.NewWho(testCap, `{}`), quiet, Hooks{})
+		if err == nil || !strings.Contains(err.Error(), "ecosystems.apt.sources[debian].keyring") {
+			t.Fatalf("%s: err = %v", name, err)
+		}
 	}
 }

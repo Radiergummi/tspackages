@@ -106,3 +106,19 @@ ecosystems:
         type: registry
         url: https://repo.maven.apache.org/maven2/
         fetch_hosts: [repo.maven.apache.org]
+
+  apt:
+    signing_key: ${file:/etc/tspackages/apt-signing.asc}   # signs the Release files of storage sources
+    sources:
+      - name: hosted
+        type: storage
+        store: main
+        claims: ["example-*"]
+      - name: debian
+        type: registry
+        url: https://deb.debian.org/debian/
+        fetch_hosts: [deb.debian.org]
+        keyring: /usr/share/keyrings/debian-archive-keyring.gpg   # path; verifies the upstream's Release
+        suites: [bookworm, bookworm-updates]
+        components: [main]
+        architectures: [amd64, arm64]

@@ -367,3 +367,96 @@ whole only up to their caps. The caps:
 | Signatures | deploys, upstream without `.sha1` | 64KiB |
 | Other files | deploys, upstream | `max_upload_bytes`, `max_artifact_bytes` |
 | Version ordering | generated metadata | versions of at most 156 bytes |
+
+## apt
+
+- **Each source is its own repository, so resolution happens on the
+  client.** apt merges the versions of every repository it knows, ranked by
+  pin priority, so tspackages can't apply its usual rule that a claimed
+  name is resolved only from claiming sources. `/apt/preferences` renders
+  that rule for the client: each claimed name is pinned to
+  `o=tspackages,l=<source>` at priority 1001 and blocked (priority -1)
+  everywhere else. **A client without the preferences file isn't
+  protected** against a claimed name being shadowed by another repository,
+  which may offer a higher version. Pins match the Release's `Origin` and
+  `Label`, which a repository declares itself: a malicious repository the
+  client already trusts with root could claim `tspackages`, and nothing
+  here defends against that. Upstream `Release` files pass through
+  unchanged, so they carry tspackages' `Origin` only if the upstream is
+  hostile. Pins can't match the host, because `storage` and `registry`
+  sources share it. Pins match package names only: when a claimed
+  package has no candidate for a client (no read rule, or no version for
+  its architecture), a public package that declares `Provides: <claimed
+  name>` can satisfy a dependency on it.
+- **A name claimed by a `storage` source is never fetched upstream.** It
+  is `404` on every `registry` source, so clients that use the mirror
+  without the pins still don't get a public package of that name.
+  Registry sources take no claims, and apt has no unclaimed-source rule.
+- **Claims are public.** `/apt/preferences` lists every claim to any
+  caller with an `apt:` read rule, and the `404` on registry sources can be
+  probed. Claims and `apt:` rules are `*` or patterns of `[a-z0-9+.-]` and
+  `*` matched against the package name; a malformed claim is a config
+  error, a malformed rule grants nothing. A `storage` claim can't be a bare
+  `*`, since its pin would block every package of every other repository.
+  What stays hidden is which packages exist.
+- **Reads are per package.** A `storage` source's indexes need any `apt:`
+  read rule and list only the packages the caller's rules match; a
+  download needs a rule for its package and answers `404` otherwise, like
+  a missing file. A `registry` source needs any `apt:` read rule for
+  indexes and downloads: the content is public, and `apt:*` would open
+  every hosted package. Uploads need a write rule for the name, checked
+  before the body is read; write doesn't imply read, and it covers every
+  suite.
+- **The signing key signs only what tspackages generated.** `signing_key`
+  is loaded once at startup and never logged or served; only the public
+  key is, at `/apt/key.asc`. It must be a legacy Ed25519 or an RSA key of
+  3072 bits or more; a v6 key is refused. The key is the root of trust for
+  every `storage` source of every client that installed it: keep the
+  private key out of the repository and back it up as a secret. A signed
+  `Release` is rendered and cached per client node, and rendered again
+  when what the node may see changes or the key does, so a changed key is
+  never answered with an old signature. Its `Date` only rises for a node,
+  because apt ignores an older `Release`. A request is served only a
+  rendering of what its own rules allow, even one that waits on a
+  rendering for the same node started under other rules. A caller whose
+  WhoIs names no node stable ID is refused with `403`.
+- **Verification chain for `registry` sources.** The upstream's `Release`
+  (or `InRelease` and the detached signature) is checked against the
+  configured `keyring`, and any one valid signature is enough. It is
+  rejected when `Valid-Until` has passed, when `Suite` or `Codename`
+  differs from the configured suite, when its `Date` is more than a day
+  ahead of the clock, or when its `Date` is older than the newest accepted
+  one, which is kept in the state store so that a lost
+  cache doesn't allow a rollback; the previous copy is served meanwhile.
+  The `Release` is passed through byte for byte and the client verifies it
+  again against its own keyring. Index files are served only when the
+  verified `Release` lists them, pool files only when a verified `Packages`
+  index does, and both are checked by SHA-256 before they are cached. A
+  pool file whose SHA-256 differs from the first one recorded for it is
+  served, logged at warn and listed on the status page. Only configured
+  suites, components and architectures are served, without asking the
+  upstream.
+- **Uploads can't inject index entries.** The `.deb`'s `control` file is
+  parsed as one deb822 stanza: no empty line, NUL or CR, valid UTF-8,
+  field names of `[A-Za-z0-9-]`, continuation lines starting with a space
+  or tab. Anything else is `400`. Only an allowlist of fields
+  (`apt.PublishableFields`) reaches the generated index, and tspackages
+  sets `Filename`, `Size` and `SHA256` itself. The name, version and
+  architecture must equal those in the file name, and a published file
+  never changes bytes (`409`). `data.tar` is never read, and no package
+  script runs on the server.
+- **No response is a `401`.** Deny is `403` (or `404` for a hidden
+  download), an upstream `401` becomes a `502`, and any `Authorization`
+  header is stripped.
+
+Uploads are spooled to disk before inspection. The caps:
+
+| Parser | Input | Caps |
+|---|---|---|
+| Paths | request paths | at most 16 segments; names and versions of at most 156 bytes, architectures 32, suites and components 64 |
+| `ar` | uploads | at most 16 members, validated headers |
+| Control tarball | uploads | 4MiB decompressed, `control` file 256KiB, `xz` dictionary 64MiB |
+| `Packages.xz` | upstream indexes | `xz` dictionary 64MiB |
+| deb822 | control files, upstream `Release` and `Packages` | stanza 1MiB, field 256KiB, `Release` 4MiB |
+| OpenPGP | upstream `Release`, `InRelease`, `Release.gpg` | `Release` and `InRelease` 4MiB, `Release.gpg` 64KiB, at most 32 signature packets |
+| Other files | uploads, upstream | `max_upload_bytes`, `max_artifact_bytes` |

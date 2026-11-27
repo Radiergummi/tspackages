@@ -46,6 +46,10 @@ var (
 		Name: "tspackages_cache_hits_total",
 		Help: "Upstream-backed reads served from the cache.",
 	}, []string{"ecosystem", "source"})
+	aptSignatures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tspackages_apt_release_signatures_total",
+		Help: "Release files signed by an apt storage source (cached signatures are not counted).",
+	}, []string{"source"})
 	upstreamDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "tspackages_upstream_request_duration_seconds",
 		Help:    "Duration of upstream requests.",
@@ -68,7 +72,7 @@ func init() {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		requests, cacheHits, upstreamDuration, gitLastSync, buildInfo,
+		requests, cacheHits, aptSignatures, upstreamDuration, gitLastSync, buildInfo,
 		prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Name: "tspackages_rate_limited_total",
 			Help: "Requests rejected by the per-identity rate limiter.",
@@ -115,6 +119,11 @@ func ObserveRequest(ecosystem, source string, code int) {
 
 func ObserveCacheHit(ecosystem, source string) {
 	cacheHits.WithLabelValues(ecosystem, source).Inc()
+}
+
+// ObserveAptSignature counts one signing of a Release by apt source.
+func ObserveAptSignature(source string) {
+	aptSignatures.WithLabelValues(source).Inc()
 }
 
 func ObserveUpstream(source string, d time.Duration) {
