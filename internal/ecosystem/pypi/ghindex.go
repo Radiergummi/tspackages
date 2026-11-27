@@ -90,11 +90,11 @@ func buildGHIndex(claims []string, repos map[githubapp.Repo][]githubapp.Release,
 					continue
 				}
 				c := ghCandidate{repo: repo, release: rel, asset: a, pkg: pkg}
-				sum := strings.TrimPrefix(a.Digest, "sha256:")
-				if a.Digest == "" {
+				sum, ok := strings.CutPrefix(a.Digest, "sha256:")
+				if !ok || !ghHex64(sum) {
 					sum = strings.TrimPrefix(digests[a.ID], "sha256:")
 				}
-				if sum == "" {
+				if !ghHex64(sum) {
 					idx.NeedHash = append(idx.NeedHash, ghPending{Repo: repo, Asset: a, Package: pkg})
 					skip.Reason = "no digest yet"
 					idx.Skipped = append(idx.Skipped, skip)
@@ -205,4 +205,17 @@ func ghParseAsset(filename string) (pkg, version string, ok bool) {
 
 func ghClaimed(claims []string, pkg string) bool {
 	return slices.ContainsFunc(claims, func(c string) bool { return Match(c, pkg) })
+}
+
+// ghHex64 reports whether s is 64 lowercase hex characters.
+func ghHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

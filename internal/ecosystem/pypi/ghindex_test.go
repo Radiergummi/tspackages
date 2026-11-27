@@ -79,6 +79,20 @@ func TestBuildGHIndex(t *testing.T) {
 			wantOwners: map[string]string{"acme-lib": "o/a"},
 		},
 		{
+			name:    "unusable GitHub digests fall back to pins",
+			claims:  []string{"acme-*"},
+			digests: map[int64]string{3: hexC, 4: "nothex"},
+			repos: map[githubapp.Repo][]githubapp.Release{repoA: {rel(1, "v1", at(1),
+				asset(1, "acme_lib-1.0-py3-none-any.whl", "sha512:"+hexA, at(1)),
+				asset(2, "acme_lib-1.1-py3-none-any.whl", "sha256:"+hexA[:10], at(1)),
+				asset(3, "acme_lib-1.2-py3-none-any.whl", "sha512:"+hexA, at(1)),
+				asset(4, "acme_lib-1.3-py3-none-any.whl", "sha256:"+strings.ToUpper(hexA), at(1)))}},
+			wantFiles:  map[string][]string{"acme-lib": {"acme_lib-1.2-py3-none-any.whl=" + hexC}},
+			wantSkips:  []string{"acme-lib/no digest yet", "acme-lib/no digest yet", "acme-lib/no digest yet"},
+			wantNeed:   []int64{1, 2, 4},
+			wantOwners: map[string]string{"acme-lib": "o/a"},
+		},
+		{
 			name:   "earliest counting asset owns",
 			claims: []string{"acme-*"},
 			repos: map[githubapp.Repo][]githubapp.Release{
