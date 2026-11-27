@@ -143,6 +143,20 @@ func githubSource(s Source, opts ValidateOptions, add func(string, ...any)) {
 	if s.Credentials != nil || len(s.DownloadCredentials) > 0 {
 		add("credentials are not supported on github sources")
 	}
+	for _, k := range []struct {
+		key string
+		set bool
+	}{
+		{"branches", len(s.Branches) > 0},
+		{"ssh_key", s.SSHKey != ""},
+		{"known_hosts", s.KnownHosts != ""},
+		{"token", s.Token != ""},
+		{"store", s.Store != ""},
+	} {
+		if k.set {
+			add("%s is not supported on github sources", k.key)
+		}
+	}
 	if s.AppID == 0 {
 		add("app_id is required")
 	}

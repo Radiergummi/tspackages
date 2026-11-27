@@ -67,6 +67,14 @@ func TestGitHubSource(t *testing.T) {
 		{"credentials", func(s *Source) { s.Credentials = &Credential{} }, "credentials are not supported on github sources"},
 		{"http url", func(s *Source) { s.URL = "http://ghe.example/api/v3/" }, "must use https"},
 		{"fetch_hosts on github.com", func(s *Source) { s.FetchHosts = []string{"x"} }, "fetch_hosts is only for GitHub Enterprise Server"},
+		{"branches", func(s *Source) { s.Branches = []string{"main"} }, "branches is not supported on github sources"},
+		{"ssh_key", func(s *Source) { s.SSHKey = "/k" }, "ssh_key is not supported on github sources"},
+		{"known_hosts", func(s *Source) { s.KnownHosts = "/k" }, "known_hosts is not supported on github sources"},
+		{"token", func(s *Source) { s.Token = "t" }, "token is not supported on github sources"},
+		{"store", func(s *Source) { s.Store = "hosted" }, "store is not supported on github sources"},
+		{"tags", func(s *Source) { s.Tags = map[string]map[string][]string{"r": {"v*": {"."}}} }, "tags is only supported on pypi git sources"},
+		{"modules", func(s *Source) { s.Modules = map[string]GoModule{"m": {Remote: "r"}} }, "modules is only supported on go git sources"},
+		{"download_credentials", func(s *Source) { s.DownloadCredentials = map[string]Credential{"h": {}} }, "credentials are not supported on github sources"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,6 +87,22 @@ func TestGitHubSource(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("App keys only on github sources", func(t *testing.T) {
+		for _, mod := range []func(*Source){
+			func(s *Source) { s.AppID = 1 },
+			func(s *Source) { s.InstallationID = 2 },
+			func(s *Source) { s.PrivateKey = key },
+		} {
+			reg := Source{Name: "pypi", Type: "registry", URL: "https://pypi.org/simple/", FetchHosts: []string{"pypi.org"}}
+			mod(&reg)
+			c := pypi(reg)
+			ApplyDefaults(c)
+			if err := validate("pypi", c); err == nil || !strings.Contains(err.Error(), "app_id, installation_id and private_key are only supported on github sources") {
+				t.Fatalf("err = %v", err)
+			}
+		}
+	})
 
 	t.Run("not for npm", func(t *testing.T) {
 		c := &Config{Ecosystems: map[string]Ecosystem{"npm": {Sources: []Source{good()}}}}

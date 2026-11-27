@@ -268,6 +268,9 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 		if len(s.Claims) == 0 && s.Type != "storage" && s.Type != "github" {
 			unclaimed++
 		}
+		if s.Type != "github" && (s.AppID != 0 || s.InstallationID != 0 || s.PrivateKey != "") {
+			add("app_id, installation_id and private_key are only supported on github sources")
+		}
 		if s.MetadataTTL < 0 {
 			add("metadata_ttl must not be negative")
 		}
