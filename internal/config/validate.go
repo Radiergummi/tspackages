@@ -246,7 +246,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			}
 			// Uploads go to the first claiming source, so a name that an
 			// earlier source also claims could never be uploaded here.
-			if s.Type != "storage" {
+			if s.Type != "storage" && s.Type != "github" {
 				continue
 			}
 			for _, e := range earlier {
@@ -265,7 +265,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			rules.source(s, sources[:i], opts, add)
 		}
 
-		if len(s.Claims) == 0 && s.Type != "storage" {
+		if len(s.Claims) == 0 && s.Type != "storage" && s.Type != "github" {
 			unclaimed++
 		}
 		if s.MetadataTTL < 0 {
@@ -275,7 +275,7 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 			add("poll_interval must not be negative")
 		}
 		switch s.Type {
-		case "git", "storage", "registry":
+		case "git", "storage", "registry", "github":
 			if !slices.Contains(rules.types, s.Type) {
 				add("type %q is not supported for %s", s.Type, eco)
 				continue
@@ -322,9 +322,13 @@ func validateSources(eco string, sources []Source, stores map[string]StoreConfig
 					add("download_credentials host %q is not in fetch_hosts", host)
 				}
 			}
+		case "github":
+			if len(s.Claims) == 0 {
+				errs = append(errs, fmt.Errorf("%s: github source %q must have claims", eco, s.Name))
+			}
 		case "git": // checked by the ecosystem's source hook
 		default:
-			add("type must be git, storage or registry, got %q", s.Type)
+			add("type must be git, storage, registry or github, got %q", s.Type)
 		}
 	}
 	if unclaimed > 1 {

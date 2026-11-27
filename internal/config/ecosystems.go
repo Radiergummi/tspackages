@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"maps"
 	"net/url"
@@ -34,7 +37,7 @@ var ecosystems = map[string]ecosystemRules{
 		source:     composerSource,
 	},
 	"pypi": {
-		types:      []string{"git", "storage", "registry"},
+		types:      []string{"git", "storage", "registry", "github"},
 		validClaim: func(c string) bool { return validClaim("pypi", c) },
 		hint:       `use "*" or a normalised name pattern of [a-z0-9-] and "*"`,
 		overlap:    func(a, b string) bool { return claimsOverlap("pypi", a, b) },
@@ -99,12 +102,84 @@ func pypiSource(s Source, _ []Source, opts ValidateOptions, add func(string, ...
 		if len(s.Branches) > 0 {
 			add("branches are not supported for pypi (Python indexes have no branch versions)")
 		}
+	case "github":
+		githubSource(s, opts, add)
 	case "registry":
 		if u, err := url.Parse(s.URL); s.URL != "" && err == nil && u.Host != "" &&
 			!strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/simple") {
 			add("url %q must point at a simple index (ending in /simple/)", s.URL)
 		}
 	}
+}
+
+// DefaultGitHubURL is the API of github.com, the default url of a github
+// source.
+const DefaultGitHubURL = "https://api.github.com/"
+
+// githubDefaultHosts are the hosts a github.com source fetches from.
+var githubDefaultHosts = []string{"api.github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+
+// isGitHubCom reports whether u is the API of github.com.
+func isGitHubCom(u *url.URL) bool { return strings.EqualFold(u.Host, "api.github.com") }
+
+// GitHubFetchHosts returns the hosts a github source fetches from and, among
+// them, the ones reached over the tailnet. github.com uses its three default
+// hosts and no tailnet hosts; GitHub Enterprise Server uses the url host plus
+// fetch_hosts, all on the tailnet.
+func GitHubFetchHosts(s Source) (fetch, tailnet []string) {
+	u, err := url.Parse(s.URL)
+	if s.URL == "" || err != nil || isGitHubCom(u) {
+		return slices.Clone(githubDefaultHosts), nil
+	}
+	fetch = append([]string{u.Host}, s.FetchHosts...)
+	return fetch, slices.Clone(fetch)
+}
+
+// githubSource checks the keys of a pypi github source.
+func githubSource(s Source, opts ValidateOptions, add func(string, ...any)) {
+	if len(s.Remotes) > 0 {
+		add("remotes is only supported on git sources")
+	}
+	if s.Credentials != nil || len(s.DownloadCredentials) > 0 {
+		add("credentials are not supported on github sources")
+	}
+	if s.AppID == 0 {
+		add("app_id is required")
+	}
+	if s.InstallationID == 0 {
+		add("installation_id is required")
+	}
+	if !isRSAPrivateKey(s.PrivateKey) {
+		add("private_key is not a PEM RSA private key")
+	}
+	u, err := url.Parse(s.URL)
+	switch {
+	case err != nil || u.Host == "":
+		add("url %q is not a valid URL", s.URL)
+	case u.Scheme != "https" && (u.Scheme != "http" || !opts.AllowHTTPUpstreams):
+		add("url %q must use https", s.URL)
+	case isGitHubCom(u) && len(s.FetchHosts) > 0:
+		add("fetch_hosts is only for GitHub Enterprise Server")
+	}
+}
+
+// isRSAPrivateKey reports whether s holds a PEM PKCS#1 or PKCS#8 RSA private
+// key. config can't import githubapp (upstream imports config), so it
+// parses the key itself.
+func isRSAPrivateKey(s string) bool {
+	block, _ := pem.Decode([]byte(s))
+	if block == nil {
+		return false
+	}
+	if _, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return true
+	}
+	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return false
+	}
+	_, ok := k.(*rsa.PrivateKey)
+	return ok
 }
 
 // noGitSource checks a source of an ecosystem without git sources: a
